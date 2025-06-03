@@ -1,0 +1,24 @@
+services:
+  rocm-horovod:
+    build:
+      context: "./rocm/"
+      args:
+        VERSION: ${VERSION}
+    container_name: rocm-horovod
+    network_mode: host
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+    ipc: host
+    shm_size: 16g
+    tty: true
+    stdin_open: true
+    volumes:
+      - ./src:/workspace/src
+    command: bash

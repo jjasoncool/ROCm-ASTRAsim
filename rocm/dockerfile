@@ -1,0 +1,30 @@
+ARG VERSION
+FROM rocm/pytorch:${VERSION}
+
+# 更新包列表並安裝 OpenMPI
+RUN apt-get update && apt-get install -y \
+    openmpi-bin \
+    openmpi-common \
+    libopenmpi-dev
+
+RUN apt-get install -y \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+# 設置 Horovod 環境變數
+ENV HOROVOD_GPU=ROCM \
+    HOROVOD_ROCM_HOME=/opt/rocm \
+    HOROVOD_GPU_OPERATIONS=NCCL \
+    HOROVOD_WITHOUT_TENSORFLOW=1 \
+    HOROVOD_WITH_PYTORCH=1 \
+    HOROVOD_WITH_MPI=1 \
+    HOROVOD_WITHOUT_MXNET=1
+
+# 安裝 Horovod 和其他依賴
+RUN git clone --recursive https://github.com/horovod/horovod.git /workspace/horovod
+RUN ln -s $ROCM_PATH/lib/cmake/hip/FindHIP* /workspace/horovod/cmake/Modules/
+RUN sed -i 's/rccl\.h/rccl\/rccl\.h/' /workspace/horovod/horovod/common/ops/nccl_operations.h
+RUN pip install --no-cache-dir /workspace/horovod/.
+
+# 設置工作目錄
+WORKDIR /workspace

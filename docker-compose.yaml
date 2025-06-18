@@ -4,6 +4,8 @@ services:
       context: "./rocm/"
       args:
         VERSION: ${VERSION}
+        ABSL_VER: ${ABSL_VER}
+        PROTOBUF_VER: ${PROTOBUF_VER}
     container_name: rocm-horovod
     network_mode: host
     cap_add:

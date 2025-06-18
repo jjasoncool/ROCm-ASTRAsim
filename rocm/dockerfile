@@ -3,13 +3,12 @@ FROM rocm/pytorch:${VERSION}
 
 # 更新包列表並安裝 OpenMPI
 RUN apt-get update && apt-get install -y \
-    openmpi-bin \
-    openmpi-common \
-    libopenmpi-dev
-
-RUN apt-get install -y \
     cmake \
-    && rm -rf /var/lib/apt/lists/*
+    # openmpi
+    openmpi-bin openmpi-common libopenmpi-dev \
+    # ASTRA-sim 需要的依賴
+    libboost-dev libboost-program-options-dev \
+    graphviz
 
 # 設置 Horovod 環境變數
 ENV HOROVOD_GPU=ROCM \
@@ -25,6 +24,96 @@ RUN git clone --recursive https://github.com/horovod/horovod.git /workspace/horo
 RUN ln -s $ROCM_PATH/lib/cmake/hip/FindHIP* /workspace/horovod/cmake/Modules/
 RUN sed -i 's/rccl\.h/rccl\/rccl\.h/' /workspace/horovod/horovod/common/ops/nccl_operations.h
 RUN pip install --no-cache-dir /workspace/horovod/.
+
+
+### ====== Abseil Installation: Protobuf Dependency ======
+## Download Abseil 20240722.0 (Latest LTS as of 10/31/2024)
+ARG ABSL_VER=20240722.0
+
+# Download source
+WORKDIR /opt
+RUN wget https://github.com/abseil/abseil-cpp/releases/download/${ABSL_VER}/abseil-cpp-${ABSL_VER}.tar.gz
+RUN tar -xf abseil-cpp-${ABSL_VER}.tar.gz
+RUN rm abseil-cpp-${ABSL_VER}.tar.gz
+
+## Compile Abseil
+WORKDIR /opt/abseil-cpp-${ABSL_VER}/build
+RUN cmake .. \
+    -DCMAKE_CXX_STANDARD=14 \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="/opt/abseil-cpp-${ABSL_VER}/install"
+RUN cmake --build . --target install --config Release --parallel $(nproc)
+ENV absl_DIR="/opt/abseil-cpp-${ABSL_VER}/install"
+### ======================================================
+
+### ============= Protobuf Installation ==================
+## Download Protobuf 29.0 (=v5.29.0, latest stable version as of Feb/01/2025)
+ARG PROTOBUF_VER=29.0
+
+# Download source
+WORKDIR /opt
+RUN wget https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOBUF_VER}/protobuf-${PROTOBUF_VER}.tar.gz
+RUN tar -xf protobuf-${PROTOBUF_VER}.tar.gz
+RUN rm protobuf-${PROTOBUF_VER}.tar.gz
+
+## Compile Protobuf
+WORKDIR /opt/protobuf-${PROTOBUF_VER}/build
+RUN cmake .. \
+    -DCMAKE_CXX_STANDARD=14 \
+    -DCMAKE_BUILD_TYPE=Release \
+    -Dprotobuf_BUILD_TESTS=OFF \
+    -Dprotobuf_ABSL_PROVIDER=package \
+    -DCMAKE_INSTALL_PREFIX="/opt/protobuf-${PROTOBUF_VER}/install"
+RUN cmake --build . --target install --config Release --parallel $(nproc)
+ENV PATH="/opt/protobuf-${PROTOBUF_VER}/install/bin:$PATH"
+ENV protobuf_DIR="/opt/protobuf-${PROTOBUF_VER}/install"
+
+# Also, install Python protobuf package
+RUN pip3 install protobuf==5.${PROTOBUF_VER}
+
+# Set the environment variable
+ENV PROTOBUF_FROM_SOURCE=True
+### ======================================================
+
+# 安裝 ASTRA-sim
+ENV ASTRA_SIM="/workspace/astra-sim"
+RUN git clone --recursive https://github.com/astra-sim/astra-sim.git ${ASTRA_SIM}
+WORKDIR ${ASTRA_SIM}
+RUN ./build/astra_analytical/build.sh
+ENV ASTRA_SIM_BIN=${ASTRA_SIM}/build/astra_analytical/build/bin/AstraSim_Analytical_Congestion_Aware
+
+# 編譯 astra-sim 的 ns3 模組
+# C++ 20 引入了新的 fmt 庫，這可能會導致 ASTRA-sim 的一些舊程式無法編譯。
+WORKDIR /workspace/astra-sim/extern/helper/spdlog_setup
+RUN sed -i 's/\bformat(/fmt::format(/g' conf.h details/conf_impl.h details/template_impl.h \
+    && sed -i 's/fmt::fmt::format(/fmt::format(/g' conf.h details/conf_impl.h details/template_impl.h \
+    && echo '#include <spdlog/fmt/fmt.h>' | cat - conf.h > temp && mv temp conf.h \
+    && echo '#include <spdlog/fmt/fmt.h>' | cat - details/conf_impl.h > temp && mv temp details/conf_impl.h \
+    && echo '#include <spdlog/fmt/fmt.h>' | cat - details/template_impl.h > temp && mv temp details/template_impl.h
+WORKDIR ${ASTRA_SIM}
+RUN ./build/astra_ns3/build.sh -c
+
+# 安裝 Chakra
+RUN pip install --no-cache-dir \
+    ${ASTRA_SIM}/extern/graph_frontend/chakra
+
+# 安裝其他 Chakra 依賴 Param
+# REF https://github.com/mlcommons/chakra/blob/main/USER_GUIDE.md
+# 安裝 PARAM (Chakra 依賴)
+WORKDIR /workspace
+RUN git clone https://github.com/facebookresearch/param.git && \
+    cd param/et_replay && \
+    git checkout 7b19f586dd8b267333114992833a0d7e0d601630 && \
+    pip install .
+
+# 安裝 Holistic Trace Analysis (用於追蹤分析)
+WORKDIR /workspace
+RUN git clone https://github.com/facebookresearch/HolisticTraceAnalysis.git && \
+    cd HolisticTraceAnalysis && \
+    git checkout d731cc2e2249976c97129d409a83bd53d93051f6 && \
+    git submodule update --init && \
+    pip install -r requirements.txt && \
+    pip install -e .
 
 # 設置工作目錄
 WORKDIR /workspace

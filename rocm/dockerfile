@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y \
     # openmpi
     openmpi-bin openmpi-common libopenmpi-dev \
     # ASTRA-sim 需要的依賴
+    libprotobuf-dev protobuf-compiler \
     libboost-dev libboost-program-options-dev \
     graphviz
 
@@ -25,55 +26,8 @@ RUN ln -s $ROCM_PATH/lib/cmake/hip/FindHIP* /workspace/horovod/cmake/Modules/
 RUN sed -i 's/rccl\.h/rccl\/rccl\.h/' /workspace/horovod/horovod/common/ops/nccl_operations.h
 RUN pip install --no-cache-dir /workspace/horovod/.
 
-
-### ====== Abseil Installation: Protobuf Dependency ======
-## Download Abseil 20240722.0 (Latest LTS as of 10/31/2024)
-ARG ABSL_VER=20240722.0
-
-# Download source
-WORKDIR /opt
-RUN wget https://github.com/abseil/abseil-cpp/releases/download/${ABSL_VER}/abseil-cpp-${ABSL_VER}.tar.gz
-RUN tar -xf abseil-cpp-${ABSL_VER}.tar.gz
-RUN rm abseil-cpp-${ABSL_VER}.tar.gz
-
-## Compile Abseil
-WORKDIR /opt/abseil-cpp-${ABSL_VER}/build
-RUN cmake .. \
-    -DCMAKE_CXX_STANDARD=14 \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX="/opt/abseil-cpp-${ABSL_VER}/install"
-RUN cmake --build . --target install --config Release --parallel $(nproc)
-ENV absl_DIR="/opt/abseil-cpp-${ABSL_VER}/install"
-### ======================================================
-
-### ============= Protobuf Installation ==================
-## Download Protobuf 29.0 (=v5.29.0, latest stable version as of Feb/01/2025)
-ARG PROTOBUF_VER=29.0
-
-# Download source
-WORKDIR /opt
-RUN wget https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOBUF_VER}/protobuf-${PROTOBUF_VER}.tar.gz
-RUN tar -xf protobuf-${PROTOBUF_VER}.tar.gz
-RUN rm protobuf-${PROTOBUF_VER}.tar.gz
-
-## Compile Protobuf
-WORKDIR /opt/protobuf-${PROTOBUF_VER}/build
-RUN cmake .. \
-    -DCMAKE_CXX_STANDARD=14 \
-    -DCMAKE_BUILD_TYPE=Release \
-    -Dprotobuf_BUILD_TESTS=OFF \
-    -Dprotobuf_ABSL_PROVIDER=package \
-    -DCMAKE_INSTALL_PREFIX="/opt/protobuf-${PROTOBUF_VER}/install"
-RUN cmake --build . --target install --config Release --parallel $(nproc)
-ENV PATH="/opt/protobuf-${PROTOBUF_VER}/install/bin:$PATH"
-ENV protobuf_DIR="/opt/protobuf-${PROTOBUF_VER}/install"
-
-# Also, install Python protobuf package
-RUN pip3 install protobuf==5.${PROTOBUF_VER}
-
-# Set the environment variable
-ENV PROTOBUF_FROM_SOURCE=True
-### ======================================================
+# Install Python protobuf package
+RUN pip install protobuf==6.31.0
 
 # 安裝 ASTRA-sim
 ENV ASTRA_SIM="/workspace/astra-sim"

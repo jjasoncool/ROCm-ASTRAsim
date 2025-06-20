@@ -27,7 +27,7 @@ RUN sed -i 's/rccl\.h/rccl\/rccl\.h/' /workspace/horovod/horovod/common/ops/nccl
 RUN pip install --no-cache-dir /workspace/horovod/.
 
 # Install Python protobuf package
-RUN pip install protobuf==6.31.0
+RUN pip install protobuf==5.29.0
 
 # 安裝 ASTRA-sim
 ENV ASTRA_SIM="/workspace/astra-sim"
@@ -50,6 +50,9 @@ RUN ./build/astra_ns3/build.sh -c
 # 安裝 Chakra
 RUN pip install --no-cache-dir \
     ${ASTRA_SIM}/extern/graph_frontend/chakra
+
+# https://github.com/mlcommons/chakra/issues/195
+RUN pip install protobuf==6.31.0
 
 # 安裝其他 Chakra 依賴 Param
 # REF https://github.com/mlcommons/chakra/blob/main/USER_GUIDE.md

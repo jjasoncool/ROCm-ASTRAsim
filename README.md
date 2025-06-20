@@ -29,12 +29,24 @@ docker run -it \
 ## ASTRA-sim 使用說明
 
 ### 網路拓樸模擬範例
+- normal topology
 ```bash
 $ASTRA_SIM_BIN \
   --workload-configuration=${ASTRA_SIM}/examples/network_analytical/workload/AllReduce_1MB \
   --system-configuration=${ASTRA_SIM}/examples/network_analytical/system.json \
   --network-configuration=${ASTRA_SIM}/examples/network_analytical/network.yml \
   --remote-memory-configuration=${ASTRA_SIM}/examples/network_analytical/remote_memory.json
+```
+
+- ns3 backend
+```bash
+${ASTRA_SIM}/extern/network_backend/ns-3/build/scratch/ns3.42-AstraSimNetwork-default \
+  --workload-configuration=${WORKLOAD} \
+  --system-configuration=${ASTRA_SIM}/examples/ns3/system.json \
+  --network-configuration=${ASTRA_SIM}/extern/network_backend/ns-3/scratch/config/config.txt \
+  --remote-memory-configuration=${ASTRA_SIM}/examples/ns3/remote_memory.json \
+  --logical-topology-configuration=${ASTRA_SIM}/examples/ns3/sample_8nodes_1D.json \
+  --comm-group-configuration=\"empty\"
 ```
 
 ### 參數說明

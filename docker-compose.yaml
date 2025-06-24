@@ -21,4 +21,5 @@ services:
     stdin_open: true
     volumes:
       - ./src:/workspace/src
+      - ./data:/workspace/data
     command: bash

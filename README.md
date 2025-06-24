@@ -40,12 +40,17 @@ $ASTRA_SIM_BIN \
 
 - ns3 backend
 ```bash
+python /workspace/src/generate_chakra_workload.py
+
+cd /workspace/data/chakra
+chakra_generator --num_npus 8 --default_runtime 1000 --default_tensor_size 1024 --default_comm_size 4096
+
 ${ASTRA_SIM}/extern/network_backend/ns-3/build/scratch/ns3.42-AstraSimNetwork-default \
-  --workload-configuration=${WORKLOAD} \
-  --system-configuration=${ASTRA_SIM}/examples/ns3/system.json \
-  --network-configuration=${ASTRA_SIM}/extern/network_backend/ns-3/scratch/config/config.txt \
-  --remote-memory-configuration=${ASTRA_SIM}/examples/ns3/remote_memory.json \
-  --logical-topology-configuration=${ASTRA_SIM}/examples/ns3/sample_8nodes_1D.json \
+  --workload-configuration=/workspace/data/chakra/workload_trace \
+  --system-configuration=/workspace/data/ASTRA-sim/system.json \
+  --network-configuration=/workspace/data/ASTRA-sim/scratch/config/config.txt \
+  --remote-memory-configuration=/workspace/data/ASTRA-sim/remote_memory.json \
+  --logical-topology-configuration=/workspace/data/ASTRA-sim/sample_8nodes_1D.json \
   --comm-group-configuration=\"empty\"
 ```
 

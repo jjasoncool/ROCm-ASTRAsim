@@ -29,7 +29,7 @@ docker run -it \
 ## ASTRA-sim 使用說明
 
 ### 網路拓樸模擬範例
-- normal topology
+#### normal topology
 ```bash
 $ASTRA_SIM_BIN \
   --workload-configuration=${ASTRA_SIM}/examples/network_analytical/workload/AllReduce_1MB \
@@ -38,10 +38,8 @@ $ASTRA_SIM_BIN \
   --remote-memory-configuration=${ASTRA_SIM}/examples/network_analytical/remote_memory.json
 ```
 
-- ns3 backend
+#### ns3 backend
 ```bash
-python /workspace/src/generate_chakra_workload.py
-
 cd /workspace/data/chakra
 chakra_generator --num_npus 8 --default_runtime 1000 --default_tensor_size 1024 --default_comm_size 4096
 
@@ -59,3 +57,9 @@ ${ASTRA_SIM}/extern/network_backend/ns-3/build/scratch/ns3.42-AstraSimNetwork-de
 - `system-configuration`: 系統配置檔
 - `network-configuration`: 網路拓樸設定檔
 - `remote-memory-configuration`: 遠端記憶體配置檔
+
+### 測試scripts
+
+```bash
+python /workspace/src/generate_chakra_workload.py
+```

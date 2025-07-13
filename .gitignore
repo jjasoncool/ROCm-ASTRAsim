@@ -1,3 +1,4 @@
 log/
 data/ASTRA-sim/scratch/output/*
 !data/ASTRA-sim/scratch/output/flow.txt
+data/chakra/workload_trace*.et

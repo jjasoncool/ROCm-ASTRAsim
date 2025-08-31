@@ -1,0 +1,3 @@
+[submodule "tutorials"]
+	path = tutorials
+	url = https://gitlab.com/research-tasks/tutorials.git

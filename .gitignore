@@ -1,4 +1,7 @@
 log/
 data/ASTRA-sim/scratch/output/*
 !data/ASTRA-sim/scratch/output/flow.txt
+data/chakra/*.et
 data/chakra/workload_trace*.et
+data/cifar10/*
+!data/cifar10/.gitkeep

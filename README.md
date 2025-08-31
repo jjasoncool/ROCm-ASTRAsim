@@ -25,9 +25,11 @@ docker run -it \
   --shm-size 8G \
   rocm/pytorch:latest
 ```
+## 使用 chakra 產生traces (.et)
+
+
 
 ## ASTRA-sim 使用說明
-
 ### 網路拓樸模擬範例
 #### normal topology
 ```bash
@@ -41,8 +43,8 @@ $ASTRA_SIM_BIN \
 #### ns3 backend
 ```bash
 cd /workspace/data/chakra
-chakra_generator --num_npus 8 --default_runtime 1000 --default_tensor_size 1024 --default_comm_size 4096
 
+- 使用 NS3 來執行 ASTRA-sim
 ${ASTRA_SIM}/extern/network_backend/ns-3/build/scratch/ns3.42-AstraSimNetwork-default \
   --workload-configuration=/workspace/data/chakra/workload_trace \
   --system-configuration=/workspace/data/ASTRA-sim/system.json \

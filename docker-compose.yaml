@@ -22,4 +22,5 @@ services:
     volumes:
       - ./src:/workspace/src
       - ./data:/workspace/data
+      - ./tutorials:/workspace/tutorials
     command: bash

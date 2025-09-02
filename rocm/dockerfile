@@ -1,4 +1,4 @@
-ARG VERSION
+ARG VERSION=latest
 FROM rocm/pytorch:${VERSION}
 
 # 更新包列表並安裝 OpenMPI
@@ -52,7 +52,7 @@ RUN pip install --no-cache-dir \
     ${ASTRA_SIM}/extern/graph_frontend/chakra
 
 # https://github.com/mlcommons/chakra/issues/195
-RUN pip install protobuf==6.31.0
+RUN pip install protobuf==6.31.1
 
 # 安裝其他 Chakra 依賴 Param
 # REF https://github.com/mlcommons/chakra/blob/main/USER_GUIDE.md
@@ -71,6 +71,8 @@ RUN git clone https://github.com/facebookresearch/HolisticTraceAnalysis.git && \
     git submodule update --init && \
     pip install -r requirements.txt && \
     pip install -e .
+
+RUN pip install hiredis --no-cache-dir
 
 # 設置工作目錄
 WORKDIR /workspace

@@ -1,5 +1,5 @@
-# horovodrun -np 2 python ./src/horovod_allreduce_test.py
-# horovodrun -np 4 -H localhost:4 python ./src/horovod_allreduce_test.py
+# horovodrun -np 2 python ./src/test/horovod_allreduce_test.py
+# horovodrun -np 4 -H localhost:4 python ./src/test/horovod_allreduce_test.py
 
 import torch
 import horovod.torch as hvd

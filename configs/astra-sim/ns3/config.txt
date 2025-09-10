@@ -3,13 +3,13 @@ USE_DYNAMIC_PFC_THRESHOLD 1
 
 PACKET_PAYLOAD_SIZE 1000
 
-TOPOLOGY_FILE ../../scratch/topology/8_nodes_1_switch_topology.txt
-FLOW_FILE ../../scratch/output/flow.txt
-TRACE_FILE ../../scratch/output/trace.txt
-TRACE_OUTPUT_FILE ../../scratch/output/mix.tr
-FCT_OUTPUT_FILE ../../scratch/output/fct.txt
-PFC_OUTPUT_FILE ../../scratch/output/pfc.txt
-QLEN_MON_FILE ../../scratch/output/qlen.txt
+TOPOLOGY_FILE ../../topos/8_nodes_1_switch_topology.txt
+FLOW_FILE ../../../runs/output/flow.txt
+TRACE_FILE ../../runs/output/trace.txt
+TRACE_OUTPUT_FILE ../../runs/output/mix.tr
+FCT_OUTPUT_FILE ../../runs/output/fct.txt
+PFC_OUTPUT_FILE ../../runs/output/pfc.txt
+QLEN_MON_FILE ../../runs/output/qlen.txt
 QLEN_MON_START 0
 QLEN_MON_END 20000
 

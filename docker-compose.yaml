@@ -20,8 +20,10 @@ services:
     tty: true
     stdin_open: true
     volumes:
+      - ./configs:/workspace/configs
+      - ./data:/workspace/data
+      - ./runs:/workspace/runs
       - ./scripts:/workspace/scripts
       - ./src:/workspace/src
-      - ./data:/workspace/data
       - ./tutorials:/workspace/tutorials
     command: bash

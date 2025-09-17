@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CIFAR-10 on ROCm (AMD GPU) with interleaved Host/Device traces per rank.
+CIFAR-10 on ROCm (AMD GPU) with unified CPU+CUDA traces per rank.
 - 單卡:  torchrun --standalone --nproc_per_node=1 ./src/train_rocm_pytorch.py --epochs 2 --batch-size 128
 - 雙卡:  torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py --epochs 2 --batch-size 128
+- 雙卡多事件: torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py --epochs=10 --batch-size=512 --omp-threads=4 --debug-epoch-print
 
 輸出 (相對於此檔案):
-  ../data/chakra/pytorch_traces/host_rank_{rank}.json
-  ../data/chakra/pytorch_traces/device_rank_{rank}.json
+  ../data/chakra/pytorch_traces/trace_rank_{rank}_epoch_{epoch}.json  # 統一檔案，含 CPU+CUDA events
 資料集:
   ../data/cifar10
 """
@@ -57,6 +57,8 @@ def cleanup_ddp(enabled):
     if enabled and dist.is_initialized():
         try:
             dist.barrier()
+        except Exception as e:
+            print(f"[Cleanup] Barrier error: {e}")
         finally:
             dist.destroy_process_group()
 
@@ -89,11 +91,9 @@ def train_one_epoch(model, loader, device, optimizer, scaler, loss_fn, epoch, pb
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--epochs", type=int, default=2, help="總訓練 epoch（>=2 可同時產生 host/device）")
+    ap.add_argument("--epochs", type=int, default=2, help="總訓練 epoch")
     ap.add_argument("--batch-size", type=int, default=128, help="每個 batch 的樣本數")
     ap.add_argument("--workers", type=int, default=4, help="DataLoader 背景執行緒數")
-    ap.add_argument("--first-profile", type=str, default="host", choices=["host","device"],
-                    help="第一個有 profiler 的 epoch 收集 host 或 device（之後交錯）")
     # <<< 新增：控制 OMP_NUM_THREADS >>>
     ap.add_argument("--omp-threads", type=int, default=2, help="設定 OMP_NUM_THREADS（預設 2）")
     ap.add_argument("--debug-epoch-print", action="store_true", help="列印 epoch 開始/結束 debug 訊息")
@@ -115,18 +115,13 @@ def main():
     rank, world, ddp_enabled = setup_ddp()
     device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK',0))}" if ddp_enabled else "cuda")
 
-    # 每個 rank 的 trace 檔名
-    host_trace_path   = os.path.join(traces_dir, f"host_rank_{rank}.json")
-    device_trace_path = os.path.join(traces_dir, f"device_rank_{rank}.json")
-
     # --- 方案B: 依序列印各 rank 的初始化資訊，避免多進程 stdout 交錯 ---
     def _print_rank_init_info():
         prefix = f"[Rank {rank}]"
         print(f"{prefix} World size={world} | Device={device}", flush=True)
         print(f"{prefix} OMP_NUM_THREADS = {os.environ.get('OMP_NUM_THREADS')}", flush=True)
         print(f"{prefix} Dataset dir : {dataset_dir}", flush=True)
-        print(f"{prefix} Host trace  : {host_trace_path}", flush=True)
-        print(f"{prefix} Device trace: {device_trace_path}", flush=True)
+        print(f"{prefix} Traces dir  : {traces_dir}", flush=True)
 
     if ddp_enabled:
         for r in range(world):
@@ -155,41 +150,21 @@ def main():
     scaler    = torch.amp.GradScaler('cuda')
     loss_fn   = nn.CrossEntropyLoss()
 
-    # 交錯規則：奇偶 epoch 與 first-profile 決定本輪收 Host 或 Device
-    def want_host(epoch):
-        # epoch 從 1 開始
-        if args.first_profile == "host":
-            return (epoch % 2 == 1)
-        else:
-            return (epoch % 2 == 0)
-
-    # Profiler 排程：warmup 1 step + active 1 step，檔案不爆
-    sched = schedule(wait=0, warmup=1, active=1, repeat=1)
+    # Profiler 排程：warmup 1 step + active 5 steps x repeat 2，捕捉更多 batches/comm
+    sched = schedule(wait=0, warmup=1, active=5, repeat=2)
 
     for epoch in range(1, args.epochs + 1):
         if ddp_enabled:
             loader.sampler.set_epoch(epoch)
 
-        prof = None
-        # 奇偶交錯：只開一種（CPU-only 或 CUDA-only）
-        if want_host(epoch):
-            # Host-only
-            prof = profile(
-                activities=[ProfilerActivity.CPU],
-                schedule=sched,
-                record_shapes=True, profile_memory=True, with_stack=True,
-                on_trace_ready=lambda p: p.export_chrome_trace(host_trace_path)
-            )
-            prof_label = "Host(CPU-only)"
-        else:
-            # Device-only
-            prof = profile(
-                activities=[ProfilerActivity.CUDA],
-                schedule=sched,
-                record_shapes=True, profile_memory=True,
-                on_trace_ready=lambda p: p.export_chrome_trace(device_trace_path)
-            )
-            prof_label = "Device(CUDA-only)"
+        # 統一捕捉 CPU + CUDA
+        prof = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=sched,
+            record_shapes=True, profile_memory=True, with_stack=True,with_flops=True,
+            on_trace_ready=lambda p: p.export_chrome_trace(os.path.join(traces_dir, f"trace_rank_{rank}_epoch_{epoch}.json"))
+        )
+        prof_label = "Full(CPU+CUDA)"
 
         if args.debug_epoch_print and is_main(rank):
             print(f"[Debug] Begin Epoch {epoch}")

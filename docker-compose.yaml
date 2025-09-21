@@ -27,3 +27,4 @@ services:
       - ./src:/workspace/src
       - ./tutorials:/workspace/tutorials
     command: bash
+    restart: always

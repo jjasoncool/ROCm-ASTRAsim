@@ -74,7 +74,8 @@ def cubeish_3d(n: int) -> tuple[int, int, int]:
 
 def gen_topology_file(out_path: Path, dims: list[int]) -> Path:
     """寫出 ASTRA-sim 的「邏輯拓樸」JSON：{"logical-dims":["2","4",...]}。"""
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.parent.mkdir(parents=True, exist_ok=True, mode=0o777)
+    out_path.parent.chmod(0o777)  # 設置正確權限
     out_path.write_text(json.dumps({"logical-dims": [str(d) for d in dims]}, indent=2),
                         encoding="utf-8")
     return out_path
@@ -137,7 +138,8 @@ def patch_network_cfg(src: Path, out: Path, *,
          'FLOW_FILE <out_dir>/flow.txt'，並預先 touch 空檔，避免開檔失敗；
       3) 覆蓋 QCN/PFC_DYN/BUFFER/PAYLOAD（若指定）。
     """
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True, mode=0o777)
+    out_dir.chmod(0o777)  # 確保權限正確設置
     lines = src.read_text(encoding="utf-8").splitlines()
 
     # 建立 placeholder flow.txt（輸入檔，但內容不使用；需能被打開）
@@ -193,7 +195,8 @@ def patch_network_cfg(src: Path, out: Path, *,
         "QLEN_MON_FILE":     out_dir / "qlen.txt",
     }
     for k, v in out_targets.items():
-        v.parent.mkdir(parents=True, exist_ok=True)  # 確保 out_dir 存在
+        v.parent.mkdir(parents=True, exist_ok=True, mode=0o777)  # 確保 out_dir 存在
+        v.parent.chmod(0o777)  # 設置正確權限
         if not v.exists():
             v.touch()  # 預先建立輸出檔，避免開啟失敗
         lines2 = replace_key(lines2, k, v)
@@ -244,7 +247,8 @@ def _scale_comm_size_inplace(node: Node, scale: float) -> None:
         node.attr[size_idx].int64_val = new_val
 
 def _write_et(meta: GlobalMetadata, nodes: list[Node], out_path: Path) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.parent.mkdir(parents=True, exist_ok=True, mode=0o777)
+    out_path.parent.chmod(0o777)  # 設置正確權限
     with out_path.open("wb") as f:
         encode_message(f, meta)
         for n in nodes:
@@ -421,8 +425,11 @@ def main():
     logroot = Path(args.log_dir).resolve() / f"{stamp}_ns3_{world}gpu_{topo_desc}"
     tmp_dir = logroot / "tmp"
     out_dir = logroot / "out"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True, mode=0o777)
+    out_dir.mkdir(parents=True, exist_ok=True, mode=0o777)
+
+    # 確保父目錄 logroot 也有正確的權限（mkdir 的 mode 不會影響父目錄）
+    logroot.chmod(0o777)
 
     # （可選）虛擬擴張：以你的實測 .et 變形/放大到 N 份（只改 comm_size）
     workload_dir, actual_world = expand_workload_virtual_if_needed(workload_dir, tmp_dir, args.virtual_world)

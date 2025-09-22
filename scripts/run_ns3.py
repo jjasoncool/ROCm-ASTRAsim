@@ -386,51 +386,58 @@ def main():
         if not p.exists():
             raise SystemExit(f"[ERR] 找不到：{p}")
 
-    # 建立本次 run 的目錄（加上 GPU 數量和拓撲信息）
-    stamp   = time.strftime("%Y%m%d-%H%M%S")
+    # 先獲取基本信息來決定目錄名稱
+    stamp = time.strftime("%Y%m%d-%H%M%S%z")  # 加入時區信息 (+0800, +0000 等)
 
-    # （可選）虛擬擴張：以你的實測 .et 變形/放大到 N 份（只改 comm_size）
-    workload_dir, world = expand_workload_virtual_if_needed(workload_dir, tmp_dir, args.virtual_world)
-
-    # 若沒做虛擬擴張，照原資料夾計數
-    if args.virtual_world is None:
+    # 如果有虛擬擴張，先用原始 workload 計算 world size，然後使用虛擬的 world size
+    if args.virtual_world is not None:
+        original_world = count_world_size(workload_dir)
+        world = args.virtual_world
+    else:
         world = count_world_size(workload_dir)
-    print(f"[INFO] workload={workload_dir}  world_size={world}")
 
-    # ---------- 邏輯拓樸（ASTRA-sim） ----------
+    # 解析拓撲參數獲得邏輯維度
     topo_arg = args.topo
-    logical_dims = None
     if topo_arg.startswith("file:"):
-        topo_json = Path(topo_arg.replace("file:", "")).resolve()
-        assert_logical_dims_match_world(topo_json, world)
-        logical_dims = load_logical_dims(topo_json)
+        topo_json_path = Path(topo_arg.replace("file:", "")).resolve()
+        logical_dims = load_logical_dims(topo_json_path)
     elif topo_arg.startswith("dims:"):
-        dims = [int(x) for x in topo_arg.replace("dims:", "").lower().split("x")]
-        if math.prod(dims) != world:
-            raise SystemExit(f"[ERR] dims 乘積 {math.prod(dims)} != world {world}")
-        logical_dims = dims
-        topo_json = gen_topology_file(tmp_dir / "logical_topology.json", dims)
+        logical_dims = [int(x) for x in topo_arg.replace("dims:", "").lower().split("x")]
+        if math.prod(logical_dims) != world:
+            raise SystemExit(f"[ERR] dims 乘積 {math.prod(logical_dims)} != world {world}")
     elif topo_arg.startswith("auto:"):
         mode = topo_arg.split(":", 1)[1]
-        if   mode == "1d": dims = [world]
-        elif mode == "2d": dims = list(squareish_2d(world))
-        elif mode == "3d": dims = list(cubeish_3d(world))
+        if   mode == "1d": logical_dims = [world]
+        elif mode == "2d": logical_dims = list(squareish_2d(world))
+        elif mode == "3d": logical_dims = list(cubeish_3d(world))
         else: raise SystemExit(f"[ERR] 不支援的 auto 模式：{mode}")
-        logical_dims = dims
-        topo_json = gen_topology_file(tmp_dir / "logical_topology.json", dims)
-        print(f"[INFO] logical-dims (auto:{mode}) → {dims}")
+        print(f"[INFO] logical-dims (auto:{mode}) → {logical_dims}")
     else:
-        topo_json = Path(topo_arg).resolve()
-        assert_logical_dims_match_world(topo_json, world)
-        logical_dims = load_logical_dims(topo_json)
+        topo_json_path = Path(topo_arg).resolve()
+        logical_dims = load_logical_dims(topo_json_path)
 
-    # 提取拓撲描述並建立帶有 GPU 數量和拓撲信息的目錄名稱
+    # 建立最終的目錄名稱
     topo_desc = extract_topo_description(topo_arg, logical_dims)
     logroot = Path(args.log_dir).resolve() / f"{stamp}_ns3_{world}gpu_{topo_desc}"
     tmp_dir = logroot / "tmp"
     out_dir = logroot / "out"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # （可選）虛擬擴張：以你的實測 .et 變形/放大到 N 份（只改 comm_size）
+    workload_dir, actual_world = expand_workload_virtual_if_needed(workload_dir, tmp_dir, args.virtual_world)
+    print(f"[INFO] workload={workload_dir}  world_size={actual_world}")
+
+    # ---------- 邏輯拓樸（ASTRA-sim） ----------
+    # 根據拓撲參數創建或驗證拓撲文件
+    if topo_arg.startswith("file:"):
+        topo_json = Path(topo_arg.replace("file:", "")).resolve()
+        assert_logical_dims_match_world(topo_json, actual_world)
+    elif topo_arg.startswith("dims:") or topo_arg.startswith("auto:"):
+        topo_json = gen_topology_file(tmp_dir / "logical_topology.json", logical_dims)
+    else:
+        topo_json = Path(topo_arg).resolve()
+        assert_logical_dims_match_world(topo_json, actual_world)
 
     # ---------- system.json 打補丁 ----------
     sys_patched = tmp_dir / "system.patched.json"

@@ -304,6 +304,28 @@ def expand_workload_virtual_if_needed(workload_src: Path, tmp_dir: Path, virtual
     return out_dir, N
 
 # ---------- Workload 參數組裝：關鍵修正 ----------
+def extract_topo_description(topo_arg: str, logical_dims: list[int] = None) -> str:
+    """
+    從拓撲參數中提取簡潔的描述信息，用於目錄命名。
+    """
+    if topo_arg.startswith("auto:"):
+        mode = topo_arg.split(":", 1)[1]
+        if logical_dims:
+            dims_str = "x".join(map(str, logical_dims))
+            return f"auto{mode}_{dims_str}"
+        else:
+            return f"auto{mode}"
+    elif topo_arg.startswith("dims:"):
+        dims_str = topo_arg.replace("dims:", "").lower()
+        return f"dims_{dims_str}"
+    elif topo_arg.startswith("file:"):
+        file_path = Path(topo_arg.replace("file:", ""))
+        return f"file_{file_path.stem}"
+    else:
+        # 直接是檔案路徑
+        file_path = Path(topo_arg)
+        return f"file_{file_path.stem}"
+
 def build_workload_arg(workload_dir: Path) -> tuple[str, str]:
     """
     回傳 (傳給 --workload-configuration 的路徑字串, 顯示用途的說明字串)。
@@ -364,13 +386,8 @@ def main():
         if not p.exists():
             raise SystemExit(f"[ERR] 找不到：{p}")
 
-    # 建立本次 run 的目錄
+    # 建立本次 run 的目錄（加上 GPU 數量和拓撲信息）
     stamp   = time.strftime("%Y%m%d-%H%M%S")
-    logroot = Path(args.log_dir).resolve() / f"{stamp}_ns3_run"
-    tmp_dir = logroot / "tmp"
-    out_dir = logroot / "out"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     # （可選）虛擬擴張：以你的實測 .et 變形/放大到 N 份（只改 comm_size）
     workload_dir, world = expand_workload_virtual_if_needed(workload_dir, tmp_dir, args.virtual_world)
@@ -382,13 +399,16 @@ def main():
 
     # ---------- 邏輯拓樸（ASTRA-sim） ----------
     topo_arg = args.topo
+    logical_dims = None
     if topo_arg.startswith("file:"):
         topo_json = Path(topo_arg.replace("file:", "")).resolve()
         assert_logical_dims_match_world(topo_json, world)
+        logical_dims = load_logical_dims(topo_json)
     elif topo_arg.startswith("dims:"):
         dims = [int(x) for x in topo_arg.replace("dims:", "").lower().split("x")]
         if math.prod(dims) != world:
             raise SystemExit(f"[ERR] dims 乘積 {math.prod(dims)} != world {world}")
+        logical_dims = dims
         topo_json = gen_topology_file(tmp_dir / "logical_topology.json", dims)
     elif topo_arg.startswith("auto:"):
         mode = topo_arg.split(":", 1)[1]
@@ -396,11 +416,21 @@ def main():
         elif mode == "2d": dims = list(squareish_2d(world))
         elif mode == "3d": dims = list(cubeish_3d(world))
         else: raise SystemExit(f"[ERR] 不支援的 auto 模式：{mode}")
+        logical_dims = dims
         topo_json = gen_topology_file(tmp_dir / "logical_topology.json", dims)
         print(f"[INFO] logical-dims (auto:{mode}) → {dims}")
     else:
         topo_json = Path(topo_arg).resolve()
         assert_logical_dims_match_world(topo_json, world)
+        logical_dims = load_logical_dims(topo_json)
+
+    # 提取拓撲描述並建立帶有 GPU 數量和拓撲信息的目錄名稱
+    topo_desc = extract_topo_description(topo_arg, logical_dims)
+    logroot = Path(args.log_dir).resolve() / f"{stamp}_ns3_{world}gpu_{topo_desc}"
+    tmp_dir = logroot / "tmp"
+    out_dir = logroot / "out"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # ---------- system.json 打補丁 ----------
     sys_patched = tmp_dir / "system.patched.json"

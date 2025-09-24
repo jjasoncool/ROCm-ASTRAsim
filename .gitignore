@@ -11,3 +11,4 @@ runs/
 # Python / 編譯中間檔
 __pycache__/
 *.pyc
+data/chakra/pytorch_traces/trace_rank_*_epoch_*.json

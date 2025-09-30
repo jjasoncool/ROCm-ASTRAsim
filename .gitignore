@@ -11,4 +11,7 @@ runs/
 # Python / 編譯中間檔
 __pycache__/
 *.pyc
+
+# 訓練產生之數據檔案
 data/chakra/pytorch_traces/trace_rank_*_epoch_*.json
+data/chakra/gpu_metrics/*.json

@@ -12,6 +12,11 @@ Usage Examples:
   Full Monitor:  torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py --epochs=10 --batch-size=512 --omp-threads=4 --debug-epoch-print
   Disable GPU:   torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py --epochs=10 --disable-gpu-monitoring
 
+  batch-size diff:
+  Small Comm:    torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py --epochs=5 --batch-size=64 --grad-accum=1    # 測試延遲
+  Medium Comm:   torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py --epochs=5 --batch-size=256 --grad-accum=2   # 平衡測試
+  Large Comm:    torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py --epochs=5 --batch-size=512 --grad-accum=4   # 測試頻寬
+
 Output Files:
   - ../data/chakra/pytorch_traces/trace_rank_{rank}_epoch_{epoch}.json    # CPU+CUDA event traces
   - ../data/chakra/gpu_metrics/gpu_metrics_rank_{rank}_epoch_{epoch}.json # GPU frequency and alpha metrics
@@ -44,11 +49,14 @@ import threading
 import statistics
 from pathlib import Path
 
+# Import ROCm compatibility module
+from rocm_compat import ROCmCompat, GPUFrequencyInfo
+
 # ==================== GPU Performance Monitoring and Alpha Calculation ====================
 class GPUMonitor:
     def __init__(self, device_id=0, sample_interval=0.5):
         """
-        GPU frequency and performance monitoring system.
+        GPU frequency and performance monitoring system with ROCm compatibility.
 
         Args:
             device_id: GPU device ID for monitoring
@@ -60,41 +68,33 @@ class GPUMonitor:
         self.samples = []
         self.monitor_thread = None
 
+        # Initialize ROCm compatibility layer
+        self.rocm_compat = ROCmCompat()
+
+        # Check ROCm tool availability
+        if not self.rocm_compat.is_available():
+            print(f"[GPUMonitor] Warning: No ROCm monitoring tools available")
+        else:
+            version_info = self.rocm_compat.get_version_info()
+            print(f"[GPUMonitor] Using {version_info.tool_type.value} (version: {version_info.tool_version})")
+
     def _query_gpu_freq(self):
-        """Query current GPU frequency information."""
+        """Query current GPU frequency information using ROCm compatibility layer."""
         try:
-            result = subprocess.run(
-                ["rocm-smi", "--showclocks", "--json"],
-                capture_output=True, text=True, check=True
-            )
-            data = json.loads(result.stdout)
-
-            # Extract frequency information for corresponding GPU
-            gpu_key = f"card{self.device_id}"
-            if gpu_key not in data:
+            freq_info = self.rocm_compat.get_gpu_frequency(self.device_id)
+            if not freq_info:
                 return None
 
-            gpu_info = data[gpu_key]
-
-            # Parse frequency data (handle "(2500Mhz)" format)
-            def parse_freq(freq_str):
-                if isinstance(freq_str, str):
-                    import re
-                    match = re.search(r'(\d+(?:\.\d+)?)', freq_str.replace('(', '').replace(')', '').lower())
-                    if match:
-                        return float(match.group(1))
-                elif isinstance(freq_str, (int, float)):
-                    return float(freq_str)
-                return None
-
-            sclk = parse_freq(gpu_info.get("sclk clock speed:", "0"))
-            mclk = parse_freq(gpu_info.get("mclk clock speed:", "0"))
-
+            # Convert to legacy format for backward compatibility
             return {
-                "timestamp": time.time(),
-                "sclk_mhz": sclk,
-                "mclk_mhz": mclk,
-                "gpu_id": self.device_id
+                "timestamp": freq_info.timestamp,
+                "sclk_mhz": freq_info.sclk_mhz,
+                "mclk_mhz": freq_info.mclk_mhz,
+                "fclk_mhz": freq_info.fclk_mhz,
+                "socclk_mhz": freq_info.socclk_mhz,
+                "dcefclk_mhz": freq_info.dcefclk_mhz,
+                "gpu_id": self.device_id,
+                "tool_used": freq_info.tool_used
             }
         except Exception as e:
             print(f"[GPUMonitor] Failed to query GPU frequency: {e}")
@@ -104,7 +104,8 @@ class GPUMonitor:
         """Monitoring loop running in background thread."""
         while self.monitoring:
             sample = self._query_gpu_freq()
-            if sample and sample["sclk_mhz"] and sample["sclk_mhz"] > 0:
+            # 改善過濾條件：接受任何有效的SCLK值，包括使用MIN_CLK的情況
+            if sample and sample["sclk_mhz"] is not None:
                 self.samples.append(sample)
             time.sleep(self.sample_interval)
 
@@ -428,10 +429,6 @@ def main():
         if args.debug_epoch_print and is_main(rank):
             print(f"[Debug] Begin Epoch {epoch}")
 
-        # Start GPU monitoring
-        if gpu_monitor:
-            gpu_monitor.start_monitoring()
-
         # Record step timing
         step_times_ms = []
         epoch_start_time = time.time()
@@ -453,10 +450,21 @@ def main():
         ) as prof:
 
             loss_sum, total, correct = 0.0, 0, 0
+            gpu_monitor_started = False
+
             for step_idx, (x, y) in enumerate(iterator, start=1):
                 step_start_time = time.time()
 
                 x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+
+                # 在第一個實際 GPU 計算後啟動監控，確保 GPU 已經激活
+                if not gpu_monitor_started and gpu_monitor and step_idx == 1:
+                    # 等待第一個前向傳播完成後再開始監控
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        _ = model(x[:1])  # 小批次熱身，激活GPU
+                    gpu_monitor.start_monitoring()
+                    gpu_monitor_started = True
+
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
                     logits = model(x)

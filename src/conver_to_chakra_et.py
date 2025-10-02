@@ -62,7 +62,7 @@ try:
 except Exception:
     _HAS_IJSON = False
 
-# ROCm SMI parsing utilities
+# JSON parsing utilities
 import json as json_std
 
 # Memory detection (optional)
@@ -534,85 +534,6 @@ def _alpha_from_core_frequency(mhz: float, scale: float) -> Optional[float]:
     except Exception:
         return None
 
-def _query_rocm_smi_core_mhz() -> Optional[float]:
-    """Query GPU core frequency using ROCm SMI tool.
-
-    Attempts to retrieve shader clock frequency from the first GPU device.
-    Handles various ROCm SMI output formats and provides fallback clock sources.
-
-    Returns:
-        Core frequency in MHz, or None if query fails or GPU is idle
-    """
-    try:
-        p = subprocess.run(["rocm-smi", "--showclocks", "--json"],
-                           check=True, capture_output=True, text=True)
-        data = json_std.loads(p.stdout)
-        first = next(iter(data.values()))
-
-        def extract_mhz_from_string(text: str) -> Optional[float]:
-            """Extract MHz value from string format like '(243Mhz)'."""
-            if not isinstance(text, str):
-                return None
-            match = re.search(r'(\d+(?:\.\d+)?)', text.replace('(', '').replace(')', '').lower().replace('mhz', ''))
-            if match:
-                try:
-                    return float(match.group(1))
-                except:
-                    return None
-            return None
-
-        def parse_clock_value(value) -> Optional[float]:
-            """Parse clock value supporting multiple formats."""
-            if isinstance(value, (int, float)):
-                return float(value) if value > 0 else None
-            elif isinstance(value, str):
-                mhz = extract_mhz_from_string(value)
-                return mhz if mhz and mhz > 0 else None
-            elif isinstance(value, dict):
-                for key in ("current", "avg", "max", "min"):
-                    v = value.get(key)
-                    if v is not None:
-                        parsed = parse_clock_value(v)
-                        if parsed and parsed > 0:
-                            return parsed
-            return None
-
-        # Priority clock sources (core/shader clock preferred)
-        priority_keys = [
-            "sclk clock speed:",
-            "sclk",
-            "gfx_clock",
-            "GFX Clock (MHz)",
-            "Current Graphics Clock (MHz)"
-        ]
-
-        for key in priority_keys:
-            if key in first:
-                mhz = parse_clock_value(first[key])
-                if mhz and mhz > 0:
-                    logger.debug(f"ROCm SMI: Found core frequency {mhz} MHz from '{key}'")
-                    return mhz
-
-        # Handle idle/power-saving mode
-        logger.warning("ROCm SMI: Core clock is 0 or unavailable, GPU may be idle")
-        logger.debug(f"ROCm SMI available clocks: {list(first.keys())}")
-
-        # Fallback clocks (not suitable for alpha calculation)
-        fallback_keys = ["socclk clock speed:", "dcefclk clock speed:", "fclk clock speed:"]
-        for key in fallback_keys:
-            if key in first:
-                mhz = parse_clock_value(first[key])
-                if mhz and mhz > 0:
-                    logger.warning(f"ROCm SMI: Core clock unavailable, found {key}={mhz}MHz (reference only)")
-
-        return None
-    except subprocess.CalledProcessError as e:
-        logger.debug(f"ROCm SMI execution failed: {e}")
-        return None
-    except Exception as e:
-        logger.debug(f"ROCm SMI parsing error: {e}")
-        return None
-
 # ----------------------------- 多進程 worker -----------------------------
 
 def _worker_parse_one(args_tuple) -> Tuple[int, int, int, float, List[Tuple[float, float, float, float]], dict, Optional[str]]:
@@ -747,10 +668,6 @@ def main():
                     help="Calibration quality threshold: filter rel_err_comm > this value (default: 5.0 = 500%%)")
     ap.add_argument("--alpha-analysis-only", action="store_true",
                     help="Only analyze alpha quality from calibration database, no conversion")
-    ap.add_argument("--alpha-from-core-mhz", type=float, default=None,
-                    help="Estimate alpha from GPU core frequency (MHz): alpha_us = alpha_scale / MHz (temporary guidance)")
-    ap.add_argument("--alpha-from-rocm-smi", action="store_true",
-                    help="Use rocm-smi to read core MHz, alpha_us = alpha_scale / MHz (temporary guidance)")
     ap.add_argument("--alpha-scale", type=float, default=30.0,
                     help="Scale factor for core frequency (temporary guidance only; default: 30.0)")
     ap.add_argument("--bootstrap-alpha", action="store_true",
@@ -888,15 +805,6 @@ def main():
         return
 
     alpha_cli = args.alpha_us
-    alpha_clock: Optional[float] = None
-    if args.alpha_from_core_mhz is not None:
-        alpha_clock = _alpha_from_core_mhz(args.alpha_from_core_mhz, args.alpha_scale)
-    elif args.alpha_from_rocm_smi:
-        mhz = _query_rocm_smi_core_mhz()
-        if mhz is not None:
-            alpha_clock = _alpha_from_core_mhz(mhz, args.alpha_scale)
-        else:
-            logger.warning("rocm-smi 無法取得核心 MHz；略過核心頻率引導。")
 
     # Display alpha source statistics
     if alpha_gpu_stats.get("collected_samples", 0) > 0:
@@ -914,16 +822,13 @@ def main():
         emit_compute = False
         reason = "forced OFF by --no-emit-compute"
     else:
-        # 改進的 alpha 優先序：GPU 實測 > CLI 指定 > 校準 DB > 頻率引導 > Bootstrap
+        # Alpha 優先序：GPU 實測 > CLI 指定 > 校準 DB > Bootstrap
         if alpha_cli and alpha_cli > 0:
             alpha = alpha_cli; emit_compute = True; reason = "ON: --alpha-us provided (manual override)"
         elif alpha_gpu and alpha_gpu > 0:
             alpha = alpha_gpu; emit_compute = True; reason = f"ON: alpha from GPU measurements ({alpha_gpu_stats.get('reason', 'N/A')})"
         elif alpha_db and alpha_db > 0:
             alpha = alpha_db; emit_compute = True; reason = f"ON: alpha from calibration DB ({alpha_db_stats.get('reason', 'N/A')})"
-        elif alpha_clock and alpha_clock > 0:
-            alpha = alpha_clock; emit_compute = True; reason = f"ON: alpha from GPU core clock (scale={args.alpha_scale})"
-            logger.warning("Core frequency-derived alpha is for temporary guidance only. Please calibrate with 2-GPU setup.")
         elif args.emit_compute and args.bootstrap_alpha:
             alpha = 1.0; emit_compute = True; reason = "ON: emit-compute + bootstrap-alpha=1.0"
         elif args.bootstrap_alpha:

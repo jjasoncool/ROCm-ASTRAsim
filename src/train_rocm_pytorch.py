@@ -341,6 +341,8 @@ def main():
     ap.add_argument("--gpu-sample-interval", type=float, default=0.1, help="GPU monitoring sampling interval in seconds (default: 0.1)")
     ap.add_argument("--efficiency-min", type=float, default=0.2, help="Minimum efficiency factor for alpha calculation (default: 0.2)")
     ap.add_argument("--efficiency-max", type=float, default=0.5, help="Maximum efficiency factor for alpha calculation (default: 0.5)")
+    ap.add_argument("--no-cleanup", action="store_true", help="Skip cleaning old trace and metrics files before training")
+    ap.add_argument("--grad-accum", type=int, default=1, help="Gradient accumulation steps (default: 1)")
     args = ap.parse_args()
 
     # Use script directory as base path
@@ -359,6 +361,36 @@ def main():
 
     # Initialize distributed data parallel
     rank, world, ddp_enabled = setup_ddp()
+
+    # Clean up old traces and metrics at the start of training (only rank 0 to avoid race conditions)
+    if is_main(rank) and not args.no_cleanup:
+        print("[Cleanup] Removing old trace and metrics files...")
+        cleanup_count = 0
+
+        # Clean pytorch traces
+        for trace_file in Path(traces_dir).glob("trace_rank_*.json"):
+            try:
+                trace_file.unlink()
+                cleanup_count += 1
+            except Exception as e:
+                print(f"[Cleanup] Warning: Could not remove {trace_file.name}: {e}")
+
+        # Clean GPU metrics
+        for metrics_file in Path(gpu_metrics_dir).glob("gpu_metrics_rank_*.json"):
+            try:
+                metrics_file.unlink()
+                cleanup_count += 1
+            except Exception as e:
+                print(f"[Cleanup] Warning: Could not remove {metrics_file.name}: {e}")
+
+        print(f"[Cleanup] Removed {cleanup_count} old files. Ready for fresh training data.")
+    elif is_main(rank):
+        print("[Cleanup] Skipping cleanup (--no-cleanup specified). Old files may interfere with analysis.")
+
+    # Synchronize all ranks after cleanup
+    if ddp_enabled:
+        dist.barrier()
+
     device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK',0))}" if ddp_enabled else "cuda")
 
     # GPU monitoring setup (enabled by default unless explicitly disabled)

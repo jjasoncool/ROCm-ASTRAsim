@@ -45,14 +45,14 @@ RUN sed -i 's/\bformat(/fmt::format(/g' conf.h details/conf_impl.h details/templ
     && echo '#include <spdlog/fmt/fmt.h>' | cat - details/conf_impl.h > temp && mv temp details/conf_impl.h \
     && echo '#include <spdlog/fmt/fmt.h>' | cat - details/template_impl.h > temp && mv temp details/template_impl.h
 WORKDIR ${ASTRA_SIM}
-RUN ./build/astra_ns3/build.sh -c
+RUN ./build/astra_ns3/build.sh -c 2>&1 | tee /workspace/ns3_build_log.txt
 
 # 安裝 Chakra
 RUN pip install --no-cache-dir \
     ${ASTRA_SIM}/extern/graph_frontend/chakra
 
 # https://github.com/mlcommons/chakra/issues/195
-RUN pip install protobuf==6.31.1
+RUN pip install protobuf==6.32.1
 
 # 安裝其他 Chakra 依賴 Param
 # REF https://github.com/mlcommons/chakra/blob/main/USER_GUIDE.md

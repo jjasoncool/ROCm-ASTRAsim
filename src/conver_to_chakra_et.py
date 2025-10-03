@@ -136,6 +136,16 @@ def _infer_us_scale_from_steps(trace: Dict) -> float:
         - 1.0 for microseconds
         - 1e3 for milliseconds
     """
+    # 首先檢查 displayTimeUnit 欄位
+    display_unit = trace.get("displayTimeUnit", "").lower()
+    if "ms" in display_unit or "millisecond" in display_unit:
+        return 1e3  # ms → μs
+    elif "us" in display_unit or "microsecond" in display_unit:
+        return 1.0  # 已是 μs
+    elif "ns" in display_unit or "nanosecond" in display_unit:
+        return 1e-3  # ns → μs
+
+    # 如果沒有明確單位，則根據數值範圍推斷
     raw = []
     events = trace.get("traceEvents", []) or []
     for e in events:
@@ -165,9 +175,9 @@ def _infer_us_scale_from_steps(trace: Dict) -> float:
     if med >= 1e7:
         return 1e-3  # ns → μs
     elif med >= 1e3:
-        return 1.0  # 已是 μs
+        return 1e3   # 很可能是 ms → μs（修正關鍵錯誤）
     else:
-        return 1e3   # ms → μs
+        return 1.0   # μs
 
 def load_trace(path: Path) -> Dict:
     """Load and parse Chrome trace JSON file.
@@ -194,6 +204,9 @@ def to_ns(us: float) -> int:
 # Event classification functions
 def _is_gpu_event(ev: dict) -> bool:
     """Check if event is GPU-related based on category and arguments."""
+    name = str(ev.get("name", "")).lower()
+    if "aten::" in name:
+        return True
     cat = str(ev.get("cat", "")).lower()
     if any(tok in cat for tok in GPU_CATEGORIES):
         return True
@@ -202,7 +215,10 @@ def _is_gpu_event(ev: dict) -> bool:
 
 def _is_comm_event(ev: dict) -> bool:
     """Check if event is communication-related."""
-    s = (str(ev.get("name", "")) + " " + str(ev.get("cat", ""))).lower()
+    name = str(ev.get("name", "")).lower()
+    if "aten::" in name:
+        return False  # aten:: ops are compute, not communication
+    s = (name + " " + str(ev.get("cat", ""))).lower()
     return any(tok in s for tok in COMM_TOKENS)
 
 # Interval processing utilities
@@ -662,7 +678,6 @@ def main():
                     help="Force enable: Insert Compute nodes before each COMM (tries DB/guidance/bootstrap if no alpha)")
     ap.add_argument("--no-emit-compute", action="store_true",
                     help="Force disable: No Compute nodes even if alpha found, maintain legacy behavior")
-    ap.add_argument("--alpha-us", type=float, default=None, help="Alpha (microseconds/cycle); will try DB/guidance/bootstrap if not provided")
     ap.add_argument("--alpha-db", type=str, default="runs/calibration_all.csv", help="Alpha database (smart filtering + median selection)")
     ap.add_argument("--alpha-quality-threshold", type=float, default=5.0,
                     help="Calibration quality threshold: filter rel_err_comm > this value (default: 5.0 = 500%%)")
@@ -804,8 +819,6 @@ def main():
             print(f"  ❌ No available alpha, recommend retraining with --enable-gpu-monitoring")
         return
 
-    alpha_cli = args.alpha_us
-
     # Display alpha source statistics
     if alpha_gpu_stats.get("collected_samples", 0) > 0:
         samples = alpha_gpu_stats["collected_samples"]
@@ -822,10 +835,8 @@ def main():
         emit_compute = False
         reason = "forced OFF by --no-emit-compute"
     else:
-        # Alpha 優先序：GPU 實測 > CLI 指定 > 校準 DB > Bootstrap
-        if alpha_cli and alpha_cli > 0:
-            alpha = alpha_cli; emit_compute = True; reason = "ON: --alpha-us provided (manual override)"
-        elif alpha_gpu and alpha_gpu > 0:
+        # Alpha 優先序：GPU 實測 > 校準 DB > Bootstrap
+        if alpha_gpu and alpha_gpu > 0:
             alpha = alpha_gpu; emit_compute = True; reason = f"ON: alpha from GPU measurements ({alpha_gpu_stats.get('reason', 'N/A')})"
         elif alpha_db and alpha_db > 0:
             alpha = alpha_db; emit_compute = True; reason = f"ON: alpha from calibration DB ({alpha_db_stats.get('reason', 'N/A')})"
@@ -876,15 +887,19 @@ def main():
                     # （可選）Compute
                     if emit_compute:
                         compute_cycles = max(1, int(round(comp_us / alpha)))
+                        if args.debug:
+                            print(f"[Debug] Step {idx:04d}: comp_us={comp_us:.0f}, alpha={alpha:.6f}, compute_cycles={compute_cycles}")
                         comp_node = ChakraNode()
                         comp_node.id = node_id; node_id += 1
                         comp_node.name = "Compute Step"
                         comp_node.type = COMPUTE_ENUM
+                        # 必要 attributes - 使用 ASTRA-sim 期望的屬性名稱
                         comp_node.attr.append(ChakraAttr(name="is_cpu_op", bool_val=False))
-                        comp_node.attr.append(ChakraAttr(name="compute_cycles", int64_val=compute_cycles))
-                        comp_node.attr.append(ChakraAttr(name="exec_cycles",     int64_val=compute_cycles))
-                        comp_node.attr.append(ChakraAttr(name="cycles",          int64_val=compute_cycles))
-                        comp_node.attr.append(ChakraAttr(name="duration_cycles", int64_val=compute_cycles))
+                        comp_node.attr.append(ChakraAttr(name="runtime", int64_val=compute_cycles))  # 主要屬性
+                        comp_node.attr.append(ChakraAttr(name="compute_cycles", int64_val=compute_cycles))  # 備用
+                        comp_node.attr.append(ChakraAttr(name="exec_cycles",     int64_val=compute_cycles))  # 備用
+                        comp_node.attr.append(ChakraAttr(name="cycles",          int64_val=compute_cycles))  # 備用
+                        comp_node.attr.append(ChakraAttr(name="duration_cycles", int64_val=compute_cycles))  # 備用
                         if not args.no_ts_attrs:
                             comp_node.attr.append(ChakraAttr(name="ts_ns",      int64_val=ts_ns))
                             comp_node.attr.append(ChakraAttr(name="compute_ns", int64_val=to_ns(comp_us)))

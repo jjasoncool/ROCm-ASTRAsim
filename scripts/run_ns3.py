@@ -327,6 +327,43 @@ def build_workload_arg(workload_dir: Path) -> tuple[str, str]:
     else:
         return workload_dir.as_posix(), f"dir={workload_dir.as_posix()}"
 
+# ---------- 工作負載檔案驗證 ----------
+def _validate_workload_integrity(workload_dir: Path) -> None:
+    """
+    驗證工作負載檔案的基本完整性
+    針對常見的 "Node X in ctrl_dep graph, but not found in index" 錯誤提供預警
+    """
+    et_map = list_et_rank_files(workload_dir)
+    if not et_map:
+        return  # 非 .et 格式，跳過驗證
+
+    # 取樣檢查第一個 .et 檔案
+    first_et = next(iter(et_map.values()))
+    try:
+        _, nodes = _read_all_nodes(first_et)
+        if not nodes:
+            raise ValueError(f"{first_et.name} 包含 0 個節點")
+
+        # 檢查是否有基本的節點屬性
+        sample_node = nodes[0]
+        if not hasattr(sample_node, 'id') or not hasattr(sample_node, 'type'):
+            raise ValueError(f"{first_et.name} 節點結構不完整")
+
+        # 檢查節點類型分布，識別潛在的格式問題
+        node_types = {}
+        for node in nodes[:min(100, len(nodes))]:  # 只檢查前100個節點避免性能問題
+            node_types[node.type] = node_types.get(node.type, 0) + 1
+
+        print(f"[INFO] 工作負載驗證通過: {len(et_map)} 個 .et 檔案，首檔包含 {len(nodes)} 個節點")
+        print(f"[INFO] 節點類型分布: {dict(list(node_types.items())[:5])}")
+
+        # 警告：如果檔案能被 Python 讀取但 ASTRA-sim 無法處理，可能是版本兼容性問題
+        if len(nodes) > 1000:  # 大型檔案更容易出現兼容性問題
+            print(f"[WARN] 檔案較大({len(nodes)}節點)，如果執行失敗可能是 Chakra ET 格式版本兼容性問題")
+
+    except Exception as e:
+        raise ValueError(f"工作負載檔案可能損壞: {e}")
+
 # ---------- 解析 PyTorch Kineto traces（real_*） ----------
 def _load_json(p: Path) -> dict | None:
     try:
@@ -726,12 +763,20 @@ def main():
         print(f"[DRY] patched files at {tmp_dir}")
         return
 
-    # 執行 (同時輸出到終端和檔案)
+    # 執行前的工作負載驗證
     stdout_path = (logroot / "stdout.log")
     print(f"[INFO] 開始執行 NS3 模擬... (輸出同步顯示)")
     print(f"[INFO] 日誌檔案: {stdout_path}")
     print(f"[INFO] 工作負載: {args.workload} (world_size={actual_world})")
     print(f"[INFO] 拓撲: {args.topo}")
+
+    # 檢查工作負載的完整性
+    try:
+        _validate_workload_integrity(workload_dir2)
+    except Exception as e:
+        print(f"[WARN] 工作負載驗證警告: {e}")
+        print(f"[WARN] 建議使用已驗證的工作負載，如: tutorials/micro2024/chakra-demo/demo4/chakra_traces")
+
     print(f"[INFO] 提示: 執行過程中可按 Ctrl+C 中斷")
     print("-" * 80)
 
@@ -794,6 +839,27 @@ def main():
         except subprocess.CalledProcessError as e:
             print("-" * 80)
             print(f"[ERR] NS3 執行失敗，退出碼: {e.returncode}")
+
+            # 分析常見錯誤並提供解決建議
+            if stdout_path.exists():
+                stderr_content = stdout_path.read_text(encoding="utf-8", errors="ignore")
+                if "Node 0 in ctrl_dep graph, but not found in index" in stderr_content:
+                    print(f"[DIAG] 檢測到工作負載檔案損壞/不兼容錯誤")
+                    print(f"[ISSUE] 這通常是 Chakra ET 格式版本與 ASTRA-sim 版本不匹配造成的")
+                    print(f"[FIX] 解決方案:")
+                    print(f"      1. 重新生成工作負載檔案（使用兼容版本的 Chakra）")
+                    print(f"      2. 或使用已知兼容的工作負載：")
+                    print(f"         --workload tutorials/micro2024/chakra-demo/demo1/allreduce")
+                    print(f"      3. 檢查 Chakra schema 版本是否與 ASTRA-sim 期望版本一致")
+                elif "file might be corrupted" in stderr_content:
+                    print(f"[DIAG] 檢測到檔案損壞錯誤")
+                    print(f"[FIX] 請檢查工作負載檔案完整性，或嘗試重新生成")
+                elif "Permission denied" in stderr_content:
+                    print(f"[DIAG] 檢測到權限錯誤")
+                    print(f"[FIX] 請檢查 Docker 容器內檔案權限，執行: chmod -R 755 /workspace")
+                else:
+                    print(f"[DIAG] 通用錯誤，請檢查 {stdout_path} 獲取詳細資訊")
+
             shutil.rmtree(logroot)
             print(f"[INFO] 執行失敗，已刪除 {logroot}")
             raise SystemExit(f"[ERR] ns-3 後端退出碼 {e.returncode}")

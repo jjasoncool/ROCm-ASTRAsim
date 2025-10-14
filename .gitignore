@@ -13,5 +13,6 @@ __pycache__/
 *.pyc
 
 # 訓練產生之數據檔案
-data/chakra/pytorch_traces/trace_rank_*_epoch_*.json
+data/chakra/pytorch_traces/*.json
 data/chakra/gpu_metrics/*.json
+data/chakra/workload_et/*.et

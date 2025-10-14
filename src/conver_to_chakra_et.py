@@ -1,941 +1,752 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PyTorch Chrome Trace to Chakra protobuf ET Converter
+Link PyTorch host/device traces -> HDT (ET+), then convert to Chakra ET (.et)
 
-This module converts PyTorch profiler traces to Chakra execution traces for
-simulation-based performance analysis and workload modeling.
+=== AMD GPU 兼容性修補說明 ===
+本腳本包含對 AMD GPU (ROCm/HIP) 的特殊支援修補。
 
-Core Features:
-- Multi-epoch trace processing with automatic unit detection
-- GPU compute and communication pattern extraction
-- Configurable performance parameter calibration
-- High-performance multi-core processing
-- Chakra protobuf format compliance
+問題：Chakra 原本為 NVIDIA GPU 設計，無法識別 AMD GPU 的 NCCL kernel 命名格式
+- NVIDIA: "ncclKernel_AllReduce_..." (明確指出操作類型)
+- AMD:    "ncclDevKernel_Generic_4(...)" (使用 Generic，不明確指出操作類型)
 
-Input:  ../data/chakra/pytorch_traces/trace_rank_{rank}_epoch_{epoch}.json
-Output: ../data/chakra/workload_et/allreduce.{rank}.et
+解決方案：動態修補 (monkey patching)
+1. 在運行時替換 PyTorchConverter.get_collective_comm_type 方法
+2. 新增對 "ncclDevKernel_Generic" 格式的識別，映射到 ALL_REDUCE
+3. 保持對原有 NVIDIA GPU 格式的完全兼容
 
-Alpha calibration sources (priority order):
-1. CLI specification (--alpha-us)
-2. GPU metrics from training
-3. Calibration database (runs/calibration_all.csv)
-4. GPU core frequency estimation
-5. Bootstrap mode
+優勢：
+- 非入侵性：不修改 Chakra 主程式碼
+- 向前兼容：支援未來 Chakra 版本更新
+- 安全：如果修補失敗，自動回退到原始行為
 
-Requirements:
-- chakra.schema.protobuf.et_def_pb2
-- chakra.src.third_party.utils.protolib
+資料夾結構（預設）：
+  ./data/chakra/
+    ├─ pytorch_traces/   # host_*.json / device_*.json 來源，同時輸出 hdt_*.json
+    └─ workload_et/      # 輸出 .et (<prefix>.<rank>.et)
+
+預設行為：
+  - 先清空 pytorch_traces/hdt_*.json 與 workload_et/*.et
+  - 強制覆寫輸出
+  - 自動偵測 ranks（由 host_*.json / device_*.json 的檔名）
+  - 自動應用 AMD GPU 修補
+
+用法：
+  python ./src/conver_to_chakra_et.py
+  # 保留舊檔且不強制覆寫
+  python ./src/conver_to_chakra_et.py --no-clean --no-force
+  # 只轉指定 ranks
+  python ./src/conver_to_chakra_et.py --ranks 0 1
+  # 以 device_*.json 內容自動命名前綴
+  python ./src/conver_to_chakra_et.py --et-prefix auto
 """
-
 from __future__ import annotations
-import os
-import re
-import csv
+
 import argparse
-import bisect
-import statistics
+import json
+import re
+import shutil
 import subprocess
-import logging
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
-# Logging configuration (--debug enables DEBUG level)
-logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
-logger = logging.getLogger("et_convert")
+# ------------------------------------------------------------------
+# 轉檔後：DAG 修正所需（Chakra protobuf）
+# ------------------------------------------------------------------
+from chakra.src.third_party.utils.protolib import decodeMessage as _decode_msg
+from chakra.src.third_party.utils.protolib import encodeMessage as _encode_msg
+from chakra.schema.protobuf.et_def_pb2 import GlobalMetadata, Node, AttributeProto, COMM_COLL_NODE, ALL_REDUCE  # type: ignore
 
-# JSON backend: prefer orjson, fallback to standard json
-try:
-    import orjson as _json
-    def _load_json_bytes(b: bytes): return _json.loads(b)
-    _JSON_BACKEND = "orjson"
-except Exception:
-    import json as _json
-    def _load_json_bytes(b: bytes): return _json.loads(b.decode("utf-8"))
-    _JSON_BACKEND = "json"
+# --------------------------- AMD GPU 修補 ---------------------------
 
-# ijson for streaming (optional) - this version focuses on batch processing
-try:
-    import ijson
-    _HAS_IJSON = True
-except Exception:
-    _HAS_IJSON = False
-
-# JSON parsing utilities
-import json as json_std
-
-# Memory detection (optional)
-try:
-    import psutil
-    _HAS_PSUTIL = True
-except Exception:
-    _HAS_PSUTIL = False
-
-# Chakra protobuf dependencies
-from chakra.src.third_party.utils.protolib import encodeMessage as encode_message
-from chakra.schema.protobuf.et_def_pb2 import (
-    Node as ChakraNode,
-    BoolList,
-    GlobalMetadata,
-    AttributeProto as ChakraAttr,
-    COMM_COLL_NODE,
-    ALL_REDUCE,
-)
-
-# Compute enum (different names in different versions)
-try:
-    from chakra.schema.protobuf.et_def_pb2 import COMP_NODE as COMPUTE_ENUM
-except Exception:
-    try:
-        from chakra.schema.protobuf.et_def_pb2 import COMPUTE_NODE as COMPUTE_ENUM
-    except Exception:
-        COMPUTE_ENUM = None
-
-# Configuration constants
-STEP_PATTERN = re.compile(r"^ProfilerStep#\d+$")
-RANK_EPOCH_PATTERN = re.compile(r"rank_(\d+)_epoch_(\d+)\.json$", re.IGNORECASE)
-
-# GPU event detection tokens
-GPU_CATEGORIES = ("kernel", "gpu", "cuda", "hip", "hcc", "gfx", "memcpy", "memset", "driver", "runtime", "hsa")
-GPU_ARG_KEYS = ("Device", "device", "Stream", "stream", "queue", "Queue Id", "Correlation ID")
-
-# Communication detection tokens
-COMM_TOKENS = ("nccl", "rccl", "allreduce", "all_reduce", "allgather", "all_gather",
-               "reducescatter", "reduce_scatter", "alltoall", "broadcast")
-
-# Utility functions
-def rank_epoch_from_name(p: Path) -> Tuple[int, int]:
-    """Extract rank and epoch from filename."""
-    m = RANK_EPOCH_PATTERN.search(p.name)
-    if not m:
-        raise ValueError(f"Cannot parse rank/epoch from filename: {p.name}")
-    return int(m.group(1)), int(m.group(2))
-
-def get_world_size(trace: Dict) -> int:
-    """Extract world size from trace metadata."""
-    di = trace.get("distributedInfo", {}) or {}
-    return int(di.get("world_size", 1))
-
-def to_ns(us: float) -> int:
-    """Convert microseconds to nanoseconds."""
-    return int(round(us * 1000.0))
-
-def _infer_us_scale_from_steps(trace: Dict) -> float:
-    """Infer time unit scale factor by analyzing ProfilerStep durations.
-
-    Automatically detects whether timestamps are in nanoseconds, microseconds,
-    or milliseconds based on median duration values.
-
-    Args:
-        trace: Chrome trace data dictionary
-
-    Returns:
-        Scale factor to convert to microseconds:
-        - 1e-3 for nanoseconds
-        - 1.0 for microseconds
-        - 1e3 for milliseconds
+def apply_amd_gpu_patch():
     """
-    # 首先檢查 displayTimeUnit 欄位
-    display_unit = trace.get("displayTimeUnit", "").lower()
-    if "ms" in display_unit or "millisecond" in display_unit:
-        return 1e3  # ms → μs
-    elif "us" in display_unit or "microsecond" in display_unit:
-        return 1.0  # 已是 μs
-    elif "ns" in display_unit or "nanosecond" in display_unit:
-        return 1e-3  # ns → μs
+    修補 PyTorchConverter 類以支援 AMD GPU 的 NCCL kernel 識別
 
-    # 如果沒有明確單位，則根據數值範圍推斷
-    raw = []
-    events = trace.get("traceEvents", []) or []
-    for e in events:
-        if not isinstance(e, dict): continue
-        if e.get("ph") != "X": continue
-        nm = e.get("name", "")
-        if isinstance(nm, str) and STEP_PATTERN.match(nm):
-            d = e.get("dur", None)
-            if d is not None:
-                try: raw.append(float(d))
-                except Exception: pass
-            if len(raw) >= 64:  # 取樣 64 筆即可
-                break
-    if not raw:
-        # 沒找到 step，就用所有事件 dur 略估
-        for e in events[:2048]:
-            if not isinstance(e, dict): continue
-            if e.get("ph") != "X": continue
-            d = e.get("dur", None)
-            if d is not None:
-                try: raw.append(float(d))
-                except Exception: pass
-    if not raw:
-        # 保守視為 μs
-        return 1.0
-    med = statistics.median(raw)
-    if med >= 1e7:
-        return 1e-3  # ns → μs
-    elif med >= 1e3:
-        return 1e3   # 很可能是 ms → μs（修正關鍵錯誤）
-    else:
-        return 1.0   # μs
+    === 問題背景 ===
+    AMD GPU 使用不同的 NCCL kernel 命名格式，原始 Chakra 只支援 NVIDIA 格式。
 
-def load_trace(path: Path) -> Dict:
-    """Load and parse Chrome trace JSON file.
+    原始支援的格式：
+    - "ncclKernel_*" (NVIDIA 標準格式)
+    - "ncclDevKernel_*" (NVIDIA 開發格式)
 
-    Args:
-        path: Path to trace file
+    AMD GPU 的實際格式：
+    - "ncclDevKernel_Generic_4(ncclDevKernelArgsStorage<4096ul>)" (AMD 專用格式)
 
-    Returns:
-        Parsed trace data dictionary
+    === 修補方法 ===
+    修補 get_protobuf_node_type_from_json_node 方法，擴展 NCCL kernel 識別邏輯
 
-    Raises:
-        RuntimeError: If file loading or JSON parsing fails
+    該方法負責決定節點的類型：
+    - COMP_NODE (4): 計算節點
+    - COMM_COLL_NODE (7): 集體通訊節點
+    - COMM_SEND_NODE (5): 點對點發送
+    - COMM_RECV_NODE (6): 點對點接收
     """
     try:
-        data = path.read_bytes()
-        return _load_json_bytes(data)
-    except Exception as ex:
-        raise RuntimeError(f"Failed to load/parse JSON: {path}") from ex
+        from chakra.src.converter.pytorch_converter import PyTorchConverter
+        from chakra.schema.protobuf.et_def_pb2 import COMM_COLL_NODE
 
-def to_ns(us: float) -> int:
-    """Convert microseconds to nanoseconds."""
-    return int(round(us * 1000.0))
+        # 保存原始方法的引用
+        original_method = PyTorchConverter.get_protobuf_node_type_from_json_node
 
-# Event classification functions
-def _is_gpu_event(ev: dict) -> bool:
-    """Check if event is GPU-related based on category and arguments."""
-    name = str(ev.get("name", "")).lower()
-    if "aten::" in name:
+        def patched_get_protobuf_node_type_from_json_node(self, json_node_map, json_node):
+            """
+            修補版本的節點類型判斷方法
+
+            首先檢查是否為 AMD GPU NCCL 操作，然後回退到原始邏輯
+
+            Args:
+                json_node_map: JSON 節點映射
+                json_node: 要判斷類型的節點
+
+            Returns:
+                int: 節點類型常數
+            """
+            # 記錄 GPU 操作用於除錯
+            if json_node.is_gpu_op():
+                print(f"[patch] 檢查 GPU 操作: {json_node.name}")
+
+                # 檢查 AMD GPU NCCL Generic kernel
+                if "ncclDevKernel_Generic" in json_node.name:
+                    print(f"[patch] 偵測到 AMD GPU NCCL Generic kernel -> COMM_COLL_NODE")
+                    return COMM_COLL_NODE
+
+            # 對於所有其他情況，使用原始方法處理
+            return original_method(self, json_node_map, json_node)
+
+        # 動態替換類方法
+        PyTorchConverter.get_protobuf_node_type_from_json_node = patched_get_protobuf_node_type_from_json_node
+        print("[patch] 已成功修補 get_protobuf_node_type_from_json_node 方法，支援 AMD GPU NCCL kernels")
         return True
-    cat = str(ev.get("cat", "")).lower()
-    if any(tok in cat for tok in GPU_CATEGORIES):
-        return True
-    args = ev.get("args", {}) or {}
-    return any(k in args for k in GPU_ARG_KEYS)
 
-def _is_comm_event(ev: dict) -> bool:
-    """Check if event is communication-related."""
-    name = str(ev.get("name", "")).lower()
-    if "aten::" in name:
-        return False  # aten:: ops are compute, not communication
-    s = (name + " " + str(ev.get("cat", ""))).lower()
-    return any(tok in s for tok in COMM_TOKENS)
-
-# Interval processing utilities
-def _overlap(a0: float, a1: float, b0: float, b1: float) -> float:
-    """Calculate overlap between two intervals."""
-    return max(0.0, min(a1, b1) - max(a0, b0))
-
-def _merge_intervals(intervals: List[Tuple[float, float]]) -> List[Tuple[float,float]]:
-    """Merge overlapping intervals into union."""
-    if not intervals:
-        return []
-    intervals.sort()
-    merged = [intervals[0]]
-    for s, e in intervals[1:]:
-        ps, pe = merged[-1]
-        if s <= pe:
-            merged[-1] = (ps, max(pe, e))
-        else:
-            merged.append((s, e))
-    return merged
-
-def _intervals_length(intervals: List[Tuple[float,float]]) -> float:
-    """Calculate total length of interval list."""
-    return sum(e - s for s, e in intervals)
-
-def _subtract_intervals(a: List[Tuple[float,float]], b: List[Tuple[float,float]]) -> List[Tuple[float,float]]:
-    """Return A \\ B interval subtraction (assumes sorted inputs)."""
-    if not a or not b:
-        return a[:]
-    out = []
-    i = j = 0
-    while i < len(a):
-        s, e = a[i]
-        while j < len(b) and b[j][1] <= s:
-            j += 1
-        cur_s = s
-        while j < len(b) and b[j][0] < e:
-            bs, be = b[j]
-            if bs > cur_s:
-                out.append((cur_s, bs))
-            cur_s = max(cur_s, be)
-            j += 1
-            if cur_s >= e:
-                break
-        if cur_s < e:
-            out.append((cur_s, e))
-        i += 1
-    return out
-
-def _extract_steps_us(trace: Dict, scale_us: float) -> List[Tuple[float, float]]:
-    """Extract ProfilerStep boundaries converted to microseconds."""
-    steps: List[Tuple[float, float]] = []
-    events = trace.get("traceEvents", [])
-    if not isinstance(events, list):
-        return steps
-    for e in events:
-        if not isinstance(e, dict):
-            continue
-        if e.get("ph") != "X":
-            continue
-        name = e.get("name")
-        if not isinstance(name, str) or not STEP_PATTERN.match(name):
-            continue
-        try:
-            ts = float(e.get("ts", 0.0)) * scale_us
-            dur = float(e.get("dur", 0.0)) * scale_us
-        except Exception:
-            continue
-        if dur > 0:
-            steps.append((ts, ts + dur))
-    steps.sort()
-    return steps
-
-def collect_step_aggregates_union_gpu_only(trace: Dict, steps: List[Tuple[float, float]], scale_us: float
-                                           ) -> Tuple[List[Tuple[float, float, float, float]], dict]:
-    """Extract GPU compute and communication metrics from trace events.
-
-    Processes only GPU events to avoid CPU overhead contamination.
-    Uses interval union operations to eliminate overlapping duration counts.
-
-    Args:
-        trace: Chrome trace data
-        steps: List of (start_us, end_us) step boundaries
-        scale_us: Time unit conversion factor
-
-    Returns:
-        Tuple of:
-        - List of (start_us, end_us, compute_us, exposed_comm_us) per step
-        - Statistics dictionary with event counts
-    """
-    if not steps:
-        return [], {"gpu_event_cnt": 0, "comm_event_cnt": 0}
-
-    starts = [s for s, _ in steps]
-    ends   = [e for _, e in steps]
-
-    comp_intervals: List[List[Tuple[float,float]]] = [[] for _ in steps]
-    comm_intervals: List[List[Tuple[float,float]]] = [[] for _ in steps]
-
-    gpu_cnt = 0
-    comm_cnt = 0
-
-    events = trace.get("traceEvents", [])
-    if not isinstance(events, list):
-        return [(s, e, 0.0, 0.0) for s, e in steps], {"gpu_event_cnt": 0, "comm_event_cnt": 0}
-
-    for ev in events:
-        if not isinstance(ev, dict): continue
-        if ev.get("ph") != "X": continue
-
-        if not _is_gpu_event(ev):
-            continue
-        gpu_cnt += 1
-
-        try:
-            ev_s = float(ev.get("ts", 0.0)) * scale_us
-            ev_e = ev_s + float(ev.get("dur", 0.0)) * scale_us
-        except Exception:
-            continue
-        if ev_e <= ev_s:
-            continue
-
-        # 定位第一個可能相交步
-        i = bisect.bisect_right(ends, ev_s)
-        i = max(0, i - 1)
-
-        is_comm = _is_comm_event(ev)
-        if is_comm:
-            comm_cnt += 1
-
-        while i < len(steps) and starts[i] < ev_e:
-            inter_s = max(starts[i], ev_s)
-            inter_e = min(ends[i], ev_e)
-            if inter_e > inter_s:
-                if is_comm:
-                    comm_intervals[i].append((inter_s, inter_e))
-                else:
-                    comp_intervals[i].append((inter_s, inter_e))
-            i += 1
-
-    out: List[Tuple[float, float, float, float]] = []
-    for k, (s, e) in enumerate(steps):
-        comp_m = _merge_intervals(comp_intervals[k])
-        comm_m = _merge_intervals(comm_intervals[k])
-        comp_len = _intervals_length(comp_m)
-        # 暴露通訊 = comm_union 減去 compute_union 的覆蓋
-        comm_exposed = _intervals_length(_subtract_intervals(comm_m, comp_m))
-        out.append((s, e, comp_len, comm_exposed))
-
-    info = {"gpu_event_cnt": gpu_cnt, "comm_event_cnt": comm_cnt}
-    return out, info
-
-# ----------------------------- α（引導/讀取） -----------------------------
-
-def _read_gpu_metrics_for_alpha(gpu_metrics_dir: Path, rank: int, epoch: int) -> Optional[float]:
-    """
-    從對應的 GPU 指標檔案讀取建議的 alpha 值
-
-    Args:
-        gpu_metrics_dir: GPU 指標目錄
-        rank: rank ID
-        epoch: epoch ID
-
-    Returns:
-        alpha_us: 建議的 alpha 值（μs/週期），若找不到則回傳 None
-    """
-    if not gpu_metrics_dir.exists():
-        return None
-
-    # 尋找對應的 GPU 指標檔案
-    metrics_file = gpu_metrics_dir / f"gpu_metrics_rank_{rank}_epoch_{epoch}.json"
-    if not metrics_file.exists():
-        return None
-
-    try:
-        with metrics_file.open("r", encoding="utf-8") as f:
-            data = json_std.load(f)
-
-        # 提取建議的 alpha 值
-        alpha_calcs = data.get("alpha_calculations", {})
-        if "alpha_us_recommended" in alpha_calcs:
-            return float(alpha_calcs["alpha_us_recommended"])
-
-        # 如果沒有建議值，嘗試其他值
-        for key in ["alpha_us_eff_0.3", "alpha_us_eff_0.2", "alpha_us_eff_0.5"]:
-            if key in alpha_calcs:
-                return float(alpha_calcs[key])
-
-        return None
     except Exception as e:
-        logger.warning(f"Failed to read GPU metrics {metrics_file}: {e}")
-        return None
+        print(f"[patch] 修補失敗: {e}")
+        print("[patch] 這可能是因為 Chakra 版本不兼容或導入錯誤")
+        return False
 
-def _collect_alpha_from_gpu_metrics(gpu_metrics_dir: Path, results_by_rank: Dict) -> Tuple[Optional[float], dict]:
+
+def patch_collective_comm_type_for_amd():
     """
-    從所有可用的 GPU 指標檔案收集 alpha 值並統計
+    動態修補 Chakra 的 get_collective_comm_type 方法，支援 AMD GPU 的 NCCL kernel 名稱。
+
+    === 問題背景 ===
+    Chakra 原本為 NVIDIA GPU (CUDA) 設計，其 get_collective_comm_type 方法只能識別標準的
+    NCCL collective 命名格式如 "allreduce", "allgather" 等。但是 AMD GPU (ROCm/HIP)
+    在執行 NCCL 操作時會產生特殊的 kernel 名稱格式：
+    "ncclDevKernel_Generic_4(ncclDevKernelArgsStorage<4096ul>)"
+
+    === 根本原因 ===
+    AMD GPU 的 HIP runtime 和 NVIDIA 的 CUDA runtime 在 profiling 時產生的 kernel 名稱
+    格式不同。AMD GPU 使用 "Generic" 作為通用 NCCL kernel 的標識符，而不是明確指出
+    操作類型（如 allreduce）。這導致 Chakra 無法從名稱中推斷出 collective 操作類型。
+
+    === 修補策略 ===
+    1. 非入侵性修補：不修改 Chakra 主程式碼，而是在運行時動態替換方法
+    2. 向前兼容：保留原始方法的所有功能，只新增 AMD GPU 支援
+    3. 合理推測：將 "ncclDevKernel_Generic" 映射到 ALL_REDUCE（深度學習中最常見的操作）
+
+    === 技術實現 ===
+    使用 Python 的動態特性（monkey patching）在運行時替換類方法。
+    這樣可以在不修改原始程式碼的情況下擴展功能。
+    """
+    try:
+        from chakra.src.converter.pytorch_converter import PyTorchConverter
+        from chakra.schema.protobuf.et_def_pb2 import ALL_REDUCE
+
+        # 保存原始方法的引用，以便在修補版本中調用
+        original_method = PyTorchConverter.get_collective_comm_type
+
+        def patched_get_collective_comm_type(self, name: str) -> int:
+            """
+            修補版本的 get_collective_comm_type 方法
+
+            優先處理 AMD GPU 的特殊格式，然後回退到原始邏輯處理標準格式。
+
+            Args:
+                name (str): GPU kernel 的名稱
+
+            Returns:
+                int: 對應的 collective communication 類型常數
+
+            AMD GPU & 通用 NCCL 操作識別：
+            - "ncclDevKernel_Generic_X" 格式 → ALL_REDUCE (0)
+            - "nccl_all_reduce", "nccl:all_reduce" → ALL_REDUCE (0)
+            - "c10d::allreduce_" → ALL_REDUCE (0)
+            - 包含 "allreduce" 的操作 → ALL_REDUCE (0)
+            """
+            # 記錄所有調用用於除錯
+            print(f"[patch] 檢查通訊操作: {name}")
+
+            # 處理 AMD GPU 的 ncclDevKernel_Generic_X 格式
+            if "ncclDevKernel_Generic" in name:
+                print(f"[patch] 偵測到 AMD GPU NCCL Generic kernel: {name} -> ALL_REDUCE")
+                return ALL_REDUCE
+
+            # 處理標準 NCCL AllReduce 操作
+            if any(pattern in name.lower() for pattern in [
+                "nccl_all_reduce", "nccl:all_reduce", "c10d::allreduce", "allreduce"
+            ]):
+                print(f"[patch] 偵測到 NCCL AllReduce 操作: {name} -> ALL_REDUCE")
+                return ALL_REDUCE
+
+            # 對於所有其他情況，使用原始方法處理
+            # 這確保了對 NVIDIA GPU 和標準命名格式的完全向後兼容
+            return original_method(self, name)
+
+        # 動態替換類方法（monkey patching）
+        # 這會影響所有後續創建的 PyTorchConverter 實例
+        PyTorchConverter.get_collective_comm_type = patched_get_collective_comm_type
+        print("[patch] 已成功修補 get_collective_comm_type 方法，支援 AMD GPU NCCL kernels")
+        return True
+
+    except Exception as e:
+        print(f"[patch] 修補失敗: {e}")
+        print("[patch] 這可能是因為 Chakra 版本不兼容或導入錯誤")
+        return False
+
+# --------------------------- 共用工具 ---------------------------
+
+def run_one(cmd: List[str]) -> bool:
+    print("  $", " ".join(map(str, cmd)), flush=True)
+    out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    print(out.stdout.rstrip())
+    return out.returncode == 0
+
+
+def detect_ranks(pt_dir: Path, ranks_arg: Optional[List[str]]) -> List[int]:
+    if ranks_arg:
+        return sorted(set(int(r) for r in ranks_arg))
+    hosts = {p.stem.split("_")[-1] for p in pt_dir.glob("host_*.json")}
+    devs  = {p.stem.split("_")[-1] for p in pt_dir.glob("device_*.json")}
+    common = sorted({int(r) for r in hosts & devs})
+    if not common:
+        raise SystemExit(f"在 {pt_dir} 找不到成對的 host_*.json / device_*.json")
+    return common
+
+
+def clean_outputs(pt_dir: Path, et_dir: Path) -> None:
+    removed = 0
+    for p in pt_dir.glob("hdt_*.json"):
+        try:
+            p.unlink(); removed += 1
+        except Exception as e:
+            print(f"[warn] 無法刪除 {p.name}: {e}")
+    print(f"[clean] 移除 {removed} 個舊的 HDT 檔（pytorch_traces/hdt_*.json）")
+    et_dir.mkdir(parents=True, exist_ok=True)
+    removed = 0
+    for p in et_dir.glob("*.et"):
+        try:
+            p.unlink(); removed += 1
+        except Exception as e:
+            print(f"[warn] 無法刪除 {p.name}: {e}")
+    print(f"[clean] 移除 {removed} 個舊的 ET 檔（workload_et/*.et）\n")
+
+
+def infer_prefix_from_device(device_json: Path) -> str:
+    txt = device_json.read_text(encoding="utf-8", errors="ignore").lower()
+    kinds = {
+        "allreduce":      [r"nccl:all_reduce", r"nccl_all_reduce", r"c10d::allreduce_", r"\ballreduce\b"],
+        "allgather":      [r"nccl:all_gather", r"\ballgather\b", r"c10d::allgather_"],
+        "reducescatter":  [r"nccl:reduce_scatter", r"\breducescatter\b", r"c10d::reducescatter_"],
+        "broadcast":      [r"nccl:broadcast", r"\bbroadcast\b", r"c10d::broadcast_"],
+    }
+    cnt: Dict[str, int] = {}
+    for k, pats in kinds.items():
+        c = 0
+        for p in pats:
+            c += len(re.findall(p, txt))
+        cnt[k] = c
+    if any(cnt.values()):
+        return max(cnt, key=cnt.get)
+    return "workload"
+
+
+# --------------------------- 連結 & 轉換 ---------------------------
+
+def link_host_device(rank: int, host: Path, device: Path, out_hdt: Path) -> None:
+    print(f"[link] rank={rank}  host={host.name}  device={device.name}  -> {out_hdt.name}")
+    out_hdt.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "chakra_trace_link",
+        f"--rank={rank}",
+        "--chakra-host-trace", str(host),
+        "--chakra-device-trace", str(device),
+        "--output-file", str(out_hdt),
+        "--log-level", "WARNING"  # 降低 log 噪音，聚焦錯誤
+    ]
+    if not run_one(cmd):
+        raise RuntimeError(f"chakra_trace_link 執行失敗，請檢查 trace 檔案或更新 Chakra/HTA 版本。")
+    print("[ok] chakra_trace_link 完成\n")
+
+
+def convert_hdt_to_et(hdt: Path, out_et: Path) -> None:
+    """
+    將 HDT (Chakra 中間格式) 轉換為 ET (執行追蹤) 格式
+
+    === 修補策略說明 ===
+    由於 AMD GPU 的特殊 NCCL kernel 命名格式問題，我們需要在轉換前先修補
+    Chakra 的 collective communication 識別邏輯。
+
+    === 為什麼要直接調用而不是使用命令行 ===
+    1. 命令行工具 (chakra_converter) 啟動新的 Python 進程
+    2. 新進程不會繼承我們的動態修補 (monkey patch)
+    3. 直接調用 Python API 可以確保修補在同一進程中生效
+    4. 如果直接調用失敗，提供命令行工具作為備選方案
+    """
+    print(f"[convert] {hdt.name}  ->  {out_et.name}")
+
+    # === 第一步：應用 AMD GPU 修補 ===
+    # 在轉換前先修補 AMD GPU 支援，這必須在同一 Python 進程中完成
+    node_type_patch_success = apply_amd_gpu_patch()
+    comm_type_patch_success = patch_collective_comm_type_for_amd()
+    if not (node_type_patch_success and comm_type_patch_success):
+        print("[warn] AMD GPU 修補失敗，可能在遇到 ncclDevKernel_Generic 時出錯")
+        print("[warn] 如果您使用的是 AMD GPU，轉換可能會失敗")
+
+    out_et.parent.mkdir(parents=True, exist_ok=True)
+
+    # === 第二步：直接調用 Chakra 轉換器 API ===
+    # 這是關鍵：直接調用而不是使用命令行工具，確保修補生效
+    try:
+        from chakra.src.converter.pytorch_converter import PyTorchConverter
+        converter = PyTorchConverter()
+        # simulate=False: 不進行模擬，只做轉換
+        converter.convert(str(hdt), str(out_et), False)
+        print("[ok] chakra_converter (直接調用) 完成\n")
+    except Exception as e:
+        print(f"[error] chakra_converter 直接調用失敗: {e}")
+        print("[fallback] 嘗試使用命令行工具作為備選方案...")
+        print("[warn] 注意：命令行工具不會受到我們的 AMD GPU 修補影響")
+
+        # === 備選方案：命令行工具 ===
+        # 如果直接調用失敗，回退到原始的命令行工具
+        # 但這不會有 AMD GPU 修補的效果
+        cmd = ["chakra_converter", "PyTorch", "--input", str(hdt), "--output", str(out_et)]
+        if not run_one(cmd):
+            raise RuntimeError(f"chakra_converter 執行失敗，請檢查 HDT 檔案。")
+
+
+# --------------------------- 轉檔後：DAG 修正 ---------------------------
+
+def _decode_et(et_path: Path) -> tuple[GlobalMetadata, list[Node]]:
+    """安全解碼整個 .et（metadata + nodes）"""
+    size = et_path.stat().st_size
+    with et_path.open("rb") as f:
+        meta = GlobalMetadata()
+        _decode_msg(f, meta)
+        nodes: list[Node] = []
+        while f.tell() < size:
+            n = Node()
+            try:
+                _decode_msg(f, n)
+            except Exception:
+                break
+            nodes.append(n)
+    return meta, nodes
+
+
+def _encode_et(out_path: Path, meta: GlobalMetadata, nodes: list[Node]) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("wb") as f:
+        _encode_msg(f, meta)
+        for n in nodes:
+            _encode_msg(f, n)
+
+
+def _get_ctrl(n: Node) -> list[int]:
+    if hasattr(n, "ctrl_deps"):
+        return list(n.ctrl_deps)
+    if hasattr(n, "parent"):
+        return list(n.parent)
+    return []
+
+
+def _set_ctrl(n: Node, deps: list[int]) -> None:
+    if hasattr(n, "ctrl_deps"):
+        del n.ctrl_deps[:]; n.ctrl_deps.extend(deps)
+    elif hasattr(n, "parent"):
+        del n.parent[:]; n.parent.extend(deps)
+
+
+def _get_data(n: Node) -> list[int]:
+    """獲取節點的 data_deps"""
+    if hasattr(n, "data_deps"):
+        return list(n.data_deps)
+    return []
+
+
+def _set_data(n: Node, deps: list[int]) -> None:
+    """設置節點的 data_deps"""
+    if hasattr(n, "data_deps"):
+        del n.data_deps[:]; n.data_deps.extend(deps)
+
+
+def _clean_all_deps(n: Node, unsupported_ids: set[int]) -> tuple[int, int]:
+    """
+    清理節點的所有依賴類型，移除對不支援節點的引用
 
     Returns:
-        (best_alpha, stats_info)
+        (ctrl_deps_cleaned_count, data_deps_cleaned_count)
     """
-    if not gpu_metrics_dir or not gpu_metrics_dir.exists():
-        return None, {"reason": "GPU metrics directory not found"}
+    ctrl_cleaned = 0
+    data_cleaned = 0
 
-    alpha_values = []
-    collected_info = []
-    missing_files = []
-    total_attempts = 0
+    # 清理 ctrl_deps
+    ctrl_deps = _get_ctrl(n)
+    if ctrl_deps:
+        new_ctrl = [d for d in ctrl_deps if d not in unsupported_ids]
+        if len(new_ctrl) != len(ctrl_deps):
+            _set_ctrl(n, new_ctrl)
+            ctrl_cleaned = len(ctrl_deps) - len(new_ctrl)
 
-    for rank, epochs_aggs in results_by_rank.items():
-        for epoch, _ in epochs_aggs:
-            total_attempts += 1
-            alpha = _read_gpu_metrics_for_alpha(gpu_metrics_dir, rank, epoch)
-            if alpha and alpha > 0:
-                alpha_values.append(alpha)
-                collected_info.append({
-                    "rank": rank,
-                    "epoch": epoch,
-                    "alpha_us": alpha
-                })
-            else:
-                # 記錄缺失的檔案
-                metrics_file = gpu_metrics_dir / f"gpu_metrics_rank_{rank}_epoch_{epoch}.json"
-                if not metrics_file.exists():
-                    missing_files.append(f"rank_{rank}_epoch_{epoch}")
+    # 清理 data_deps
+    data_deps = _get_data(n)
+    if data_deps:
+        new_data = [d for d in data_deps if d not in unsupported_ids]
+        if len(new_data) != len(data_deps):
+            _set_data(n, new_data)
+            data_cleaned = len(data_deps) - len(new_data)
 
-    # 提供詳細統計信息
-    stats = {
-        "source": "GPU metrics from training",
-        "collected_samples": len(alpha_values),
-        "total_attempts": total_attempts,
-        "missing_files_count": len(missing_files),
-        "details": collected_info
-    }
+    return ctrl_cleaned, data_cleaned
 
-    # 如果有缺失檔案，記錄警告
-    if missing_files:
-        logger.warning(f"Missing {len(missing_files)} GPU metrics files: {missing_files[:5]}{'...' if len(missing_files) > 5 else ''}")
-        stats["missing_files"] = missing_files
 
-    if alpha_values:
-        best_alpha = statistics.median(alpha_values)
-        stats.update({
-            "chosen_alpha": best_alpha,
-            "alpha_range": (min(alpha_values), max(alpha_values)),
-            "reason": f"median of {len(alpha_values)} GPU-measured alpha values"
-        })
-        return best_alpha, stats
-    else:
-        stats["reason"] = "no GPU metrics found with valid alpha"
-        return None, stats
-
-def _read_alpha_us_from_db(db_path: Path, quality_threshold: float = 5.0) -> Tuple[Optional[float], dict]:
-    """Load performance parameter alpha from calibration database.
-
-    Applies quality filtering to select reliable calibration results:
-    - Filters out entries with high relative communication error
-    - Excludes entries where communication equals wall-clock time
+def fix_et_dag_inplace(et_file: Path, break_cycles: bool = True, astra_sim_compat: bool = True) -> dict[str, int]:
+    """
+    就地修正：移除自依賴與不存在的依賴；必要時斷開循環（back-edges）；
+    並可選擇性地移除不支援的節點類型以兼容 ASTRA-sim。
 
     Args:
-        db_path: Path to calibration CSV file
-        quality_threshold: Maximum acceptable relative error percentage
+        et_file: ET 檔案路徑
+        break_cycles: 是否斷開循環依賴
+        astra_sim_compat: 是否進行 ASTRA-sim 兼容性過濾
 
-    Returns:
-        Tuple of (best_alpha_value, statistics_dict)
+    回傳：修正統計 {self_deps_removed, missing_deps_removed, cycles_removed, unsupported_nodes_removed}
     """
-    if not db_path.exists():
-        return None, {"reason": "DB file not found"}
+    meta, nodes = _decode_et(et_file)
+    id_set = {n.id for n in nodes}
+    stats = {"self_deps_removed": 0, "missing_deps_removed": 0, "cycles_removed": 0, "unsupported_nodes_removed": 0}
 
-    all_vals: List[float] = []
-    good_vals: List[float] = []
-    filtered_out = {"high_rel_err": 0, "comm_equals_wall": 0, "invalid_data": 0}
+    # === ASTRA-sim 兼容性檢查 ===
+    if astra_sim_compat:
+        # 經過源碼與實務測試，ASTRA-sim 的 overlap 抽取僅對 GPU/COMM 類事件計算重疊。
+        # 因此：將 metadata / process_group 等「不應進排程」的節點移除，並清理對它們的依賴。
+        # 另外：對 COMM 類事件補齊必要欄位（group_id/comm_size），避免 size=0 或缺欄。
+        unsupported_ids: set[int] = set()
+        cleaned_nodes: list[Node] = []
 
-    with db_path.open("r", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            try:
-                alpha = float(row.get("alpha_us", ""))
-                if alpha <= 0:
-                    continue
-                all_vals.append(alpha)
+        # 1) 判斷「不該進排程」的節點（PG/metadata）
+        def _is_pg_or_metadata(nn: Node) -> bool:
+            nm = (getattr(nn, "name", "") or "").lower()
+            if "process_group" in nm or nm.startswith("## process_group"):
+                return True
+            # 以 Attribute 名稱判斷：含 pg_name/pg_desc/backend_config/group_size/ranks 等
+            for a in nn.attr:
+                if a.name in ("pg_name", "pg_desc", "backend_config", "group_size", "ranks"):
+                    return True
+            return False
 
-                # 檢查相對誤差
-                rel_err_comm = float(row.get("rel_err_comm", "0"))
-                flags = row.get("flags", "")
+        for n in nodes:
+            if _is_pg_or_metadata(n):
+                unsupported_ids.add(n.id)
 
-                # 過濾條件
-                if rel_err_comm > quality_threshold:
-                    filtered_out["high_rel_err"] += 1
-                    continue
+        # 2) 先清理所有節點對「不支援節點」的依賴
+        if unsupported_ids:
+            for nn in nodes:
+                _clean_all_deps(nn, unsupported_ids)
 
-                if "comm_equals_wall" in flags:  # 通訊等於牆鐘時間（compute ≈ 0）
-                    filtered_out["comm_equals_wall"] += 1
-                    continue
+        # 3) 過濾：移除不支援節點
+        for n in nodes:
+            if n.id in unsupported_ids:
+                stats["unsupported_nodes_removed"] += 1
+                continue
+            cleaned_nodes.append(n)
+        nodes = cleaned_nodes
 
-                good_vals.append(alpha)
-
-            except Exception:
-                filtered_out["invalid_data"] += 1
+        # 4) 對 COMM 類事件補欄位：group_id / comm_size（若缺值或 <=0）
+        for n in nodes:
+            # 偵測 COMM 的方式：優先看 comm_type 屬性；若無，再嘗試根據名稱/屬性推斷
+            has_comm_attr = any(a.name == "comm_type" for a in n.attr)
+            if not has_comm_attr:
+                # 可能是早期或被 converter 改名；這裡保守處理：若無 comm_type，就略過補欄位
                 continue
 
-    stats = {
-        "total_records": len(all_vals),
-        "good_records": len(good_vals),
-        "filtered_out": filtered_out,
-        "all_alpha_range": (min(all_vals), max(all_vals)) if all_vals else None,
-        "good_alpha_range": (min(good_vals), max(good_vals)) if good_vals else None,
-        "quality_threshold": quality_threshold
-    }
+            # group_id 補 0（若缺）
+            if not any(a.name in ("group_id", "comm_group_id", "pg_id") for a in n.attr):
+                b = n.attr.add()
+                b.name = "group_id"
+                b.int64_val = 0
 
-    if good_vals:
-        best_alpha = statistics.median(good_vals)
-        stats["chosen_alpha"] = best_alpha
-        stats["reason"] = f"median of {len(good_vals)} good calibrations"
-        return best_alpha, stats
-    elif all_vals:
-        # 如果沒有「好」的校準，但有數據，回傳最小值（通常較保守）
-        fallback_alpha = min(all_vals)
-        stats["chosen_alpha"] = fallback_alpha
-        stats["reason"] = f"fallback: min of {len(all_vals)} records (all had quality issues)"
-        return fallback_alpha, stats
+            # comm_size：若缺或 <=0，嘗試從其它欄位回推；最後保底 1KB
+            size_attr = next((a for a in n.attr if a.name == "comm_size"), None)
+            size_val = size_attr.int64_val if size_attr is not None else None
+            if size_val is None or size_val <= 0:
+                alt = next(
+                    (a.int64_val for a in n.attr
+                     if a.name in ("size_bytes", "tensor_bytes", "message_size", "nccl_size")
+                     and hasattr(a, "int64_val") and a.int64_val > 0),
+                    None
+                )
+                if alt is None:
+                    numel = next((a.int64_val for a in n.attr if a.name == "numel"), None)
+                    el_sz = next((a.int64_val for a in n.attr if a.name in ("dtype_size", "element_size")), None)
+                    alt = (numel * el_sz) if (numel and el_sz) else None
+                if alt is None:
+                    alt = 1024  # 最小保底，避免 0 破壞 ASTRA 的網路時間估測
+                if size_attr is None:
+                    size_attr = n.attr.add(); size_attr.name = "comm_size"
+                size_attr.int64_val = int(alt)
+
+        supported_nodes = nodes
     else:
-        stats["reason"] = "no valid alpha_us data found"
-        return None, stats
+        # 沒有啟用 astra_sim_compat，保持所有原始節點
+        supported_nodes = nodes
 
-def _alpha_from_core_frequency(mhz: float, scale: float) -> Optional[float]:
-    """Calculate alpha from core frequency: alpha_us = scale / MHz (temporary guidance only)."""
-    try:
-        mhz = float(mhz)
-        return (scale / mhz) if mhz > 0 else None
-    except Exception:
-        return None
+    # 更新節點列表
+    nodes = supported_nodes
+    id_set = {n.id for n in nodes}
 
-# ----------------------------- 多進程 worker -----------------------------
+    # === 原有的依賴清理邏輯 ===
+    # 去自依賴 & 移除不存在依賴（針對 ctrl_deps）
+    for n in nodes:
+        deps = _get_ctrl(n)
+        nd = []
+        for d in deps:
+            if d == n.id:
+                stats["self_deps_removed"] += 1
+                continue
+            if d not in id_set:
+                stats["missing_deps_removed"] += 1
+                continue
+            nd.append(d)
+        if len(nd) != len(deps):
+            _set_ctrl(n, nd)
 
-def _worker_parse_one(args_tuple) -> Tuple[int, int, int, float, List[Tuple[float, float, float, float]], dict, Optional[str]]:
-    """Worker process function for parallel trace file processing.
+    # 同樣處理 data_deps
+    for n in nodes:
+        deps = _get_data(n)
+        if deps:
+            nd = []
+            for d in deps:
+                if d == n.id:
+                    stats["self_deps_removed"] += 1
+                    continue
+                if d not in id_set:
+                    stats["missing_deps_removed"] += 1
+                    continue
+                nd.append(d)
+            if len(nd) != len(deps):
+                _set_data(n, nd)
 
-    Parses a single trace file and extracts performance metrics.
-    Designed for use with ProcessPoolExecutor for scalable processing.
+    if break_cycles:
+        # dep -> node 邊（以 ctrl 依賴構圖）
+        id_to_node = {n.id: n for n in nodes}
+        out_edges: dict[int, list[int]] = {nid: [] for nid in id_set}
+        for nn in nodes:
+            for d in _get_ctrl(nn):
+                out_edges.setdefault(d, []).append(nn.id)
 
-    Args:
-        args_tuple: (path_str, max_steps, keep_every, rebase_ts)
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color: dict[int, int] = {nid: WHITE for nid in id_set}
 
-    Returns:
-        Tuple of (rank, epoch, world_size, scale_factor, aggregates, info, error_msg)
-    """
-    (path_str, max_steps, keep_every, rebase_ts) = args_tuple
-    p = Path(path_str)
-    try:
-        r, e = rank_epoch_from_name(p)
-    except Exception:
-        return 0, 0, 0, 1.0, [], {}, f"檔名解析失敗: {p.name}"
-    try:
-        trace = load_trace(p)
-        world = get_world_size(trace)
-        scale_us = _infer_us_scale_from_steps(trace)
-        steps = _extract_steps_us(trace, scale_us)
-        if not steps:
-            return r, e, world, scale_us, [], {}, f"{p.name} 無 ProfilerStep 事件"
-        # 聚合（GPU-only + de-overlap + exposed_comm）
-        agg, info = collect_step_aggregates_union_gpu_only(trace, steps, scale_us)
+        def dfs(u: int):
+            color[u] = GRAY
+            for v in list(out_edges.get(u, [])):
+                if color[v] == WHITE:
+                    dfs(v)
+                elif color[v] == GRAY:
+                    # back-edge u->v：移除 v 的 ctrl_deps 中的 u
+                    cn = id_to_node[v]
+                    deps = _get_ctrl(cn)
+                    if u in deps:
+                        _set_ctrl(cn, [x for x in deps if x != u])
+                        stats["cycles_removed"] += 1
+            color[u] = BLACK
 
-        # 篩步數與抽樣
-        if max_steps is not None and max_steps > 0:
-            agg = agg[:max_steps]
-        if keep_every > 1:
-            agg = agg[::keep_every]
+        for nid in list(id_set):
+            if color[nid] == WHITE:
+                dfs(nid)
 
-        # rebase_ts：讓本檔內 ts 以第一步起點為 0（跨檔銜接在主進程處理）
-        if rebase_ts and agg:
-            base = agg[0][0]
-            agg = [(s - base, e - base, cu, mu) for (s, e, cu, mu) in agg]
+    # 覆寫檔案
+    _encode_et(et_file, meta, nodes)
+    return stats
 
-        return r, e, world, scale_us, agg, info, None
-    except Exception as ex:
-        return r, e, 0, 1.0, [], {}, f"讀/解/聚合失敗: {p.name} ({ex})"
 
-# ----------------------------- 計算 bytes -----------------------------
+# --------------------------- ASTRA-sim 兼容版本生成 ---------------------------
 
-def per_gpu_allreduce_bytes(world_size: int, model_param_bytes: int) -> int:
-    """Calculate AllReduce bytes per GPU for ring algorithm.
+def extract_comm_nodes_from_hdt(hdt_file: Path) -> List[Dict]:
+    """從 HDT JSON 檔案中提取通訊相關節點"""
+    with hdt_file.open('r') as f:
+        data = json.load(f)
 
-    Uses ring topology formula: 2*(N-1)/N * model_bytes
-    For N=2, this approximates to model_bytes per GPU.
+    nodes = data.get('nodes', [])
+    comm_nodes = []
 
-    Args:
-        world_size: Number of GPUs in distributed training
-        model_param_bytes: Total model parameter size in bytes
+    for node in nodes:
+        name = node.get('name', '').lower()
+        # 識別通訊相關節點
+        if any(keyword in name for keyword in [
+            'nccl', 'allreduce', 'all_reduce', 'comm',
+            'c10d::allreduce', 'nccldevkernel'
+        ]):
+            comm_nodes.append(node)
 
-    Returns:
-        Bytes transferred per GPU per AllReduce operation
-    """
-    return int(2 * (world_size - 1) / world_size * model_param_bytes)
+    print(f"[comm-extract] 從 {hdt_file.name} 找到 {len(comm_nodes)} 個通訊節點")
+    return comm_nodes
 
-# ----------------------------- jobs/記憶體 -----------------------------
 
-def _estimate_memory_jobs(args, files: List[Path]) -> int:
-    """Estimate optimal number of parallel jobs based on memory constraints."""
-    jobs = max(1, int(args.jobs))
-    sample = files[:8]
-    sizes_mb = [max(1, p.stat().st_size // (1024*1024)) for p in sample] or [64]
-    median_mb = statistics.median(sizes_mb)
-    est_worker_mb = max(64, int(median_mb * args.mem_overhead_factor))
+def extract_comm_size_from_node(node: Dict) -> int:
+    """從節點中提取通訊大小（以字節為單位）"""
+    # 檢查 inputs 中的張量大小
+    inputs = node.get('inputs', {})
+    values = inputs.get('values', [])
+    total_size = 0
 
-    avail_mb = None
-    if args.max_memory_mb:
-        avail_mb = max(256, int(args.max_memory_mb))
-    elif _HAS_PSUTIL:
-        try:
-            avail_mb = max(256, int(psutil.virtual_memory().available // (1024*1024)))
-        except Exception:
-            pass
+    for value in values:
+        if isinstance(value, list) and len(value) >= 4:
+            try:
+                # 計算張量大小 (假設 Float32 = 4 bytes)
+                shape_elements = 1
+                for dim in value[:-2]:  # 除了最後兩個元素（dtype, device）
+                    if isinstance(dim, int):
+                        shape_elements *= dim
+                tensor_size = shape_elements * 4
+                total_size += tensor_size
+            except (ValueError, TypeError):
+                total_size += 1024 * 1024  # 1MB 預設
 
-    if avail_mb:
-        cap = max(1, int(avail_mb // est_worker_mb))
-        jobs = min(jobs, cap)
-    else:
-        cpu = os.cpu_count() or 2
-        jobs = min(jobs, max(1, cpu // 2))
+    # 檢查屬性中是否有明確的大小信息
+    attrs = node.get('attrs', [])
+    for attr in attrs:
+        if attr.get('name') == 'comm_size':
+            return int(attr.get('value', total_size))
 
-    return max(1, jobs)
+    return max(total_size, 1024 * 1024)  # 至少 1MB
 
-# ----------------------------- 主程式 -----------------------------
+
+def create_astra_sim_et(comm_nodes: List[Dict], output_file: Path, rank: int) -> None:
+    """創建 ASTRA-sim 兼容的簡化 ET 檔案"""
+    print(f"[astra-et] 創建簡化 ET 檔案: {output_file.name}")
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with output_file.open("wb") as et:
+        # 1. 寫入 metadata
+        metadata = GlobalMetadata(version="0.0.4")
+        _encode_msg(et, metadata)
+
+        # 2. 為每個通訊操作創建簡化節點
+        for i, comm_node in enumerate(comm_nodes):
+            node = Node()
+            node.id = i
+            node.name = f"AMD_GPU_COMM_{rank}_{i}"
+            node.type = COMM_COLL_NODE
+
+            # 添加必要屬性
+            node.attr.append(AttributeProto(name="is_cpu_op", bool_val=False))
+            node.attr.append(AttributeProto(name="comm_type", int64_val=ALL_REDUCE))
+
+            # 提取並設定通訊大小
+            comm_size = extract_comm_size_from_node(comm_node)
+            node.attr.append(AttributeProto(name="comm_size", int64_val=comm_size))
+
+            # 設定必要的依賴關係（簡化版本：每個節點依賴前一個）
+            if i > 0:
+                node.data_deps.append(i - 1)
+
+            _encode_msg(et, node)
+            print(f"  [node] {i}: {comm_node.get('name', 'unknown')} -> 大小 {comm_size} bytes")
+
+    print(f"[astra-et] ✅ 簡化 ET 檔案完成: {output_file}")
+
+
+# --------------------------- 主流程 ---------------------------
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--traces-dir", default=None,
-                    help="Trace directory (default: script_dir/../data/chakra/pytorch_traces)")
-    ap.add_argument("--out-dir", default=None,
-                    help="Output .et directory (default: script_dir/../data/chakra/workload_et)")
-    ap.add_argument("--gpu-metrics-dir", default=None,
-                    help="GPU metrics directory (default: script_dir/../data/chakra/gpu_metrics)")
-    ap.add_argument("--trace-pattern", default="trace_rank_*.json",
-                    help="Input trace filename pattern (default: trace_rank_*.json, multi-epoch supported)")
-
-    # Legacy parameters
-    ap.add_argument("--dtype", choices=["fp32", "fp16"], default="fp32",
-                    help="Gradient dtype (affects ALLREDUCE bytes calculation)")
-    ap.add_argument("--model-param-count", type=int, default=17159306,
-                    help="Model parameter count (default: ~17M for CIFAR10_CNN)")
-    ap.add_argument("--override-bytes", type=int, default=10485760,
-                    help="Direct specification of ALLREDUCE bytes per step per GPU (10MB/step)")
-    ap.add_argument("--meta-version", default="0.0.4",
-                    help="GlobalMetadata version (default: 0.0.4)")
-    ap.add_argument("--file-prefix", default="allreduce",
-                    help="Output filename prefix (default: allreduce → allreduce.{rank}.et)")
-    ap.add_argument("--debug", action="store_true", help="Print detailed step metrics for debugging")
-
-    # Large file management
-    ap.add_argument("--epoch-min", type=int, default=None, help="Only process epochs >= this value")
-    ap.add_argument("--epoch-max", type=int, default=None, help="Only process epochs <= this value")
-    ap.add_argument("--max-steps-per-epoch", type=int, default=None, help="Maximum steps to export per epoch")
-    ap.add_argument("--keep-every", type=int, default=1, help="Keep every N steps (default: 1 = keep all)")
-    ap.add_argument("--no-ts-attrs", action="store_true", help="Omit timestamp attributes to reduce .et file size")
-
-    # Compute node configuration (auto-enabled if alpha available)
-    ap.add_argument("--emit-compute", action="store_true",
-                    help="Force enable: Insert Compute nodes before each COMM (tries DB/guidance/bootstrap if no alpha)")
-    ap.add_argument("--no-emit-compute", action="store_true",
-                    help="Force disable: No Compute nodes even if alpha found, maintain legacy behavior")
-    ap.add_argument("--alpha-db", type=str, default="runs/calibration_all.csv", help="Alpha database (smart filtering + median selection)")
-    ap.add_argument("--alpha-quality-threshold", type=float, default=5.0,
-                    help="Calibration quality threshold: filter rel_err_comm > this value (default: 5.0 = 500%%)")
-    ap.add_argument("--alpha-analysis-only", action="store_true",
-                    help="Only analyze alpha quality from calibration database, no conversion")
-    ap.add_argument("--alpha-scale", type=float, default=30.0,
-                    help="Scale factor for core frequency (temporary guidance only; default: 30.0)")
-    ap.add_argument("--bootstrap-alpha", action="store_true",
-                    help="If no alpha, use temporary alpha=1.0 μs/cycle to insert Compute (separate Compute/Comm for later calibration)")
-
-    # Timestamp processing
-    ap.add_argument("--rebase-ts", action="store_true", help="Make cross-epoch ts_ns monotonically increasing")
-
-    # Bytes alias
-    ap.add_argument("--bytes-per-step", type=int, default=None,
-                    help="Alias for --override-bytes; takes priority if both specified")
-
-    # Multi-core/memory management
-    ap.add_argument("--jobs", type=int, default=os.cpu_count() or 2,
-                    help="Number of parallel processing workers (default: CPU core count)")
-    ap.add_argument("--max-memory-mb", type=int, default=None,
-                    help="Maximum allowed memory usage (MB). If specified, limits jobs accordingly")
-    ap.add_argument("--mem-overhead-factor", type=float, default=2.0,
-                    help="Memory overhead factor for worker estimation (default: 2.0 × median file size)")
-
+    ap = argparse.ArgumentParser(description="Link PyTorch host/device -> HDT, then convert to Chakra ET (.et)")
+    ap.add_argument("--base-dir", default="./data/chakra", help="根目錄（預設：./data/chakra）")
+    ap.add_argument("--pt-dir",   default="pytorch_traces", help="host_*.json / device_*.json 與 hdt_*.json 目錄（相對 base-dir）")
+    ap.add_argument("--et-dir",   default="workload_et",    help="輸出 .et 目錄（相對 base-dir）")
+    ap.add_argument("--et-prefix",default="et",             help="輸出 .et 檔名前綴（可用 'auto' 自動偵測）")
+    ap.add_argument("--ranks", nargs="*", help="只處理指定 ranks（預設自動偵測）")
+    ap.add_argument("--no-clean", action="store_true", help="不要清空舊的 hdt_*.json 與 *.et")
+    ap.add_argument("--no-force", action="store_true", help="不要覆寫已存在的 .et")
+    ap.add_argument("--simple-astra", action="store_true", help="生成 ASTRA-sim 兼容的簡化版本（僅通訊節點）")
     args = ap.parse_args()
-    if args.debug:
-        logger.setLevel(logging.DEBUG)
 
-    # 路徑
-    script_dir = Path(__file__).resolve().parent
-    traces_dir = Path(args.traces_dir).resolve() if args.traces_dir \
-        else (script_dir / "../data/chakra/pytorch_traces").resolve()
-    out_dir    = Path(args.out_dir).resolve() if args.out_dir \
-        else (script_dir / "../data/chakra/workload_et").resolve()
-    gpu_metrics_dir = Path(args.gpu_metrics_dir).resolve() if args.gpu_metrics_dir \
-        else (script_dir / "../data/chakra/gpu_metrics").resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    base   = Path(args.base_dir).resolve()
+    pt_dir = (base / args.pt_dir).resolve()
+    et_dir = (base / args.et_dir).resolve()
 
-    print(f"[paths] traces={traces_dir}  out={out_dir}  gpu_metrics={gpu_metrics_dir}  json_backend={_JSON_BACKEND}")
+    print(f"[paths]\n  base={base}\n  pt_dir={pt_dir}\n  et_dir={et_dir}\n")
 
-    # File collection and filtering
-    trace_files_all = sorted(traces_dir.glob(args.trace_pattern))
-    if not trace_files_all:
-        raise FileNotFoundError(f"No files matching {args.trace_pattern} found in {traces_dir}")
+    # 檢查工具是否存在
+    if shutil.which("chakra_trace_link") is None:
+        print("[warn] 找不到 chakra_trace_link（請確認已安裝且在 PATH）")
+    if shutil.which("chakra_converter") is None:
+        print("[warn] 找不到 chakra_converter（請確認已安裝且在 PATH）")
 
-    trace_files: List[Path] = []
-    for p in trace_files_all:
-        try:
-            _, e = rank_epoch_from_name(p)
-        except Exception:
-            continue
-        if args.epoch_min is not None and e < args.epoch_min: continue
-        if args.epoch_max is not None and e > args.epoch_max: continue
-        trace_files.append(p)
-        if not trace_files:
-            raise RuntimeError("No trace files match criteria. Check --epoch-min/max and filename format.")    # Dynamic job estimation
-    jobs = _estimate_memory_jobs(args, trace_files)
-    print(f"[jobs] requested={args.jobs} → using={jobs}")
+    # 預設清空舊檔
+    if not args.no_clean:
+        clean_outputs(pt_dir, et_dir)
 
-    # 多進程解析
-    worlds: List[int] = []
-    scales: List[float] = []
-    results_by_rank: Dict[int, List[Tuple[int, List[Tuple[float, float, float, float]]]]] = {}
-    infos_by_rank_epoch: Dict[Tuple[int,int], dict] = {}
+    # 決定要處理哪些 rank
+    ranks = detect_ranks(pt_dir, args.ranks)
+    print(f"[ranks] 將處理：{ranks}\n")
 
-    worker_args = [(str(p), args.max_steps_per_epoch, args.keep_every, args.rebase_ts) for p in trace_files]
-    with ProcessPoolExecutor(max_workers=jobs) as ex:
-        futs = [ex.submit(_worker_parse_one, a) for a in worker_args]
-        for fut in as_completed(futs):
-            r, e, world, scale_us, agg, info, err = fut.result()
-            if err:
-                logger.warning(err)
-            if world == 0 and not agg:
-                # 壞檔或解析失敗，跳過
-                continue
-            results_by_rank.setdefault(r, []).append((e, agg))
-            infos_by_rank_epoch[(r,e)] = info
-            if world > 0: worlds.append(world)
-            scales.append(scale_us)
+    force = not args.no_force
 
-    ranks = sorted(results_by_rank.keys())
-    if not ranks:
-        raise RuntimeError("No valid trace data found (files may be corrupted or filtered out).")
-
-    world_size = max(worlds) if worlds else 1
-    scale_median = statistics.median(scales) if scales else 1.0
-    print(f"[scale] inferred_time_scale_to_μs ≈ {scale_median:.6g}")
-
-    # dtype → bytes
-    dtype_bytes = 4 if args.dtype == "fp32" else 2
-    model_param_bytes = args.model_param_count * dtype_bytes
-    if args.bytes_per_step is not None:
-        bytes_per_step = int(args.bytes_per_step)
-    elif args.override_bytes is not None:
-        bytes_per_step = int(args.override_bytes)
-    else:
-        bytes_per_step = per_gpu_allreduce_bytes(world_size, model_param_bytes)
-    print(f"[info] world_size={world_size}  bytes_per_step={bytes_per_step}  dtype={args.dtype}")
-
-    # 是否插 Compute 與 α（改進的優先序）
-    alpha_gpu, alpha_gpu_stats = _collect_alpha_from_gpu_metrics(gpu_metrics_dir, results_by_rank)
-    alpha_db, alpha_db_stats = _read_alpha_us_from_db(Path(args.alpha_db), args.alpha_quality_threshold)
-
-    # Alpha calibration quality analysis mode
-    if args.alpha_analysis_only:
-        print(f"\n=== Alpha Calibration Quality Analysis ===")
-        print(f"GPU metrics directory: {gpu_metrics_dir}")
-        print(f"Calibration database: {args.alpha_db}")
-        print(f"Quality threshold: rel_err_comm ≤ {args.alpha_quality_threshold}")
-
-        # GPU metrics results
-        print(f"\n【GPU Metrics】{alpha_gpu_stats.get('reason', 'N/A')}")
-        if alpha_gpu_stats.get("collected_samples", 0) > 0:
-            samples = alpha_gpu_stats["collected_samples"]
-            alpha_range = alpha_gpu_stats.get("alpha_range")
-            print(f"  Collected {samples} GPU-measured alpha values")
-            if alpha_range:
-                print(f"  Range: {alpha_range[0]:.6f} ~ {alpha_range[1]:.6f} μs/cycle")
-            if alpha_gpu_stats.get("chosen_alpha"):
-                print(f"  Recommended: {alpha_gpu_stats['chosen_alpha']:.6f} μs/cycle")
-
-        # Calibration database results
-        print(f"\n【Calibration Database】{alpha_db_stats.get('reason', 'N/A')}")
-        if alpha_db_stats.get("total_records", 0) > 0:
-            total = alpha_db_stats["total_records"]
-            good = alpha_db_stats["good_records"]
-            print(f"  Total calibration records: {total}, good quality: {good}")
-            if alpha_db_stats.get("chosen_alpha"):
-                print(f"  Recommended: {alpha_db_stats['chosen_alpha']:.6f} μs/cycle")
-
-        # Summary recommendations
-        print(f"\n【Recommendations】")
-        if alpha_gpu and alpha_gpu > 0:
-            print(f"  ✅ Use GPU-measured alpha = {alpha_gpu:.6f} μs/cycle (most accurate)")
-        elif alpha_db and alpha_db > 0:
-            print(f"  ⚠️  Use calibration DB alpha = {alpha_db:.6f} μs/cycle (check quality)")
-        else:
-            print(f"  ❌ No available alpha, recommend retraining with --enable-gpu-monitoring")
-        return
-
-    # Display alpha source statistics
-    if alpha_gpu_stats.get("collected_samples", 0) > 0:
-        samples = alpha_gpu_stats["collected_samples"]
-        alpha_range = alpha_gpu_stats.get("alpha_range", (0, 0))
-        print(f"  └─ Collected {samples} training-measured alpha values, range: {alpha_range[0]:.6f} ~ {alpha_range[1]:.6f}")
-
-    if alpha_db_stats.get("total_records", 0) > 0:
-        total = alpha_db_stats["total_records"]
-        good = alpha_db_stats["good_records"]
-        print(f"  └─ Calibration DB: {total} total records, {good} good quality")
-
-    alpha: Optional[float] = None
-    if args.no_emit_compute:
-        emit_compute = False
-        reason = "forced OFF by --no-emit-compute"
-    else:
-        # Alpha 優先序：GPU 實測 > 校準 DB > Bootstrap
-        if alpha_gpu and alpha_gpu > 0:
-            alpha = alpha_gpu; emit_compute = True; reason = f"ON: alpha from GPU measurements ({alpha_gpu_stats.get('reason', 'N/A')})"
-        elif alpha_db and alpha_db > 0:
-            alpha = alpha_db; emit_compute = True; reason = f"ON: alpha from calibration DB ({alpha_db_stats.get('reason', 'N/A')})"
-        elif args.emit_compute and args.bootstrap_alpha:
-            alpha = 1.0; emit_compute = True; reason = "ON: emit-compute + bootstrap-alpha=1.0"
-        elif args.bootstrap_alpha:
-            alpha = 1.0; emit_compute = True; reason = "AUTO: bootstrap-alpha=1.0"
-        else:
-            emit_compute = False; reason = "AUTO: no alpha → COMM-only"
-    if emit_compute and COMPUTE_ENUM is None:
-        emit_compute = False
-        reason = "Compute enum missing in your Chakra build → fallback OFF"
-
-    print(f"[compute] emit_compute={emit_compute}  alpha={alpha if alpha else 'N/A'}  ({reason})")
-
-    # 逐 rank 輸出 .et
     for r in ranks:
-        epochs_aggs = sorted(results_by_rank[r], key=lambda x: x[0])
+        host = pt_dir / f"host_{r}.json"
+        dev  = pt_dir / f"device_{r}.json"
+        if not host.exists() or not dev.exists():
+            print(f"[skip] rank {r} 檔案不完整：{host.name if host.exists() else '缺 host'} / {dev.name if dev.exists() else '缺 device'}")
+            continue
 
-        ts_offset_us = 0.0
-        et_path = out_dir / f"{args.file_prefix}.{r}.et"
-        total_steps_written = 0
+        # HDT 放在 pytorch_traces 內
+        hdt = pt_dir / f"hdt_{r}.json"
 
-        # 檢查是否觀察到 GPU 事件（用於旗標輸出）
-        gpu_seen = any((infos_by_rank_epoch.get((r,e), {}).get("gpu_event_cnt", 0) > 0) for e, _ in epochs_aggs)
-        comm_gpu_seen = any((infos_by_rank_epoch.get((r,e), {}).get("comm_event_cnt", 0) > 0) for e, _ in epochs_aggs)
+        # 決定輸出的 et 檔名
+        prefix = args.et_prefix
+        if prefix == "auto":
+            try:
+                prefix = infer_prefix_from_device(dev)
+                print(f"[auto-prefix] rank {r}: 主要 collective 推測為 '{prefix}'")
+            except Exception as e:
+                print(f"[auto-prefix] rank {r}: 無法自動判斷（{e}），改用 'workload'")
+                prefix = "workload"
+        et  = et_dir / f"{prefix}.{r}.et"
 
-        with et_path.open("wb") as et:
-            encode_message(et, GlobalMetadata(version=args.meta_version))
-            node_id = 1
+        if et.exists() and not force:
+            print(f"[skip] {et} 已存在。用 --no-force 可維持、或移除該檔再重跑。")
+            continue
 
-            for e, agg in epochs_aggs:
-                if not agg:
-                    logger.warning(f"Rank{r} epoch{e} has no step data, skipping.")
-                    continue
+        # link → convert
+        link_host_device(r, host, dev, hdt)
 
-                last_end_in_epoch = 0.0
-                for idx, (s_us, e_us, comp_us, comm_exposed_us) in enumerate(agg, 1):
-                    step_len = max(0.0, e_us - s_us)
+        # 根據模式選擇處理方式
+        if args.simple_astra:
+            # ASTRA-sim 兼容模式：直接從 HDT 生成簡化 ET
+            print(f"[simple-astra] 生成 ASTRA-sim 兼容版本 for rank {r}")
+            comm_nodes = extract_comm_nodes_from_hdt(hdt)
+            if comm_nodes:
+                create_astra_sim_et(comm_nodes, et, r)
+            else:
+                print(f"[warn] rank {r}: 未找到通訊節點，跳過")
+        else:
+            # 標準模式：完整轉換 + DAG 修正
+            convert_hdt_to_et(hdt, et)
 
-                    # 調整：此時 comp_us + comm_exposed_us ≤ step_len（理論上）
-                    if args.debug:
-                        print(f"[Debug Rank {r} E{e:02d} Step {idx:04d}] "
-                              f"step_len={step_len:.3f}  comp={comp_us:.3f}  comm_exposed={comm_exposed_us:.3f}")
+            # 轉檔後：就地修 DAG（清理不一致依賴/循環，並過濾 ASTRA-sim 不支援的節點）
+            try:
+                stats = fix_et_dag_inplace(et, break_cycles=True, astra_sim_compat=True)
+                print(f"[post-fix] {et.name}: self={stats['self_deps_removed']}, "
+                      f"missing={stats['missing_deps_removed']}, cycles={stats['cycles_removed']}, "
+                      f"unsupported={stats['unsupported_nodes_removed']}")
+            except Exception as e:
+                print(f"[post-fix] DAG 修正失敗（{et.name}）：{e}")
 
-                    ts_ns = to_ns(s_us + (ts_offset_us if args.rebase_ts else 0.0))
+    print("\n[done] 轉換完成。請到以下資料夾查看輸出：", et_dir)
 
-                    # （可選）Compute
-                    if emit_compute:
-                        compute_cycles = max(1, int(round(comp_us / alpha)))
-                        if args.debug:
-                            print(f"[Debug] Step {idx:04d}: comp_us={comp_us:.0f}, alpha={alpha:.6f}, compute_cycles={compute_cycles}")
-                        comp_node = ChakraNode()
-                        comp_node.id = node_id; node_id += 1
-                        comp_node.name = "Compute Step"
-                        comp_node.type = COMPUTE_ENUM
-                        # 必要 attributes - 使用 ASTRA-sim 期望的屬性名稱
-                        comp_node.attr.append(ChakraAttr(name="is_cpu_op", bool_val=False))
-                        comp_node.attr.append(ChakraAttr(name="runtime", int64_val=compute_cycles))  # 主要屬性
-                        comp_node.attr.append(ChakraAttr(name="compute_cycles", int64_val=compute_cycles))  # 備用
-                        comp_node.attr.append(ChakraAttr(name="exec_cycles",     int64_val=compute_cycles))  # 備用
-                        comp_node.attr.append(ChakraAttr(name="cycles",          int64_val=compute_cycles))  # 備用
-                        comp_node.attr.append(ChakraAttr(name="duration_cycles", int64_val=compute_cycles))  # 備用
-                        if not args.no_ts_attrs:
-                            comp_node.attr.append(ChakraAttr(name="ts_ns",      int64_val=ts_ns))
-                            comp_node.attr.append(ChakraAttr(name="compute_ns", int64_val=to_ns(comp_us)))
-                        encode_message(et, comp_node)
-
-                    # COMM（保持官方風格；注意：comm_ns 寫的是 **exposed_comm** 供對照）
-                    comm_node = ChakraNode()
-                    comm_node.id = node_id; node_id += 1
-                    comm_node.name = "All-Reduce Step"
-                    comm_node.type = COMM_COLL_NODE
-                    comm_node.attr.append(ChakraAttr(name="is_cpu_op", bool_val=False))
-                    comm_node.attr.append(ChakraAttr(name="comm_type", int64_val=ALL_REDUCE))
-                    comm_node.attr.append(ChakraAttr(name="comm_size", int64_val=bytes_per_step))
-                    comm_node.attr.append(ChakraAttr(name="involved_dim", bool_list=BoolList(values=[True])))
-                    if not args.no_ts_attrs:
-                        comm_node.attr.append(ChakraAttr(name="ts_ns",      int64_val=ts_ns))
-                        comm_node.attr.append(ChakraAttr(name="compute_ns", int64_val=to_ns(comp_us)))
-                        comm_node.attr.append(ChakraAttr(name="comm_ns",    int64_val=to_ns(comm_exposed_us)))
-                    encode_message(et, comm_node)
-
-                    total_steps_written += 1
-                    last_end_in_epoch = max(last_end_in_epoch, e_us)
-
-                if args.rebase_ts:
-                    ts_offset_us += last_end_in_epoch
-
-        flag = []
-        if not gpu_seen:
-            flag.append("no_gpu_events_observed")
-        if gpu_seen and not comm_gpu_seen:
-            flag.append("comm_unobserved_no_gpu_events")
-        print(f"[OK] wrote {et_path}  steps={total_steps_written}  "
-              f"(emit-compute={'ON' if emit_compute else 'OFF'}, "
-              f"rebase-ts={'ON' if args.rebase_ts else 'OFF'}, "
-              f"json={_JSON_BACKEND})"
-              + (f"  flags={','.join(flag)}" if flag else ""))
 
 if __name__ == "__main__":
     main()

@@ -1,4 +1,6 @@
-import torch
+import torch, platform
+
+print("python =", platform.python_version())
 
 # 顯示 PyTorch 版本
 print("PyTorch 版本:", torch.__version__)  # 預期顯示 2.3.0+rocm6.3 或類似版本
@@ -21,3 +23,9 @@ if torch.cuda.is_available():
     print("選定的裝置 (使用 cuda):", device_cuda)
 else:
     print("沒有可用的 GPU")
+
+try:
+    from torch._C import _kineto  # 有些 build 可見
+    print("kineto available =", _kineto is not None)
+except Exception as e:
+    print("kineto import error:", e)

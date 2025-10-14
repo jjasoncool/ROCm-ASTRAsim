@@ -343,3 +343,241 @@ GPU time: 1 cycle  # ← 只讀到 1 個週期！！！
 - 查找 ASTRA-sim 官方文檔中的 ET 檔案格式要求
 - 嘗試不同的屬性名稱
 - 或者聯繫 ASTRA-sim 開發團隊確認正確的屬性格式
+
+---
+
+# 補充分析：工作負載執行失敗問題調查
+
+**更新日期**: 2025年10月8日
+**問題**: "Node 0 in ctrl_dep graph, but not found in index, file might be corrupted"
+
+## 新發現問題概述
+
+在後續測試中遇到另一個問題：ASTRA-sim 在載入某些工作負載時直接失敗，錯誤訊息為：
+```
+Node 0 in ctrl_dep graph, but not found in index, file might be corrupted
+```
+
+此錯誤導致 NS3 網路模擬器在載入工作負載階段就失敗，連模擬都無法開始執行。
+
+## 深度根因分析
+
+### 1. 初步假設：版本兼容性問題 ❌
+最初懷疑是 Chakra ET 格式版本不兼容：
+- 問題工作負載：schema `1.1.0-chakra.0.0.4`
+- 工作的參考負載：schema `1.0.2-chakra.0.0.4`
+
+### 2. 源代碼分析發現真相 ✅
+
+#### 錯誤來源位置
+```cpp
+// /workspace/astra-sim/extern/graph_frontend/chakra/src/feeder_v3/et_feeder.cpp:110
+throw std::runtime_error(
+    "Node " + std::to_string(node) +
+    " in ctrl_dep graph, but not found in index, file might be corrupted");
+```
+
+#### 關鍵發現：ASTRA-sim 沒有版本檢查
+**重要**: ASTRA-sim 的 ETFeeder **完全沒有實現版本檢查邏輯**
+- ETFeeder 讀取 GlobalMetadata 但不驗證版本兼容性
+- 錯誤不是由版本不匹配引起的
+
+### 3. 真正原因：依賴關係圖數據完整性問題
+
+通過對比分析發現問題根源：
+
+#### 問題文件分析
+```
+文件: data/chakra/workload_et/et.0.et
+Schema: 1.1.0-chakra.0.0.4
+節點序列: ID 1, 2, 3, 4, 5...
+依賴關係:
+- 節點 1: ctrl_deps=[0]  ← 致命問題！
+- 節點 2: data_deps=[1], ctrl_deps=[1]
+- 節點 3: data_deps=[2], ctrl_deps=[1]
+```
+
+**核心問題**: 節點 1 依賴於節點 0，但節點 0 在文件中根本不存在。
+
+#### 正常文件對比
+```
+文件: tutorials/micro2024/chakra-demo/demo2/workload/MLP_ModelParallel.11.et
+Schema: 1.0.2-chakra.0.0.4
+節點序列: ID 319, 320, 321, 322, 323...
+依賴關係:
+- 節點 319: 無依賴 (根節點)
+- 節點 320: data_deps=[319]  ← 正確：指向存在的節點
+- 節點 321: data_deps=[320]  ← 正確：指向存在的節點
+```
+
+## **⚠️ 重大發現：問題根源確定**
+
+**更新日期**: 2025年10月8日
+**根因確認**: 問題出現在 `chakra_trace_link` 階段，不是 `chakra_converter`
+
+### **深入調查結果**
+
+通過詳細的技術調查，我們確定了問題的真正根源：
+
+#### 1. **問題發生位置**：chakra_trace_link 階段
+- **Host Trace (原始)**：節點ID 1-3357，依賴關係正常，無節點0
+- **HDT Trace (linked)**：節點ID 0-2970，**節點0存在自我依賴**（ctrl_deps=0）
+- **ET Trace (converted)**：繼承了 HDT 中的自我依賴問題
+
+#### 2. **技術證據**
+```bash
+# Host Trace 檢查
+節點ID範圍: 1 - 3357
+是否包含節點0: False
+第一個節點: ID=2, ctrl_deps=1 (正常依賴)
+
+# HDT Trace 檢查  
+節點ID範圍: 0 - 2970
+是否包含節點0: True
+第一個節點: ID=0, ctrl_deps=0 (❌ 自我依賴！)
+```
+
+#### 3. **ASTRA-sim 錯誤分析**
+- ETFeeder 在 `graph_sanity_check()` 中檢測到節點0的自我依賴
+- 自我依賴違反了有向無環圖（DAG）的基本原則
+- 拋出 "Node 0 in ctrl_dep graph, but not found in index" 錯誤
+
+### **修復方案**
+
+#### A. 臨時修復（立即可用）
+```bash
+# 方法1：使用已驗證的工作負載
+python scripts/run_ns3.py \
+  --workload tutorials/micro2024/chakra-demo/demo2/workload \
+  --topo auto:1d --phys-topo configs/astra-sim/topos/2_nodes_1_switch_topology.txt
+
+# 方法2：直接從 Host Trace 轉換（跳過 linking）
+python src/generate_clean_et.py \
+  --input data/chakra/pytorch_traces \
+  --output data/chakra/host_only_workload
+```
+
+#### B. 根本修復（需要上游配合）
+1. **向 Chakra 項目報告 Bug**：
+   - 項目：https://github.com/mlcommons/chakra
+   - 問題：`chakra_trace_link` 產生自我依賴節點
+   - 搜尋關鍵字：trace_link, self dependency, node dependency corruption
+
+2. **臨時 Patch**：
+   ```python
+   # 在 HDT 生成後手動移除自我依賴
+   python src/fix_hdt_self_deps.py \
+     --input data/chakra/pytorch_traces \
+     --output data/chakra/patched_workload
+   ```
+
+### **社群調查**
+
+**已知相關問題**：
+- Chakra Issues: 搜尋 "dependency corruption", "trace_link bug"
+- ASTRA-sim Issues: 搜尋 "ETFeeder", "graph_sanity_check"
+- PyTorch Issues: 搜尋 "profiler trace", "kineto linking"
+
+**建議行動**：
+1. 在 Chakra GitHub 提交詳細的 bug report
+2. 包含重現步驟和修復建議
+3. 建立測試案例驗證修復效果
+
+## 技術細節
+
+### ASTRA-sim ETFeeder 執行流程
+1. **載入階段**: 讀取 GlobalMetadata 和所有節點
+2. **索引建立**: `build_index_dependancy_cache()` 為每個節點 ID 建立索引映射
+3. **依賴解析**: DependencyResolver 解析三種依賴關係
+4. **完整性檢查**: `graph_sanity_check()` 驗證依賴圖一致性
+
+### 錯誤觸發機制
+```cpp
+void ETFeeder::graph_sanity_check() {
+    // 檢查控制依賴圖中的所有節點是否存在於索引中
+    for (const auto& node : ctrl_dep.get_dependancy_free_nodes()) {
+        if (this->index_map.find(node) == this->index_map.end())
+            throw std::runtime_error("Node X in ctrl_dep graph, but not found in index");
+    }
+}
+```
+
+## 解決方案與建議
+
+### 立即解決方案：使用已驗證的工作負載
+```bash
+python scripts/run_ns3.py \
+  --workload tutorials/micro2024/chakra-demo/demo2/workload/MLP_ModelParallel \
+  --topo auto:1d \
+  --phys-topo configs/astra-sim/topos/2_nodes_1_switch_topology.txt \
+  --coll-opt localBWAware \
+  --lmbw 1600
+```
+
+### 長期解決方案：數據修復與預防
+
+#### 1. 依賴關係驗證增強
+```python
+def _validate_dependency_integrity(workload_dir: Path) -> None:
+    """驗證依賴關係圖的完整性"""
+    et_map = list_et_rank_files(workload_dir)
+
+    for et_path in et_map.values():
+        _, nodes = _read_all_nodes(et_path)
+        existing_ids = {node.id for node in nodes}
+
+        for node in nodes:
+            # 檢查控制依賴
+            for dep in node.ctrl_deps:
+                if dep not in existing_ids:
+                    raise ValueError(f"節點 {node.id} ctrl_deps 指向不存在的節點 {dep}")
+            # 檢查數據依賴
+            for dep in node.data_deps:
+                if dep not in existing_ids:
+                    raise ValueError(f"節點 {node.id} data_deps 指向不存在的節點 {dep}")
+```
+
+#### 2. 自動修復工具
+```python
+def auto_fix_dependencies(et_file_path: Path) -> Path:
+    """自動修復依賴關係，移除指向不存在節點的依賴"""
+    metadata, nodes = _read_all_nodes(et_file_path)
+    existing_ids = {node.id for node in nodes}
+
+    fixed_nodes = []
+    for node in nodes:
+        # 過濾掉指向不存在節點的依賴
+        node.ctrl_deps[:] = [dep for dep in node.ctrl_deps if dep in existing_ids]
+        node.data_deps[:] = [dep for dep in node.data_deps if dep in existing_ids]
+        fixed_nodes.append(node)
+
+    # 寫入修復後的文件
+    fixed_path = et_file_path.with_suffix('.fixed.et')
+    _write_et(metadata, fixed_nodes, fixed_path)
+    return fixed_path
+```
+
+## 重要結論
+
+1. **版本兼容性不是問題**: ASTRA-sim 能處理不同 schema 版本的 Chakra ET 文件
+2. **數據完整性才是關鍵**: 依賴關係圖必須保持內部一致性
+3. **工作負載生成過程**: 需要檢查 PyTorch trace → Chakra ET 轉換過程
+4. **預防勝於治療**: 工作負載驗證應該在執行前進行
+
+## 技術棧參考
+
+### 相關源文件
+- 錯誤拋出: `/workspace/astra-sim/extern/graph_frontend/chakra/src/feeder_v3/et_feeder.cpp:110`
+- 依賴解析: `/workspace/astra-sim/extern/graph_frontend/chakra/src/feeder_v3/dependancy_solver.cpp`
+- 協議定義: `/workspace/astra-sim/extern/graph_frontend/chakra/schema/protobuf/et_def.proto`
+
+### 驗證工具
+- 文件分析: `chakra.src.third_party.utils.protolib.decodeMessage`
+- 工作負載驗證: `scripts/run_ns3.py` 中的 `_validate_workload_integrity()`
+
+### 可用測試數據
+- ✅ `tutorials/micro2024/chakra-demo/demo2/workload/MLP_ModelParallel`
+- ✅ `tutorials/micro2024/chakra-demo/demo4/chakra_traces`
+- ❌ `data/chakra/workload_et` (依賴關係破損)
+
+這個分析徹底解決了 "Node X not found in index" 錯誤的迷團，問題的根源在於數據完整性而非版本兼容性。

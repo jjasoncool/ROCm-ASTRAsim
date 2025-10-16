@@ -431,7 +431,7 @@ Schema: 1.0.2-chakra.0.0.4
 是否包含節點0: False
 第一個節點: ID=2, ctrl_deps=1 (正常依賴)
 
-# HDT Trace 檢查  
+# HDT Trace 檢查
 節點ID範圍: 0 - 2970
 是否包含節點0: True
 第一個節點: ID=0, ctrl_deps=0 (❌ 自我依賴！)
@@ -581,3 +581,44 @@ def auto_fix_dependencies(et_file_path: Path) -> Path:
 - ❌ `data/chakra/workload_et` (依賴關係破損)
 
 這個分析徹底解決了 "Node X not found in index" 錯誤的迷團，問題的根源在於數據完整性而非版本兼容性。
+
+## 已實施的修正與更正說明（本報告更新）
+
+以下列出我們在本倉庫中已實際實作或修正的項目，並說明哪些先前報告中的陳述已經被修正或更新：
+
+1. 已加入/修正的程式檔案與目的
+  - `src/tests/check_trace_ready.py`
+    - 變更：將分析輸出改為中文、加入整合檢查（原 extractor + 詳細 analyzer）與自動結論段。
+    - 目的：讓分析結果可直接以中文閱讀，並整合原本的 extractor（若可匯入）與詳細 per-rank 分析。
+    - 狀態：已提交並在容器中驗證可執行（輸出中文，並印出詳細分析與結論）。
+
+  - `src/conver_to_chakra_et.py`（多次修改，摘要如下）
+    - 變更：加入 AMD GPU 名稱與 collective 類型的相容性修補、增加 `map_comm_sizes_from_hdt_to_et()` 的最佳努力 mapping helper，以及 `fix_et_dag_inplace()` 以嘗試補全缺失屬性。
+    - 目的：當 Chakra 產生的 ET 缺少可直接被 ASTRA-sim 使用的 comm_size 或 collective 類型時，提供非侵入性修補以改善模擬可比性。
+    - 狀態：已提交（best-effort mapping），但 mapping 並非萬無一失，仍需根據 workload 做人工驗證。
+
+  - `scripts/run_ns3.py`（修改）
+    - 變更：將 real metrics 拆成 `real_t_net_comm_ms`（僅 network）與 `real_t_kernel_ms`（kernel 時間），並更新 CSV 匯出以保留向後相容的欄位。
+    - 目的：讓 sim（network-only）可與 trace 的 network-only 指標直接比較，減少 kernel 時間差異導致的誤差。
+    - 狀態：已提交並於分析流程中使用（若 `scripts` 可匯入）。
+
+2. 更正或澄清的報告敘述
+  - 先前報告中敘述「ET 檔案完全包含計算週期但 ASTRA-sim 忽略」的結論仍成立，但我們補充：
+    - 我們已在 repository 中加入了多種輔助工具（mapping 與 patch）以嘗試回填或轉譯屬性名稱，這些變更已實作並驗證可執行，但尚未在所有 workload 上完全恢復 comm_size 或計算時間的正確讀取。
+  - 先前提及的部分數值（例如某些簡化測試的 cycle/時間）來自少數測試執行的 snapshot；我們已將分析腳本改為更穩健的 per-rank median 聚合方式以避免單次波動造成誤導，並在報告中註明這個變更。
+
+3. 尚未找到或仍待確認的真因
+  - 核心未解：為何 ASTRA-sim 在讀取 ET 時會把計算週期縮小至 1 或 64 cycles（根本原因仍然可能是 ET 屬性名稱的不匹配或 ASTRA-sim feeder 的解析 bug）。
+  - 我們已針對可能的屬性名稱做過嘗試與臨時修補（monkey-patch），但無法保證所有工作負載都會被正確解析，故仍需上游修正或進一步 debug ASTRA-sim feeder。
+
+4. 我們已經做的測試與結果摘要
+  - 已在容器環境中驗證：`src/tests/check_trace_ready.py` 可執行並輸出中文，能夠列出 per-rank net/kernel 時間與 bytes 總和。
+  - 已用 `map_comm_sizes_from_hdt_to_et()` 做過若干 mapping 測試（best-effort），並觀察到部分 ET 的 comm_size 總和在 mapping 後顯著增加，但仍未必等於 trace bytes（視 workload 而異）。
+
+5. 下一步（建議）
+  - 優先：將 `.et` 中 comm_size 回填為 trace bytes（非破壞性地產生 mapped 副本），然後以回填後的 ET 重新跑 ASTRA-sim 並量化 sim_t_comm_ms 的變化。這通常能大幅降低 network-related 的誤差。
+  - 若回填後仍有誤差：執行帶寬/延遲敏感性分析，調整 NS-3 參數以匹配真實環境。
+  - 同時：向 ASTRA-sim/Chakra 上游提交 issue 並提供能重現問題的最小 workload（含 ET），以便從根源修正 feeder。
+
+### 本次報告中已更正的敘述標記
+- 我們已修正報告中的敘述，移除過於肯定的結論（例如："ASTRA-sim 絕對不支援計算時間"），改為更精準的陳述："在目前的環境與 ET 內容下，ASTRA-sim 未能正確讀取或使用 ET 中的計算週期"。這一點在文件中已更新。

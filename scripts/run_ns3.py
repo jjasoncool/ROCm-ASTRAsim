@@ -70,7 +70,7 @@ CALIB_FIELDS = [
     'mode', 'tag', 'calib_id', 'world', 'logical_dims', 'topo_desc',
     'qcn', 'pfc_dyn', 'buffer', 'payload', 'coll_opt', 'lmbw',
     'alpha_us', 'sim_cycles_step', 'sim_cycles_comm', 'sim_cycles_gpu', 'sim_t_step_ms', 'sim_t_comm_ms',
-    'real_t_step_ms', 'real_t_comm_ms', 'run_dir', 'rel_err_step', 'rel_err_comm',
+    'real_t_step_ms', 'real_t_comm_ms', 'real_t_net_comm_ms', 'real_t_kernel_ms', 'run_dir', 'rel_err_step', 'rel_err_comm',
     'flags'  # 執行狀態標記（例如 comm_equals_wall_no_compute）
 ]
 
@@ -378,12 +378,88 @@ def _trace_dir_default(script_path: Path) -> Path:
 
 def _list_epoch_pairs(trace_dir: Path) -> list[tuple[Path, Path, int]]:
     """回傳 [(rank0_json, rank1_json, epoch_id), ...]，只收兩邊都有的 epoch。"""
-    r0 = {int(re.search(r"epoch_(\d+)\.json$", p.name).group(1)): p
-          for p in trace_dir.glob("trace_rank_0_epoch_*.json")}
-    r1 = {int(re.search(r"epoch_(\d+)\.json$", p.name).group(1)): p
-          for p in trace_dir.glob("trace_rank_1_epoch_*.json")}
-    common = sorted(set(r0.keys()) & set(r1.keys()))
-    return [(r0[e], r1[e], e) for e in common]
+    # 現在回傳更通用的群組：[(epoch, {rank->Path}, source_type), ...]
+    # 為維持相容性，舊有需要 pair 的呼叫者請使用第一個兩個 rank
+    return list_trace_groups(trace_dir)
+
+
+def list_trace_groups(trace_dir: Path) -> list[tuple[int, dict[int, Path], str]]:
+    """
+    列出 trace_dir 中可辨識的 trace 群組，回傳 list of (epoch_id, {rank->Path}, source_type)
+    source_type in {'trace_rank', 'device', 'host', 'hdt'}
+
+    - 如果存在 trace_rank_<r>_epoch_<e>.json，依 epoch 分群並以 rank-id 做鍵
+    - 否則，如果存在 device_*.json / host_*.json / hdt_*.json，則把同類型檔案視為單一 epoch=0 的群組，rank 從檔名抽出數字
+    """
+    groups = []
+    # 1) per-epoch trace_rank_* pattern
+    epoch_map: dict[int, dict[int, Path]] = {}
+    for p in trace_dir.glob('trace_rank_*_epoch_*.json'):
+        m = re.search(r'trace_rank_(\d+)_epoch_(\d+)\.json$', p.name)
+        if not m:
+            continue
+        r = int(m.group(1)); e = int(m.group(2))
+        epoch_map.setdefault(e, {})[r] = p
+    if epoch_map:
+        for e in sorted(epoch_map.keys()):
+            groups.append((e, epoch_map[e], 'trace_rank'))
+        return groups
+
+    # 2) device_*.json
+    devs = sorted(trace_dir.glob('device_*.json'))
+    if devs:
+        ranks = {}
+        for p in devs:
+            m = re.search(r'device_(\d+)\.json$', p.name)
+            if not m:
+                continue
+            r = int(m.group(1)); ranks[r] = p
+        if ranks:
+            groups.append((0, ranks, 'device'))
+            return groups
+
+    # 3) host_*.json
+    hosts = sorted(trace_dir.glob('host_*.json'))
+    if hosts:
+        ranks = {}
+        for p in hosts:
+            m = re.search(r'host_(\d+)\.json$', p.name)
+            if not m:
+                continue
+            r = int(m.group(1)); ranks[r] = p
+        if ranks:
+            groups.append((0, ranks, 'host'))
+            return groups
+
+    # 4) hdt_*.json (only accept if looks like containing timing info)
+    hdts = sorted(trace_dir.glob('hdt_*.json'))
+    if hdts:
+        ranks = {}
+        def _hdt_may_have_timing(p: Path) -> bool:
+            try:
+                txt = p.open('r', encoding='utf-8', errors='ignore').read(200000)
+            except Exception:
+                return False
+            if '"traceEvents"' in txt or 'ProfilerStep' in txt:
+                return True
+            if '"start_ts"' in txt or '"finish_ts"' in txt:
+                return True
+            for k in ('"duration"', '"dur"', '"duration_ms"', '"exec"', '"cycles"', '"timestamp"'):
+                if k in txt:
+                    return True
+            return False
+        for p in hdts:
+            m = re.search(r'hdt_(\d+)\.json$', p.name)
+            if not m:
+                continue
+            r = int(m.group(1))
+            if _hdt_may_have_timing(p):
+                ranks[r] = p
+        if ranks:
+            groups.append((0, ranks, 'hdt'))
+            return groups
+
+    return []
 
 def _dur_units_to_ms(trace_obj: dict, dur_val: float) -> float:
     # 若 trace 宣告 displayTimeUnit == "ms"，多半 dur 就是毫秒；否則多半是微秒
@@ -440,37 +516,75 @@ def _extract_step_and_comm_ms(trace_path: Path) -> tuple[list[float], float | No
     comm_ms_per_step = (comm_sum_ms / max(1, len(steps_ms))) if (any_comm and steps_ms) else None
     return steps_ms, comm_ms_per_step
 
-def extract_real_metrics_from_traces(trace_dir: Path) -> tuple[float | None, float | None, int | None]:
+def extract_real_metrics_from_traces(trace_dir: Path) -> tuple[float | None, float | None, float | None, int | None]:
     """
-    掃描兩張卡的 trace，鎖定「同一 epoch」的 pair：
-      • real_t_step_ms：取兩張卡對應 epoch 的 step durations 的「中位數再取中位數」
-      • real_t_comm_ms：若抓得到通訊事件，兩卡加總後取一半（粗估每卡），再取中位數
-    回傳: (real_t_step_ms, real_t_comm_ms, used_epoch)
+    掃描 trace 群組，回傳多項 real metrics，用於研究比較（Strategy C 默認行為）：
+      • real_t_step_ms: per-step wall time（median of per-rank medians）
+      • real_t_net_comm_ms: per-step network-only communication time（只算 name 含 '|bytes=' 且非 kernel 的事件）
+      • real_t_kernel_ms: per-step GPU NCCL kernel time（kernel 類事件或 name 含 nccldevkernel）
+      • used_epoch: 選用的 epoch id
+
+    回傳: (real_t_step_ms, real_t_net_comm_ms, real_t_kernel_ms, used_epoch)
+    為向後相容，呼叫端若只解包三個值則會拿到 (step, net_comm, used_epoch)
     """
-    pairs = _list_epoch_pairs(trace_dir)
-    if not pairs:
-        print(f"[WARN] {trace_dir} 找不到 rank0/1 成對的 trace。")
-        return None, None, None
+    groups = list_trace_groups(trace_dir)
+    if not groups:
+        print(f"[WARN] {trace_dir} 找不到任何可用的 trace 群組（device_/host_/trace_rank_*/hdt_*）。")
+        return None, None, None, None
 
-    step_medians = []
-    comm_per_epoch = []
-    used_epoch = None
+    used_epoch, ranks, src = groups[0]
+    per_rank_step_medians = []
+    per_rank_net_comm = []
+    per_rank_kernel = []
 
-    for p0, p1, e in pairs:
-        s0, c0 = _extract_step_and_comm_ms(p0)
-        s1, c1 = _extract_step_and_comm_ms(p1)
-        if s0 and s1:
-            step_medians.append(median([median(s0), median(s1)]))
-            used_epoch = e if used_epoch is None else used_epoch
-        # 通訊：兩卡的總和 / 2 當作每卡平均
-        comm_vals = []
-        if c0 is not None: comm_vals.append(c0)
-        if c1 is not None: comm_vals.append(c1)
-        if comm_vals:
-            comm_per_epoch.append(sum(comm_vals) / max(1, len(comm_vals)))
-    real_t_step_ms = median(step_medians) if step_medians else None
-    real_t_comm_ms = median(comm_per_epoch) if comm_per_epoch else None
-    return real_t_step_ms, real_t_comm_ms, used_epoch
+    for r, p in sorted(ranks.items()):
+        obj = _load_json(p)
+        if not obj:
+            continue
+
+        # steps list and count
+        steps = [ev for ev in obj.get('traceEvents', []) if KINETO_STEP_PAT.match(str(ev.get('name', '')))]
+        steps_n = len(steps)
+
+        # compute total network-only and kernel-only durations in ms
+        net_ms_total = 0.0
+        kernel_ms_total = 0.0
+        step_durations = []
+
+        for ev in obj.get('traceEvents', []):
+            if ev.get('ph') != 'X':
+                continue
+            name = str(ev.get('name', ''))
+            cat = str(ev.get('cat', ''))
+            d_ms = _dur_units_to_ms(obj, ev.get('dur', 0.0))
+            lname = name.lower()
+            lcat = cat.lower()
+
+            # step durations collected for step median
+            if KINETO_STEP_PAT.match(name):
+                step_durations.append(d_ms)
+
+            # network-only: has bytes= token and not kernel category
+            if '|bytes=' in lname and 'kernel' not in lcat:
+                net_ms_total += d_ms
+
+            # kernel events: kernel category OR known devkernel name patterns
+            if 'kernel' in lcat or 'nccldevkernel' in lname or 'devkernel' in lname:
+                kernel_ms_total += d_ms
+
+        if step_durations:
+            per_rank_step_medians.append(median(step_durations))
+        # per-step metrics: divide totals by number of steps to get ms/step
+        if steps_n > 0:
+            per_rank_net_comm.append(net_ms_total / steps_n)
+            per_rank_kernel.append(kernel_ms_total / steps_n)
+
+    real_t_step_ms = median(per_rank_step_medians) if per_rank_step_medians else None
+    real_t_net_comm_ms = median(per_rank_net_comm) if per_rank_net_comm else None
+    real_t_kernel_ms = median(per_rank_kernel) if per_rank_kernel else None
+
+    print(f"[INFO] 使用群組 source={src} epoch={used_epoch} 的 {len(ranks)} 個 rank 做為 real metrics (net_comm/kernel split)")
+    return real_t_step_ms, real_t_net_comm_ms, real_t_kernel_ms, used_epoch
 
 # ---------- 解析 ASTRA‑sim stdout.log（cycles） ----------
 def parse_astra_stdout_cycles(stdout_path: Path) -> tuple[int | None, int | None, int | None]:
@@ -588,10 +702,39 @@ def _append_calibration_db(db_path: Path, row: dict) -> None:
 
     # 2) 去重：若 key 相同且 real/sim/alpha 完全一致就不再追加
     new_key = _row_key_for_dedup(row)
+    def _almost_equal(a, b, rel_tol=1e-4, abs_tol=1e-6):
+        try:
+            fa = float(a)
+            fb = float(b)
+        except Exception:
+            return False
+        # handle zeros
+        if abs(fa - fb) <= abs_tol:
+            return True
+        return abs(fa - fb) <= rel_tol * max(abs(fa), abs(fb), 1.0)
+
     for old in rows:
         if _row_key_for_dedup(old) == new_key:
-            same = all(str(old.get(k, "")) == str(row.get(k, "")) for k in
-                       ["alpha_us","sim_t_step_ms","sim_t_comm_ms","real_t_step_ms","real_t_comm_ms"])
+            # Compare core calibration values using numeric tolerance when possible.
+            compare_keys = [
+                "alpha_us", "sim_t_step_ms", "sim_t_comm_ms",
+                "real_t_step_ms", "real_t_comm_ms",
+                "real_t_net_comm_ms", "real_t_kernel_ms"
+            ]
+            same = True
+            for k in compare_keys:
+                oldv = old.get(k, "")
+                newv = row.get(k, "")
+                if oldv == "" and newv == "":
+                    continue
+                # try numeric compare first
+                if _almost_equal(oldv, newv):
+                    continue
+                # fallback to string equality
+                if str(oldv) == str(newv):
+                    continue
+                same = False
+                break
             if same:
                 print(f"[INFO] calibration_all.csv 已有相同條目，略過追加。")
                 return
@@ -883,13 +1026,35 @@ def main():
     trace_dir = Path(args.trace_dir).resolve() if args.trace_dir else _trace_dir_default(script_path)
     real_t_step_ms = None
     real_t_comm_ms = None
+    real_t_net_comm_ms = None
+    real_t_kernel_ms = None
     used_epoch = None
 
     if not args.no_autocalib and actual_world == 2:
         if trace_dir.exists():
-            real_t_step_ms, real_t_comm_ms, used_epoch = extract_real_metrics_from_traces(trace_dir)
-            if real_t_step_ms is None:
+            # extract_real_metrics_from_traces may return 3 or 4 values for backward compatibility
+            res = extract_real_metrics_from_traces(trace_dir)
+            if not res or res[0] is None:
                 print(f"[WARN] 無法從 {trace_dir} 抓到 ProfilerStep，略過 auto calibration。")
+            else:
+                # Expecting either (step, net_comm, kernel, epoch) or older (step, comm, epoch)
+                if len(res) == 4:
+                    real_t_step_ms, real_t_net_comm_ms, real_t_kernel_ms, used_epoch = res
+                    # maintain legacy name real_t_comm_ms as network-only for downstream code
+                    real_t_comm_ms = real_t_net_comm_ms
+                elif len(res) == 3:
+                    # older callers returned (step, comm, epoch)
+                    real_t_step_ms, real_t_comm_ms, used_epoch = res
+                    real_t_net_comm_ms = real_t_comm_ms
+                else:
+                    # defensive fallback
+                    try:
+                        real_t_step_ms = res[0]
+                        real_t_comm_ms = res[1] if len(res) > 1 else None
+                        used_epoch = res[2] if len(res) > 2 else None
+                        real_t_net_comm_ms = real_t_comm_ms
+                    except Exception:
+                        print(f"[WARN] extract_real_metrics_from_traces() 回傳非預期格式: {res}")
         else:
             print(f"[WARN] {trace_dir} 不存在，略過 auto calibration。")
 
@@ -953,6 +1118,8 @@ def main():
         "sim_t_comm_ms": f"{sim_t_comm_ms:.6f}" if sim_t_comm_ms is not None else "",
         "real_t_step_ms": f"{real_t_step_ms:.6f}" if real_t_step_ms is not None else "",
         "real_t_comm_ms": f"{real_t_comm_ms:.6f}" if real_t_comm_ms is not None else "",
+        "real_t_net_comm_ms": f"{real_t_net_comm_ms:.6f}" if real_t_net_comm_ms is not None else "",
+        "real_t_kernel_ms": f"{real_t_kernel_ms:.6f}" if real_t_kernel_ms is not None else "",
         "run_dir": str(logroot),
         "rel_err_step": f"{rel_err_step:.6f}" if rel_err_step is not None else "",
         "rel_err_comm": f"{rel_err_comm:.6f}" if rel_err_comm is not None else "",

@@ -1,4 +1,200 @@
 #!/usr/bin/env python3
+"""
+Lightweight trace readiness checker.
+
+This module provides a small utility to analyze PyTorch/Kineto device traces
+and report per-rank network vs kernel timing summaries and cross-rank medians.
+
+Placed under `src/tests` so it can be imported from test harnesses or used
+manually from the command line.
+"""
+from pathlib import Path
+import json
+import re
+from statistics import median
+from typing import Dict
+
+KINETO_STEP_PAT = re.compile(r'^ProfilerStep#\d+$')
+
+
+def parse_trace(path: Path) -> Dict:
+    obj = json.loads(path.read_text(encoding='utf-8', errors='ignore'))
+    unit = str(obj.get('displayTimeUnit', '')).lower()
+
+    def to_ms(d):
+        try:
+            dv = float(d)
+        except Exception:
+            try:
+                dv = float(str(d))
+            except Exception:
+                dv = 0.0
+        return dv if unit == 'ms' else dv / 1000.0
+
+    net_events = []
+    kernel_events = []
+    steps = []
+    bytes_total = 0
+    bytes_events = 0
+
+    for ev in obj.get('traceEvents', []):
+        if ev.get('ph') != 'X':
+            continue
+        name = str(ev.get('name', ''))
+        cat = str(ev.get('cat', ''))
+        dur = to_ms(ev.get('dur', 0.0))
+        if KINETO_STEP_PAT.match(name):
+            steps.append(dur)
+        lname = name.lower()
+        lcat = cat.lower()
+        if '|bytes=' in lname and 'kernel' not in lcat:
+            net_events.append((name, dur))
+            m = re.search(r'bytes=(\d+)', lname)
+            if m:
+                try:
+                    bytes_total += int(m.group(1))
+                    bytes_events += 1
+                except Exception:
+                    pass
+        if 'kernel' in lcat or 'nccldevkernel' in lname or 'devkernel' in lname:
+            kernel_events.append((name, dur))
+
+    return {
+        'steps_n': len(steps),
+        'step_median_ms': median(steps) if steps else None,
+        'net_count': len(net_events),
+        'net_total_ms': sum(d for _, d in net_events),
+        'net_per_step_ms': (sum(d for _, d in net_events) / len(steps)) if steps else None,
+        'kernel_count': len(kernel_events),
+        'kernel_total_ms': sum(d for _, d in kernel_events),
+        'kernel_per_step_ms': (sum(d for _, d in kernel_events) / len(steps)) if steps else None,
+        'bytes_events': bytes_events,
+        'bytes_total': bytes_total,
+        'top_net': sorted(net_events, key=lambda x: -x[1])[:20],
+        'top_kernel': sorted(kernel_events, key=lambda x: -x[1])[:20]
+    }
+
+
+def analyze_dir(trace_dir: Path) -> Dict[str, Dict]:
+    """Analyze all device_*.json traces in trace_dir and print a summary.
+
+    Returns a dictionary mapping filename -> summary dict (as returned by parse_trace).
+    """
+    files = sorted((trace_dir).glob('device_*.json'))
+    if not files:
+        raise FileNotFoundError(f'No device_*.json found in {trace_dir}')
+
+    all_summ = {}
+    for f in files:
+        s = parse_trace(f)
+        all_summ[f.name] = s
+        print('\n---', f.name)
+        print(' 步數 (steps_n):', s['steps_n'], '  步中位數 (ms):', s['step_median_ms'])
+        print(' 網路事件: 數量', s['net_count'], ' 總耗時(ms)', s['net_total_ms'], ' 每步平均(ms)', s['net_per_step_ms'])
+        print(' Kernel/運算事件: 數量', s['kernel_count'], ' 總耗時(ms)', s['kernel_total_ms'], ' 每步平均(ms)', s['kernel_per_step_ms'])
+        print(' bytes 事件數量:', s['bytes_events'], ' bytes 總量:', s['bytes_total'])
+        print('\n 前十名網路事件 (耗時 ms | 事件名稱):')
+        for n, d in s['top_net'][:10]:
+            print('  {:.3f}  {}'.format(d, n[:200]))
+        print('\n 前十名 Kernel/運算事件 (耗時 ms | 事件名稱):')
+        for n, d in s['top_kernel'][:10]:
+            print('  {:.3f}  {}'.format(d, n[:200]))
+
+    # cross-rank medians
+    ranks = list(all_summ.keys())
+    net_per_step = [all_summ[r]['net_per_step_ms'] for r in ranks if all_summ[r]['net_per_step_ms'] is not None]
+    kernel_per_step = [all_summ[r]['kernel_per_step_ms'] for r in ranks if all_summ[r]['kernel_per_step_ms'] is not None]
+    step_meds = [all_summ[r]['step_median_ms'] for r in ranks if all_summ[r]['step_median_ms'] is not None]
+    print('\n跨 rank 中位數 (CROSS-RANK MEDIANS):')
+    print(' 每步網路耗時中位數 (net_per_step median):', median(net_per_step) if net_per_step else None)
+    print(' 每步 Kernel 耗時中位數 (kernel_per_step median):', median(kernel_per_step) if kernel_per_step else None)
+    print(' 步中位數 (step_median median):', median(step_meds) if step_meds else None)
+
+    return all_summ
+
+
+
+
+def run_all_checks(trace_dir: Path | str):
+    """Run the original real-metrics extraction plus the new trace analyzer and print a combined report.
+
+    Returns a dict with keys: 'real_metrics' and 'detailed' (per-rank summaries).
+    """
+    trace_dir = Path(trace_dir)
+    # import original extractor from scripts/run_ns3
+    try:
+        from scripts import run_ns3 as runns3
+    except Exception:
+        runns3 = None
+
+    result = {}
+
+    if runns3 is not None and hasattr(runns3, 'extract_real_metrics_from_traces'):
+        try:
+            real_metrics = runns3.extract_real_metrics_from_traces(trace_dir)
+            # expected: (real_t_step_ms, real_t_net_comm_ms, real_t_kernel_ms, used_epoch)
+        except Exception as e:
+            real_metrics = None
+            print(f"[warn] extract_real_metrics_from_traces failed: {e}")
+    else:
+        real_metrics = None
+
+    result['real_metrics'] = real_metrics
+
+    # detailed per-rank analysis (new)
+    try:
+        detailed = analyze_dir(trace_dir)
+    except FileNotFoundError as e:
+        print(f"[error] analyze_dir failed: {e}")
+        detailed = None
+    result['detailed'] = detailed
+
+    # print combined summary
+    print('\n==== 綜合檢查摘要 ====')
+    if real_metrics:
+        print('[原始 extractor] real_t_step_ms =', real_metrics[0])
+        print('[原始 extractor] real_t_net_comm_ms =', real_metrics[1])
+        print('[原始 extractor] real_t_kernel_ms =', real_metrics[2])
+        print('[原始 extractor] used_epoch =', real_metrics[3])
+    else:
+        print('[原始 extractor] 無可用資料')
+
+    if detailed:
+        # compute cross-rank median net_per_step if available
+        net_per_steps = [v['net_per_step_ms'] for v in detailed.values() if v.get('net_per_step_ms') is not None]
+        kernel_per_steps = [v['kernel_per_step_ms'] for v in detailed.values() if v.get('kernel_per_step_ms') is not None]
+        print('[詳細分析器] 跨 rank 每步網路耗時中位數 =', median(net_per_steps) if net_per_steps else None)
+        print('[詳細分析器] 跨 rank 每步 Kernel 耗時中位數 =', median(kernel_per_steps) if kernel_per_steps else None)
+    else:
+        print('[詳細分析器] 無可用資料')
+
+    # 結論：基於上面的結果給出簡短建議
+    print('\n---- 結論 (自動摘要) ----')
+    if real_metrics:
+        r_step, r_net, r_kernel, epoch = real_metrics
+        print(f'  - 真實量測 (epoch={epoch}) 每步總耗時 ≈ {r_step} ms。')
+        print(f'  - 真實量測 每步網路耗時 ≈ {r_net} ms；每步 Kernel 耗時 ≈ {r_kernel} ms。')
+        if net_per_steps:
+            det_net_med = median(net_per_steps)
+            print(f'  - 詳細分析器的跨 rank 每步網路耗時中位數 = {det_net_med} ms，與原始 extractor 報告的 {r_net} ms 比較可做交叉檢查。')
+    else:
+        print('  - 無法取得原始 extractor 的真實量測，請確認 scripts/run_ns3.py 是否在 module path 中或可被匯入。')
+
+    if detailed:
+        print('  - 裝置端 trace 已解析，含網路與 Kernel 事件摘要；請注意 bytes 總量與 ET 中 comm_size 是否一致，若不一致請執行 map_comm_sizes_from_hdt_to_et() 以補足 ET 的 comm_size。')
+    else:
+        print('  - 詳細分析器未能取得裝置端 trace，請確認 device_*.json 檔案存在且可讀。')
+
+    print('\n建議後續動作：')
+    print('  1) 若要進一步做模擬校準，請確保 .et 檔案內的 comm_size 已回填正確的 bytes 值。')
+    print('  2) 若 scripts/run_ns3 無法匯入，可將 `scripts/__init__.py` 加入或改用 path-based import。')
+    print('  3) 若發現網路相對誤差過大，先比較 network-only 部分（sim vs real）以排除 kernel/運算差異的影響。')
+
+    return result
+
+
+
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 check_trace_ready.py
@@ -152,6 +348,14 @@ def main():
         sys.exit(1)
 
     print("[READY] 目前的 traces 應可交給 chakra_trace_link / chakra_converter。")
+    # 在原本的 smoke checks 之後執行更深入的整合檢查（不改變 exit code）
+    try:
+        print('\n[INFO] 執行整合檢查（原 extractor + 詳細 analyzer）...')
+        # run_all_checks is defined in this module
+        run_all_checks(traces_dir)
+    except Exception as e:
+        print(f"[warn] run_all_checks 發生錯誤：{e}")
+
     sys.exit(0)
 
 if __name__ == "__main__":

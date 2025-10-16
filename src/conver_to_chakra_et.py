@@ -55,7 +55,12 @@ from typing import List, Dict, Tuple, Optional
 # ------------------------------------------------------------------
 from chakra.src.third_party.utils.protolib import decodeMessage as _decode_msg
 from chakra.src.third_party.utils.protolib import encodeMessage as _encode_msg
-from chakra.schema.protobuf.et_def_pb2 import GlobalMetadata, Node, AttributeProto, COMM_COLL_NODE, ALL_REDUCE  # type: ignore
+from chakra.schema.protobuf.et_def_pb2 import GlobalMetadata, Node, AttributeProto, COMP_NODE, COMM_COLL_NODE, COMM_SEND_NODE, COMM_RECV_NODE, ALL_REDUCE, ALL_GATHER, REDUCE_SCATTER, ALL_TO_ALL  # type: ignore
+# BROADCAST may not exist in all schema versions; fall back to None
+try:
+    from chakra.schema.protobuf.et_def_pb2 import BROADCAST  # type: ignore
+except Exception:
+    BROADCAST = None
 
 # --------------------------- AMD GPU 修補 ---------------------------
 
@@ -106,10 +111,24 @@ def apply_amd_gpu_patch():
             if json_node.is_gpu_op():
                 print(f"[patch] 檢查 GPU 操作: {json_node.name}")
 
-                # 檢查 AMD GPU NCCL Generic kernel
+                # 檢查 AMD GPU NCCL Generic kernel (底層 kernel 名稱)
                 if "ncclDevKernel_Generic" in json_node.name:
                     print(f"[patch] 偵測到 AMD GPU NCCL Generic kernel -> COMM_COLL_NODE")
                     return COMM_COLL_NODE
+
+            # 檢查所有 NCCL 相關操作，包括 PyTorch profiler 生成的名稱
+            # 注意：NCCL 操作可能不是 GPU 操作，所以我們需要檢查所有節點
+            if ("nccl:all_reduce" in json_node.name or
+                "nccl:all_gather" in json_node.name or
+                "nccl:reduce_scatter" in json_node.name or
+                "nccl:broadcast" in json_node.name or
+                "nccl:all_to_all" in json_node.name or
+                "ncclDevKernel_Generic" in json_node.name):
+                print(f"[patch] 偵測到 NCCL 集體通訊操作: {json_node.name} -> COMM_COLL_NODE")
+                # 確保 NCCL 操作被標記為 GPU 操作，以便 is_cpu_op 被正確設置為 False
+                json_node.cat = "kernel"  # 設置為 GPU kernel 類別
+                print(f"[patch] 將 NCCL 操作標記為 GPU 操作 (cat='kernel')")
+                return COMM_COLL_NODE
 
             # 對於所有其他情況，使用原始方法處理
             return original_method(self, json_node_map, json_node)
@@ -160,7 +179,8 @@ def patch_collective_comm_type_for_amd():
             """
             修補版本的 get_collective_comm_type 方法
 
-            優先處理 AMD GPU 的特殊格式，然後回退到原始邏輯處理標準格式。
+            支援 AMD GPU 的 ncclDevKernel_Generic_X 格式並提供智能推測。
+            同時處理標準 NCCL 操作的完整分類。
 
             Args:
                 name (str): GPU kernel 的名稱
@@ -168,29 +188,32 @@ def patch_collective_comm_type_for_amd():
             Returns:
                 int: 對應的 collective communication 類型常數
 
-            AMD GPU & 通用 NCCL 操作識別：
-            - "ncclDevKernel_Generic_X" 格式 → ALL_REDUCE (0)
-            - "nccl_all_reduce", "nccl:all_reduce" → ALL_REDUCE (0)
-            - "c10d::allreduce_" → ALL_REDUCE (0)
-            - 包含 "allreduce" 的操作 → ALL_REDUCE (0)
+            AMD GPU NCCL 操作處理策略：
+            1. 首先嘗試從上下文推測具體操作類型
+            2. 對於 ncclDevKernel_Generic_X 格式，預設為 ALL_REDUCE（DDP最常見）
+            3. 記錄警告以便未來改進分類邏輯
             """
-            # 記錄所有調用用於除錯
+            # basic logging for debugging
             print(f"[patch] 檢查通訊操作: {name}")
 
-            # 處理 AMD GPU 的 ncclDevKernel_Generic_X 格式
-            if "ncclDevKernel_Generic" in name:
-                print(f"[patch] 偵測到 AMD GPU NCCL Generic kernel: {name} -> ALL_REDUCE")
-                return ALL_REDUCE
-
-            # 處理標準 NCCL AllReduce 操作
-            if any(pattern in name.lower() for pattern in [
-                "nccl_all_reduce", "nccl:all_reduce", "c10d::allreduce", "allreduce"
-            ]):
+            ln = name.lower()
+            # 處理標準 NCCL 操作（精確分類）
+            if any(pattern in ln for pattern in ["nccl_all_reduce", "nccl:all_reduce", "c10d::allreduce", "allreduce"]):
                 print(f"[patch] 偵測到 NCCL AllReduce 操作: {name} -> ALL_REDUCE")
                 return ALL_REDUCE
+            if any(pattern in ln for pattern in ["nccl_all_gather", "nccl:all_gather", "c10d::allgather", "allgather"]):
+                print(f"[patch] 偵測到 NCCL AllGather 操作: {name} -> ALL_GATHER")
+                return ALL_GATHER
+            if BROADCAST is not None and any(pattern in ln for pattern in ["nccl_broadcast", "nccl:broadcast", "c10d::broadcast", "broadcast"]):
+                print(f"[patch] 偵測到 NCCL Broadcast 操作: {name} -> BROADCAST")
+                return BROADCAST
 
-            # 對於所有其他情況，使用原始方法處理
-            # 這確保了對 NVIDIA GPU 和標準命名格式的完全向後兼容
+            # 處理 AMD GPU 的 ncclDevKernel_Generic_X 格式（需要推測），預設為 ALL_REDUCE
+            if "nccldevkernel_generic" in ln or "nccldevkernel" in ln:
+                print(f"[patch] 警告: AMD GPU Generic kernel 無法確定具體通信類型: {name}; 預設 -> ALL_REDUCE")
+                return ALL_REDUCE
+
+            # 其餘情況回退到原始實作
             return original_method(self, name)
 
         # 動態替換類方法（monkey patching）
@@ -462,12 +485,35 @@ def fix_et_dag_inplace(et_file: Path, break_cycles: bool = True, astra_sim_compa
             cleaned_nodes.append(n)
         nodes = cleaned_nodes
 
+        # 4) 過濾：移除所有 CPU-side 的 COMP 節點（is_cpu_op == True）
+        # ASTRA-sim 的 overlap 計算只接受 GPU 與 COMM，因此要避免留下 CPU COMP
+        cpu_comp_ids: set[int] = set()
+        remaining: list[Node] = []
+        for n in nodes:
+            if n.type == COMP_NODE:
+                # 檢查是否有 is_cpu_op 屬性且為 True
+                cpu_attr = next((a for a in n.attr if a.name == "is_cpu_op"), None)
+                if cpu_attr is not None and getattr(cpu_attr, 'bool_val', False):
+                    cpu_comp_ids.add(n.id)
+                    stats["unsupported_nodes_removed"] += 1
+                    continue
+            remaining.append(n)
+        if cpu_comp_ids:
+            # 清理其他節點對這些 CPU COMP 節點的依賴
+            for nn in remaining:
+                _clean_all_deps(nn, cpu_comp_ids)
+        nodes = remaining
+
+        # 重新計算 id_set（後面的清理/斷循環依賴需要最新的 id 集合）
+        id_set = {n.id for n in nodes}
+
         # 4) 對 COMM 類事件補欄位：group_id / comm_size（若缺值或 <=0）
         for n in nodes:
-            # 偵測 COMM 的方式：優先看 comm_type 屬性；若無，再嘗試根據名稱/屬性推斷
+            # 偵測 COMM 的方式：優先看 comm_type 屬性，或檢查節點類型為 COMM_COLL_NODE
             has_comm_attr = any(a.name == "comm_type" for a in n.attr)
-            if not has_comm_attr:
-                # 可能是早期或被 converter 改名；這裡保守處理：若無 comm_type，就略過補欄位
+            is_comm_node = n.type in (COMM_COLL_NODE, COMM_SEND_NODE, COMM_RECV_NODE)
+            if not (has_comm_attr or is_comm_node):
+                # 不是通信節點，跳過補欄位
                 continue
 
             # group_id 補 0（若缺）
@@ -475,6 +521,12 @@ def fix_et_dag_inplace(et_file: Path, break_cycles: bool = True, astra_sim_compa
                 b = n.attr.add()
                 b.name = "group_id"
                 b.int64_val = 0
+
+            # comm_type：為 COMM_COLL_NODE 添加預設的 ALL_REDUCE
+            if n.type == COMM_COLL_NODE and not any(a.name == "comm_type" for a in n.attr):
+                comm_type_attr = n.attr.add()
+                comm_type_attr.name = "comm_type"
+                comm_type_attr.int64_val = ALL_REDUCE  # 從匯入中獲得
 
             # comm_size：若缺或 <=0，嘗試從其它欄位回推；最後保底 1KB
             size_attr = next((a for a in n.attr if a.name == "comm_size"), None)
@@ -496,16 +548,17 @@ def fix_et_dag_inplace(et_file: Path, break_cycles: bool = True, astra_sim_compa
                     size_attr = n.attr.add(); size_attr.name = "comm_size"
                 size_attr.int64_val = int(alt)
 
-        supported_nodes = nodes
-    else:
-        # 沒有啟用 astra_sim_compat，保持所有原始節點
-        supported_nodes = nodes
-
-    # 更新節點列表
-    nodes = supported_nodes
-    id_set = {n.id for n in nodes}
-
-    # === 原有的依賴清理邏輯 ===
+            # is_cpu_op：通信節點必須在 GPU 上運行
+            # 注意：由於我們已經在 apply_amd_gpu_patch 中確保 NCCL 操作被標記為 GPU 操作，
+            # Chakra 的轉換器應該已經正確設置了 is_cpu_op=False。
+            # 這裡我們檢查現有的 is_cpu_op 值，如果不正確則報告錯誤。
+            if n.type in (COMM_COLL_NODE, COMM_SEND_NODE, COMM_RECV_NODE):
+                cpu_attr = next((a for a in n.attr if a.name == "is_cpu_op"), None)
+                if cpu_attr is not None:
+                    if cpu_attr.bool_val == True:
+                        print(f"[warn] 通信節點 {n.id} 的 is_cpu_op 為 True，這可能導致 ASTRA-sim 錯誤")
+                else:
+                    print(f"[warn] 通信節點 {n.id} 缺少 is_cpu_op 屬性")
     # 去自依賴 & 移除不存在依賴（針對 ctrl_deps）
     for n in nodes:
         deps = _get_ctrl(n)
@@ -657,6 +710,77 @@ def create_astra_sim_et(comm_nodes: List[Dict], output_file: Path, rank: int) ->
             print(f"  [node] {i}: {comm_node.get('name', 'unknown')} -> 大小 {comm_size} bytes")
 
     print(f"[astra-et] ✅ 簡化 ET 檔案完成: {output_file}")
+
+
+def map_comm_sizes_from_hdt_to_et(hdt_file: Path, et_file: Path) -> dict:
+    """
+    將 HDT 中抽出的 comm node sizes 寫回到已存在的 .et 檔案中的 COMM 節點。
+
+    返回統計：{'updated': n_updated, 'before_total': bytes_before, 'after_total': bytes_after}
+    此函式嘗試按順序對齊 HDT 的 comm_nodes 與 ET 中的 COMM_* 節點；若數量不同，會退回到名稱匹配的 best-effort。
+    """
+    if not hdt_file.exists() or not et_file.exists():
+        raise FileNotFoundError(f"HDT or ET not found: {hdt_file}, {et_file}")
+
+    comm_nodes = extract_comm_nodes_from_hdt(hdt_file)
+    meta, nodes = _decode_et(et_file)
+
+    # 找到 ET 中的通訊節點
+    et_comm_indices = [i for i, n in enumerate(nodes) if n.type in (COMM_COLL_NODE, COMM_SEND_NODE, COMM_RECV_NODE)]
+    before_total = 0
+    for idx in et_comm_indices:
+        n = nodes[idx]
+        sa = next((a for a in n.attr if a.name == 'comm_size'), None)
+        if sa is not None and hasattr(sa, 'int64_val'):
+            before_total += int(sa.int64_val)
+
+    updated = 0
+
+    # Best-effort: if counts match, map by order; otherwise try name substring match
+    if et_comm_indices and len(et_comm_indices) == len(comm_nodes):
+        for i, cnode in enumerate(comm_nodes):
+            target_idx = et_comm_indices[i]
+            size = extract_comm_size_from_node(cnode)
+            # set attr
+            en = nodes[target_idx]
+            a = next((a for a in en.attr if a.name == 'comm_size'), None)
+            if a is None:
+                a = en.attr.add(); a.name = 'comm_size'
+            a.int64_val = int(size)
+            updated += 1
+    else:
+        # name-based matching
+        for cnode in comm_nodes:
+            cname = (cnode.get('name') or '').lower()
+            matched = False
+            for idx in et_comm_indices:
+                ename = (getattr(nodes[idx], 'name', '') or '').lower()
+                if cname and (cname in ename or ename in cname):
+                    size = extract_comm_size_from_node(cnode)
+                    en = nodes[idx]
+                    a = next((a for a in en.attr if a.name == 'comm_size'), None)
+                    if a is None:
+                        a = en.attr.add(); a.name = 'comm_size'
+                    a.int64_val = int(size)
+                    updated += 1
+                    matched = True
+                    break
+            if not matched:
+                # try to fallback by skipping
+                continue
+
+    after_total = 0
+    for idx in et_comm_indices:
+        n = nodes[idx]
+        sa = next((a for a in n.attr if a.name == 'comm_size'), None)
+        if sa is not None and hasattr(sa, 'int64_val'):
+            after_total += int(sa.int64_val)
+
+    # 覆寫 ET
+    _encode_et(et_file, meta, nodes)
+
+    print(f"[map-comm] {et_file.name}: updated={updated} before={before_total} bytes after={after_total} bytes")
+    return {'updated': updated, 'before_total': before_total, 'after_total': after_total}
 
 
 # --------------------------- 主流程 ---------------------------

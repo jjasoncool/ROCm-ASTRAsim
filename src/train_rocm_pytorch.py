@@ -4,14 +4,40 @@
 CIFAR-10 Training Framework for ROCm (AMD GPU) with Distributed Profiling
 (Chakra-compatible; aligned with standard practice)
 
-Usage:
-  # 建議：把視窗移到第 2 個 epoch 的中段
-  torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
-    --epochs 3 --batch-size 128 \
-    --profile-epoch 2 --trace-wait 32 --trace-steps 128
+TRACE 檔案大小優化建議：
+======================
+問題：目前設定會產生過大的 trace 檔案
+- Device trace: ~547MB/GPU (220萬+ 事件)
+- Host trace: ~538MB/process (57萬+ 節點)
+- 總計: ~2.2GB/次訓練
 
-  # 若仍缺 EventRecord，可暫時加上工程保險（不影響數值結果）：
-  #   --inject-sync-hack
+優化策略：
+1. 【最有效】減少追蹤步數：--trace-steps 8-16 (目前128，可減少85-90%資料量)
+2. 關閉詳細追蹤：移除 --trace-shapes --trace-mem --trace-stack
+3. 減少 DataLoader workers：--workers 0 (減少多程序追蹤噪音)
+4. 分層追蹤模式：
+   - 快速模式: --trace-steps 4   (通訊模式檢查)
+   - 標準模式: --trace-steps 8   (一般分析)
+   - 深度模式: --trace-steps 16  (詳細除錯)
+
+Usage Examples:
+  # 快速模式 (推薦日常使用)
+  torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
+    --epochs 3 --batch-size 128 --workers 0 \
+    --profile-epoch 2 --trace-wait 32 --trace-steps 4
+
+  # 標準模式 (詳細分析)
+  torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
+    --epochs 3 --batch-size 128 --workers 0 \
+    --profile-epoch 2 --trace-wait 32 --trace-steps 8
+
+  # 深度模式 (除錯用)
+  torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
+    --epochs 3 --batch-size 128 --workers 0 \
+    --profile-epoch 2 --trace-wait 32 --trace-steps 16 \
+    --trace-shapes --inject-sync-hack
+
+注意：workers=0 使用主程序載入資料，避免多程序追蹤複雜化
 """
 
 import os
@@ -183,9 +209,17 @@ def is_main(rank: int) -> bool:
 
 def make_tagging_allreduce_hook():
     from torch.distributed.algorithms.ddp_comm_hooks import default_hooks as dh
+    import torch.distributed as dist
+
     def hook(state, bucket):
-        with record_function("nccl_all_reduce"):
-            return dh.allreduce_hook(state, bucket)
+        # 取出 bucket tensor 與大小（bytes）
+        t = bucket.buffer() if hasattr(bucket, "buffer") else None
+        bytes_ = (t.numel() * t.element_size()) if t is not None else 0
+
+        # ★ 關鍵：父事件 record_param_comms + 子事件 nccl:all_reduce|bytes=...
+        with record_function("record_param_comms"):
+            with record_function(f"nccl:all_reduce|bytes={bytes_}|pg=dp0"):
+                return dh.allreduce_hook(state, bucket)  # 官方 hook，內部會做均值
     return hook
 
 # ---------- 主程式 ----------
@@ -193,17 +227,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--batch-size", type=int, default=128)
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=0, help="DataLoader workers (0=主程序載入，減少追蹤噪音)")
     ap.add_argument("--omp-threads", type=int, default=2)
     ap.add_argument("--debug-epoch-print", action="store_true")
 
-    # 視窗定位與大小
+    # 視窗定位與大小 (優化預設值以減少檔案大小)
     ap.add_argument("--profile-epoch", type=int, default=2, help="要擷取的 epoch（1-based）")
     ap.add_argument("--trace-wait", type=int, default=32, help="先略過前 N 步再開始 profile（避開 warm-up）")
-    ap.add_argument("--trace-steps", type=int, default=128, help="視窗內擷取的步數")
-    ap.add_argument("--trace-shapes", action="store_true")
-    ap.add_argument("--trace-stack", action="store_true")
-    ap.add_argument("--trace-mem", action="store_true")
+    ap.add_argument("--trace-steps", type=int, default=8, help="視窗內擷取的步數 (建議: 4-16，避免檔案過大)")
+    ap.add_argument("--trace-shapes", action="store_true", help="追蹤 tensor 形狀 (增加檔案大小)")
+    ap.add_argument("--trace-stack", action="store_true", help="追蹤呼叫堆疊 (增加檔案大小)")
+    ap.add_argument("--trace-mem", action="store_true", help="追蹤記憶體使用 (增加檔案大小)")
 
     # 監測與清理
     ap.add_argument("--disable-gpu-monitoring", action="store_true")
@@ -343,16 +377,16 @@ def main():
                 if args.inject_sync_hack and torch.cuda.is_available():
                     with record_function("manual_sync_event_hack"):
                         s0 = torch.cuda.current_stream()
-                        s1 = torch.cuda.Stream(priority=0)  # 輔助 stream，模擬通訊同步
                         evt = torch.cuda.Event(enable_timing=False)  # HIP 等效事件
                         with torch.cuda.stream(s0):
                             evt.record()  # hipEventRecord
-                        with torch.cuda.stream(s1):
-                            s1.wait_event(evt)  # hipStreamWaitEvent
+                        with torch.cuda.stream(aux_stream):
+                            aux_stream.wait_event(evt)  # hipStreamWaitEvent
                             _ = torch.empty(1, device='cuda').add_(1)  # 小 kernel 確保記錄
 
-                # with record_function("manual_blocking_sync"):
-                #     torch.cuda.synchronize()
+                if step_idx == active_steps:
+                    with record_function("manual_blocking_sync"):
+                        torch.cuda.synchronize()
 
                 prof.step()
 

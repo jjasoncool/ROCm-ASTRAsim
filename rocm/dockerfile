@@ -38,6 +38,8 @@ ENV ASTRA_SIM_BIN=${ASTRA_SIM}/build/astra_analytical/build/bin/AstraSim_Analyti
 
 # 編譯 astra-sim 的 ns3 模組
 # C++ 20 引入了新的 fmt 庫，這可能會導致 ASTRA-sim 的一些舊程式無法編譯。
+WORKDIR /workspace/astra-sim/extern/network_backend/ns-3
+RUN git checkout astra-sim
 WORKDIR /workspace/astra-sim/extern/helper/spdlog_setup
 RUN sed -i 's/\bformat(/fmt::format(/g' conf.h details/conf_impl.h details/template_impl.h \
     && sed -i 's/fmt::fmt::format(/fmt::format(/g' conf.h details/conf_impl.h details/template_impl.h \

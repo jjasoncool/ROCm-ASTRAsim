@@ -234,7 +234,7 @@ def main():
     # 視窗定位與大小 (優化預設值以減少檔案大小)
     ap.add_argument("--profile-epoch", type=int, default=2, help="要擷取的 epoch（1-based）")
     ap.add_argument("--trace-wait", type=int, default=32, help="先略過前 N 步再開始 profile（避開 warm-up）")
-    ap.add_argument("--trace-steps", type=int, default=8, help="視窗內擷取的步數 (建議: 4-16，避免檔案過大)")
+    ap.add_argument("--trace-steps", type=int, default=4, help="視窗內擷取的步數 (建議: 4-16，避免檔案過大)")
     ap.add_argument("--trace-shapes", action="store_true", help="追蹤 tensor 形狀 (增加檔案大小)")
     ap.add_argument("--trace-stack", action="store_true", help="追蹤呼叫堆疊 (增加檔案大小)")
     ap.add_argument("--trace-mem", action="store_true", help="追蹤記憶體使用 (增加檔案大小)")

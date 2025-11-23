@@ -302,7 +302,130 @@ def link_host_device(rank: int, host: Path, device: Path, out_hdt: Path) -> None
     print("[ok] chakra_trace_link 完成\n")
 
 
-def convert_hdt_to_et(hdt: Path, out_et: Path) -> None:
+def add_compute_cycles_to_compute_nodes(et_file: Path, hdt_file: Path, device_file: Path = None) -> int:
+    """
+    為 ET 文件中的 COMPUTE 節點添加 compute_cycles 屬性
+
+    優化策略：優先從 device trace 提取實際 GPU kernel timing，
+    作為後備從 HDT ProfilerStep 推斷。
+
+    參數:
+        et_file: ET 文件路徑
+        hdt_file: HDT 文件路徑，用於提取時長信息
+        device_file: 設備 trace 文件路徑（可選），用於提取精確的 GPU kernel timing
+
+    返回:
+        修復的節點數量
+    """
+    print(f"[fix-compute-cycles] 修復 {et_file.name} 中的 compute_cycles")
+
+    # 方法1：從 device trace 提取實際 GPU kernel timing（更高準確性）
+    gpu_kernel_durations = []
+    if device_file and device_file.exists():
+        try:
+            with device_file.open('r') as f:
+                device_data = json.load(f)
+
+            trace_events = device_data.get('traceEvents', [])
+            for event in trace_events:
+                # 查找 GPU kernel 執行事件
+                cat = event.get('cat', '')
+                name = event.get('name', '')
+
+                # 識別 GPU kernel：hipLaunchKernel 或具有 kernel 信息的操作
+                is_gpu_kernel = (
+                    cat == 'cuda_runtime' and 'hipLaunchKernel' in name
+                ) or (
+                    event.get('args', {}).get('kernel') is not None
+                )
+
+                if is_gpu_kernel:
+                    dur_ns = event.get('dur')
+                    if dur_ns is not None and dur_ns > 0:
+                        gpu_kernel_durations.append(dur_ns)
+                        if len(gpu_kernel_durations) >= 100:  # 限制樣本大小避免過度記憶體使用
+                            break
+
+            if gpu_kernel_durations:
+                # 使用中位數而非平均值，減少 outlier 影響
+                gpu_kernel_durations.sort()
+                median_kernel_ns = gpu_kernel_durations[len(gpu_kernel_durations) // 2]
+
+                # 動態查詢實際 GPU 頻率以獲得精確校準
+                try:
+                    from rocm_compat import get_gpu_frequency
+                    freq_info = get_gpu_frequency(device_id=0)
+                    if freq_info and freq_info.sclk_mhz and freq_info.sclk_mhz > 0:
+                        actual_freq_ghz = freq_info.sclk_mhz / 1000.0
+                        print(f"[fix-compute-cycles] GPU 頻率查詢結果: {freq_info.sclk_mhz:.1f} MHz ({actual_freq_ghz:.3f} GHz)")
+                    else:
+                        print("[warn] 無法查詢 GPU 頻率，回退到預設值 2.4 GHz")
+                        actual_freq_ghz = 2.4
+                except Exception as e:
+                    print(f"[warn] GPU 頻率查詢失敗 ({e})，使用預設值 2.4 GHz")
+                    actual_freq_ghz = 2.4
+
+                # 使用實際查詢的頻率計算 cycles
+                estimated_cycles = int(median_kernel_ns * actual_freq_ghz)
+                print(f"[fix-compute-cycles] 從 device trace 提取 {len(gpu_kernel_durations)} 個 GPU kernels，")
+                print(f"[fix-compute-cycles] 中位數 kernel 持續時間: {median_kernel_ns:.0f} ns @ {actual_freq_ghz:.3f} GHz -> 估計 cycles: {estimated_cycles}")
+                avg_compute_cycles = estimated_cycles
+            else:
+                print("[info] device trace 中未找到 GPU kernel timing 數據")
+
+        except Exception as e:
+            print(f"[warn] 無法從 device trace 提取 GPU kernel timing: {e}")
+
+    # 方法2：從 HDT 提取 ProfilerStep 時長（後備方案）
+    if not gpu_kernel_durations:
+        step_durations = {}
+        try:
+            with hdt_file.open('r') as f:
+                hdt_data = json.load(f)
+
+            for node in hdt_data.get('nodes', []):
+                name = node.get('name', '')
+                if name.startswith('ProfilerStep#'):
+                    step_num = int(name.replace('ProfilerStep#', ''))
+                    dur = node.get('dur')
+                    if dur is not None:
+                        step_durations[step_num] = dur
+        except Exception as e:
+            print(f"[warn] 無法從 HDT 提取時長信息: {e}")
+
+        # 計算平均 step 時長（轉換為 cycles，假設 1ms = 2400 cycles @ 2.4GHz）
+        if step_durations:
+            avg_step_ms = sum(step_durations.values()) / len(step_durations)
+            avg_compute_cycles = int(avg_step_ms * 2400)  # 基於 2.4GHz GPU
+            print(f"[fix-compute-cycles] 從 HDT ProfilerStep 計算平均 compute_cycles: {avg_compute_cycles}")
+        else:
+            # 默認值：1ms = 2.4e6 cycles（@2.4GHz）
+            avg_compute_cycles = 2400000
+            print(f"[fix-compute-cycles] 使用默認 compute_cycles: {avg_compute_cycles}")
+
+    # 添加屬性到 COMPUTE 節點
+    meta, nodes = _decode_et(et_file)
+    fixed_count = 0
+
+    for node in nodes:
+        if node.type == COMP_NODE:
+            # 檢查是否已有 compute_cycles
+            has_compute_cycles = any(a.name in ["compute_cycles", "exec_cycles", "cycles"] for a in node.attr)
+
+            if not has_compute_cycles:
+                # 添加 compute_cycles 屬性
+                attr = node.attr.add()
+                attr.name = "compute_cycles"
+                attr.int64_val = avg_compute_cycles
+                fixed_count += 1
+
+    # 保存修復後的 ET 文件
+    _encode_et(et_file, meta, nodes)
+    print(f"[fix-compute-cycles] 已為 {fixed_count} 個 COMPUTE 節點添加 compute_cycles")
+    return fixed_count
+
+
+def convert_hdt_to_et(hdt: Path, out_et: Path, device_file: Path = None) -> None:
     """
     將 HDT (Chakra 中間格式) 轉換為 ET (執行追蹤) 格式
 
@@ -315,6 +438,9 @@ def convert_hdt_to_et(hdt: Path, out_et: Path) -> None:
     2. 新進程不會繼承我們的動態修補 (monkey patch)
     3. 直接調用 Python API 可以確保修補在同一進程中生效
     4. 如果直接調用失敗，提供命令行工具作為備選方案
+
+    === AMD GPU 修補增強 ===
+    在轉換後額外確保 COMPUTE 節點具有 compute_cycles 屬性
     """
     print(f"[convert] {hdt.name}  ->  {out_et.name}")
 
@@ -342,11 +468,19 @@ def convert_hdt_to_et(hdt: Path, out_et: Path) -> None:
         print("[warn] 注意：命令行工具不會受到我們的 AMD GPU 修補影響")
 
         # === 備選方案：命令行工具 ===
-        # 如果直接調用失敗，回退到原始的命令行工具
-        # 但這不會有 AMD GPU 修補的效果
         cmd = ["chakra_converter", "PyTorch", "--input", str(hdt), "--output", str(out_et)]
         if not run_one(cmd):
             raise RuntimeError(f"chakra_converter 執行失敗，請檢查 HDT 檔案。")
+
+    # === 第三步：AMD GPU 修補增強 ===
+    # 確保 COMPUTE 節點具有 compute_cycles 屬性
+    try:
+        fixed_count = add_compute_cycles_to_compute_nodes(out_et, hdt, device_file)
+        if fixed_count > 0:
+            print(f"[fix] 添加了 {fixed_count} 個 compute_cycles 屬性到 COMPUTE 節點")
+    except Exception as e:
+        print(f"[warn] compute_cycles 修復失敗: {e}")
+        print("[info] 模擬可能仍會卡住，請檢查 COMPUTE 節點是否有 compute_cycles 屬性")
 
 
 # --------------------------- 轉檔後：DAG 修正 ---------------------------
@@ -736,39 +870,147 @@ def map_comm_sizes_from_hdt_to_et(hdt_file: Path, et_file: Path) -> dict:
 
     updated = 0
 
-    # Best-effort: if counts match, map by order; otherwise try name substring match
-    if et_comm_indices and len(et_comm_indices) == len(comm_nodes):
-        for i, cnode in enumerate(comm_nodes):
-            target_idx = et_comm_indices[i]
-            size = extract_comm_size_from_node(cnode)
-            # set attr
-            en = nodes[target_idx]
-            a = next((a for a in en.attr if a.name == 'comm_size'), None)
-            if a is None:
-                a = en.attr.add(); a.name = 'comm_size'
-            a.int64_val = int(size)
-            updated += 1
-    else:
-        # name-based matching
-        for cnode in comm_nodes:
-            cname = (cnode.get('name') or '').lower()
-            matched = False
-            for idx in et_comm_indices:
-                ename = (getattr(nodes[idx], 'name', '') or '').lower()
-                if cname and (cname in ename or ename in cname):
-                    size = extract_comm_size_from_node(cnode)
-                    en = nodes[idx]
-                    a = next((a for a in en.attr if a.name == 'comm_size'), None)
-                    if a is None:
-                        a = en.attr.add(); a.name = 'comm_size'
-                    a.int64_val = int(size)
-                    updated += 1
-                    matched = True
-                    break
-            if not matched:
-                # try to fallback by skipping
-                continue
+    # Build helper data structures
+    # HDT comm entries: derive bytes and optional time interval
+    hdt_entries = []
+    for hn in comm_nodes:
+        entry = {}
+        entry['name'] = (hn.get('name') or '').lower()
+        entry['bytes'] = extract_comm_size_from_node(hn)
+        # optional time bounds (if available in HDT)
+        entry['start'] = hn.get('ts') or hn.get('start') or None
+        entry['end'] = hn.get('end') or hn.get('duration') and ((hn.get('ts') or 0) + hn.get('duration')) or None
+        entry['raw'] = hn
+        entry['assigned'] = 0
+        hdt_entries.append(entry)
 
+    et_entries = []
+    for idx in et_comm_indices:
+        n = nodes[idx]
+        ename = (getattr(n, 'name', '') or '').lower()
+        esize = next((a.int64_val for a in n.attr if a.name == 'comm_size' and hasattr(a, 'int64_val')), 0)
+        # attempt to read timestamps if present (start/end)
+        estart = None
+        eend = None
+        # some schemas might store ts/duration on attributes
+        ts_attr = next((a for a in n.attr if a.name in ('ts', 'time', 'start_ts')), None)
+        dur_attr = next((a for a in n.attr if a.name in ('duration', 'dur', 'elapsed')), None)
+        if ts_attr is not None and hasattr(ts_attr, 'int64_val'):
+            estart = int(ts_attr.int64_val)
+        if dur_attr is not None and hasattr(dur_attr, 'int64_val') and estart is not None:
+            eend = estart + int(dur_attr.int64_val)
+        et_entries.append({'idx': idx, 'name': ename, 'size': int(esize or 0), 'start': estart, 'end': eend, 'node': n, 'assigned': 0})
+
+    # Strategy:
+    # 1) Exact / substring name matches (high confidence)
+    # 2) Time overlap matches (if timestamps available)
+    # 3) Greedy bytes assignment: allocate remaining HDT bytes to unassigned ET nodes by best name score
+
+    provenance = []
+
+    # 1) Name exact/substring matching
+    for he in hdt_entries:
+        if he['bytes'] <= 0:
+            continue
+        for ee in et_entries:
+            if ee['assigned']:
+                continue
+            if not he['name'] or not ee['name']:
+                continue
+            if he['name'] == ee['name'] or he['name'] in ee['name'] or ee['name'] in he['name']:
+                # assign full bytes
+                assign = int(he['bytes'])
+                ee['assigned'] = assign
+                he['assigned'] = assign
+                # set attr
+                a = next((a for a in ee['node'].attr if a.name == 'comm_size'), None)
+                if a is None:
+                    a = ee['node'].attr.add(); a.name = 'comm_size'
+                a.int64_val = assign
+                updated += 1
+                provenance.append({'method': 'name', 'hdt_name': he['name'], 'et_name': ee['name'], 'bytes': assign, 'et_idx': ee['idx']})
+                break
+
+    # 2) Time overlap matching
+    for he in hdt_entries:
+        if he['assigned']:
+            continue
+        if he.get('start') is None or he.get('end') is None:
+            continue
+        for ee in et_entries:
+            if ee['assigned']:
+                continue
+            if ee.get('start') is None or ee.get('end') is None:
+                continue
+            # check overlap
+            if not (he['end'] < ee['start'] or he['start'] > ee['end']):
+                assign = int(he['bytes'])
+                ee['assigned'] = assign
+                he['assigned'] = assign
+                a = next((a for a in ee['node'].attr if a.name == 'comm_size'), None)
+                if a is None:
+                    a = ee['node'].attr.add(); a.name = 'comm_size'
+                a.int64_val = assign
+                updated += 1
+                provenance.append({'method': 'time', 'hdt_name': he['name'], 'et_name': ee['name'], 'bytes': assign, 'et_idx': ee['idx']})
+                break
+
+    # 3) Greedy bytes assignment for remaining HDT entries -> distribute to remaining ET nodes by name-similarity score
+    # prepare list of remaining ETs and remaining HDTs
+    remaining_ets = [ee for ee in et_entries if not ee['assigned']]
+    remaining_hdts = [he for he in hdt_entries if not he['assigned']]
+
+    def name_score(a: str, b: str) -> int:
+        # simple heuristic: common substring length
+        if not a or not b:
+            return 0
+        # use longest common substring (O(n^2) but strings are short)
+        best = 0
+        for i in range(len(a)):
+            for j in range(i+1, len(a)+1):
+                sub = a[i:j]
+                if sub and sub in b:
+                    best = max(best, len(sub))
+        return best
+
+    for he in remaining_hdts:
+        if he['bytes'] <= 0:
+            continue
+        # score remaining ET nodes
+        scores = [(name_score(he['name'], ee['name']), ee) for ee in remaining_ets]
+        scores.sort(key=lambda x: x[0], reverse=True)
+        if not scores:
+            continue
+        best_score, best_ee = scores[0]
+        # if best_score == 0, fall back to proportional distribution
+        if best_score > 0:
+            assign = int(he['bytes'])
+            best_ee['assigned'] = assign
+            he['assigned'] = assign
+            a = next((a for a in best_ee['node'].attr if a.name == 'comm_size'), None)
+            if a is None:
+                a = best_ee['node'].attr.add(); a.name = 'comm_size'
+            a.int64_val = assign
+            updated += 1
+            provenance.append({'method': 'greedy_name', 'hdt_name': he['name'], 'et_name': best_ee['name'], 'bytes': assign, 'et_idx': best_ee['idx'], 'score': best_score})
+        else:
+            # proportional distribution: split he['bytes'] among remaining_ets evenly
+            if not remaining_ets:
+                continue
+            per = int(he['bytes'] // len(remaining_ets))
+            rem = int(he['bytes']) - per * len(remaining_ets)
+            for i, ee in enumerate(remaining_ets):
+                assign = per + (1 if i == 0 else 0) if rem else per
+                ee['assigned'] = assign
+                # update node
+                a = next((a for a in ee['node'].attr if a.name == 'comm_size'), None)
+                if a is None:
+                    a = ee['node'].attr.add(); a.name = 'comm_size'
+                a.int64_val = assign
+                updated += 1
+                provenance.append({'method': 'proportional', 'hdt_name': he['name'], 'et_name': ee['name'], 'bytes': assign, 'et_idx': ee['idx']})
+
+    # compute after_total
     after_total = 0
     for idx in et_comm_indices:
         n = nodes[idx]
@@ -778,6 +1020,24 @@ def map_comm_sizes_from_hdt_to_et(hdt_file: Path, et_file: Path) -> dict:
 
     # 覆寫 ET
     _encode_et(et_file, meta, nodes)
+
+    # write provenance sidecar into runs/mapping/ for centralized storage (non-destructive)
+    try:
+        runs_mapping_dir = Path('runs') / 'mapping'
+        runs_mapping_dir.mkdir(parents=True, exist_ok=True)
+        # name provenance by et filename + rank if possible
+        et_basename = et_file.stem
+        prov_path = runs_mapping_dir / f"{et_basename}.mapping.json"
+        with prov_path.open('w') as pf:
+            json.dump({'provenance': provenance, 'hdt_file': str(hdt_file), 'et_file': str(et_file)}, pf, indent=2)
+    except Exception:
+        # fallback: write next to et_file
+        try:
+            prov_path = et_file.with_suffix(et_file.suffix + '.mapping.json')
+            with prov_path.open('w') as pf:
+                json.dump({'provenance': provenance, 'hdt_file': str(hdt_file), 'et_file': str(et_file)}, pf, indent=2)
+        except Exception:
+            pass
 
     print(f"[map-comm] {et_file.name}: updated={updated} before={before_total} bytes after={after_total} bytes")
     return {'updated': updated, 'before_total': before_total, 'after_total': after_total}
@@ -858,7 +1118,7 @@ def main():
                 print(f"[warn] rank {r}: 未找到通訊節點，跳過")
         else:
             # 標準模式：完整轉換 + DAG 修正
-            convert_hdt_to_et(hdt, et)
+            convert_hdt_to_et(hdt, et, dev)
 
             # 轉檔後：就地修 DAG（清理不一致依賴/循環，並過濾 ASTRA-sim 不支援的節點）
             try:

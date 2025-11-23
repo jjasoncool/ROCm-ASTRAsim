@@ -69,8 +69,8 @@ KINETO_COMM_HINTS = ("nccl", "rccl", "all_reduce", "allreduce", "all_gather", "r
 CALIB_FIELDS = [
     'mode', 'tag', 'calib_id', 'world', 'logical_dims', 'topo_desc',
     'qcn', 'pfc_dyn', 'buffer', 'payload', 'coll_opt', 'lmbw',
-    'alpha_us', 'sim_cycles_step', 'sim_cycles_comm', 'sim_cycles_gpu', 'sim_t_step_ms', 'sim_t_comm_ms',
-    'real_t_step_ms', 'real_t_comm_ms', 'real_t_net_comm_ms', 'real_t_kernel_ms', 'run_dir', 'rel_err_step', 'rel_err_comm',
+    'alpha_us', 'alpha_comm_us', 'alpha_gpu_us', 'sim_cycles_step', 'sim_cycles_comm', 'sim_cycles_gpu', 'sim_t_step_ms', 'sim_t_comm_ms',
+    'real_t_step_ms', 'real_t_comm_ms', 'real_t_net_comm_ms', 'real_t_kernel_ms', 'run_dir', 'rel_err_step', 'rel_err_comm', 'sim_t_comm_ms_comm', 'rel_err_comm_comm',
     'flags'  # 執行狀態標記（例如 comm_equals_wall_no_compute）
 ]
 
@@ -172,15 +172,31 @@ def patch_network_cfg(src: Path, out: Path, *,
         pat = re.compile(rf'^\s*{re.escape(key)}(\s+|=).*$', re.IGNORECASE)
         replaced = False
         new_lines = []
+        def _format_val(v):
+            # For numeric or simple string values (like BUFFER_SIZE), return str(v).
+            # For file paths, attempt to resolve to absolute posix path.
+            if v is None:
+                return None
+            # if it's an int/float, just stringify
+            if isinstance(v, (int, float)):
+                return str(v)
+            try:
+                # try to treat as a path; if it fails, fallback to str(v)
+                pv = Path(v)
+                return pv.resolve().as_posix()
+            except Exception:
+                return str(v)
+
+        val_str = _format_val(value)
         for ln in lines_list:
             if pat.match(ln):
                 if value is not None and not replaced:
-                    new_lines.append(f"{key} {Path(value).resolve().as_posix()}")
+                    new_lines.append(f"{key} {val_str}")
                     replaced = True
             else:
                 new_lines.append(ln)
         if (value is not None) and (not replaced):
-            new_lines.append(f"{key} {Path(value).resolve().as_posix()}")
+            new_lines.append(f"{key} {val_str}")
         return new_lines
 
     lines_wo_flow = []
@@ -894,6 +910,15 @@ def main():
         f"--remote-memory-configuration={remote_json.as_posix()}",
         f"--logical-topology-configuration={topo_json.as_posix()}",
     ]
+
+    # ★ 若系統有 stdbuf，包一層讓 ns-3 改成 line-buffered，避免 PIPE 下完全不輸出
+    stdbuf_path = shutil.which("stdbuf")
+    if stdbuf_path is not None:
+        cmd = [stdbuf_path, "-oL", "-eL", *cmd]
+        print(f"[INFO] 檢測到 stdbuf，已使用 line-buffered 模式執行 ns-3：{' '.join(cmd)}")
+    else:
+        print("[WARN] 系統找不到 stdbuf，ns-3 在 PIPE 模式下可能不會即時輸出（這是 C stdout 緩衝機制的正常現象）")
+
     if args.comm_group and args.comm_group.lower() not in {"empty", "none"}:
         cg_path = Path(args.comm_group).expanduser().resolve()
         if not cg_path.exists():
@@ -1070,8 +1095,30 @@ def main():
         else:
             # 無實測（例如 N>2 虛擬擴張），sim_t_step_ms 與 alpha 只能留空或沿用前次（此處留空，只記 cycles）
             pass
+
+    # 額外計算 comm 尺度的 alpha（alpha_comm_us），以便診斷 sim_comm 與 real_comm 是否共享相同尺度
+    alpha_comm_us = None
+    if sim_cycles_comm is not None and real_t_comm_ms is not None:
+        # real_t_comm_ms (ms/step) -> microsecond per sim cycle
+        alpha_comm_us = (real_t_comm_ms * 1000.0) / max(1, sim_cycles_comm)
+
+    # 額外計算 gpu 尺度的 alpha（alpha_gpu_us），以便診斷 sim_gpu 與 real_kernel 是否匹配
+    alpha_gpu_us = None
+    if sim_cycles_gpu is not None and real_t_kernel_ms is not None:
+        alpha_gpu_us = (real_t_kernel_ms * 1000.0) / max(1, sim_cycles_gpu)
+
+    # 使用通用 alpha 計算 sim_t_comm_ms
+    sim_t_comm_ms = None
     if sim_cycles_comm is not None and alpha_us is not None:
         sim_t_comm_ms = sim_cycles_comm * (alpha_us / 1000.0)
+
+    # 若存在 comm-specific alpha，計算使用 comm alpha 的 sim comm 時間與對應誤差（便於比較）
+    sim_t_comm_ms_comm = None
+    rel_err_comm_comm = None
+    if sim_cycles_comm is not None and alpha_comm_us is not None:
+        sim_t_comm_ms_comm = sim_cycles_comm * (alpha_comm_us / 1000.0)
+        if real_t_comm_ms is not None and sim_t_comm_ms_comm is not None:
+            rel_err_comm_comm = (abs(sim_t_comm_ms_comm - real_t_comm_ms) / real_t_comm_ms)
 
     # ---------- A-保護：Comm==Wall 與 ET 是否有 Compute ----------
     flags: list[str] = []
@@ -1109,20 +1156,27 @@ def main():
         "payload": args.payload if args.payload is not None else "",
         "coll_opt": args.coll_opt if args.coll_opt is not None else "",
         "lmbw": args.lmbw if args.lmbw is not None else "",
-        "alpha_us": f"{alpha_us:.6f}" if alpha_us is not None else "",
+    "alpha_us": f"{alpha_us:.6f}" if alpha_us is not None else "",
+    "alpha_comm_us": f"{alpha_comm_us:.6f}" if alpha_comm_us is not None else "",
+    "alpha_gpu_us": f"{alpha_gpu_us:.6f}" if alpha_gpu_us is not None else "",
         "sim_cycles_step": sim_cycles_step if sim_cycles_step is not None else "",
         "sim_cycles_comm": sim_cycles_comm if sim_cycles_comm is not None else "",
         "sim_cycles_gpu": sim_cycles_gpu if sim_cycles_gpu is not None else "",
         "sim_t_step_ms": f"{sim_t_step_ms:.6f}" if sim_t_step_ms is not None else "",
         # A-保護：若上面抑制了 sim_t_comm_ms，這裡自然留空
         "sim_t_comm_ms": f"{sim_t_comm_ms:.6f}" if sim_t_comm_ms is not None else "",
+        "sim_t_comm_ms_comm": f"{sim_t_comm_ms_comm:.6f}" if sim_t_comm_ms_comm is not None else "",
         "real_t_step_ms": f"{real_t_step_ms:.6f}" if real_t_step_ms is not None else "",
         "real_t_comm_ms": f"{real_t_comm_ms:.6f}" if real_t_comm_ms is not None else "",
         "real_t_net_comm_ms": f"{real_t_net_comm_ms:.6f}" if real_t_net_comm_ms is not None else "",
         "real_t_kernel_ms": f"{real_t_kernel_ms:.6f}" if real_t_kernel_ms is not None else "",
+    # 額外輸出 comm-specific alpha & gpu-specific alpha（microseconds per sim cycle）以便診斷
+    "alpha_comm_us": f"{alpha_comm_us:.6f}" if alpha_comm_us is not None else "",
+    "alpha_gpu_us": f"{alpha_gpu_us:.6f}" if alpha_gpu_us is not None else "",
         "run_dir": str(logroot),
         "rel_err_step": f"{rel_err_step:.6f}" if rel_err_step is not None else "",
         "rel_err_comm": f"{rel_err_comm:.6f}" if rel_err_comm is not None else "",
+        "rel_err_comm_comm": f"{rel_err_comm_comm:.6f}" if rel_err_comm_comm is not None else "",
         "flags": "|".join(flags) if flags else "",
     }
     export_metrics(out_dir, row)

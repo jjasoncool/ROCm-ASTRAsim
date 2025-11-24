@@ -24,6 +24,7 @@ Link PyTorch host/device traces -> HDT (ET+), then convert to Chakra ET (.et)
   ./data/chakra/
     ├─ pytorch_traces/   # host_*.json / device_*.json 來源，同時輸出 hdt_*.json
     └─ workload_et/      # 輸出 .et (<prefix>.<rank>.et)
+    └─ gpu_metrics/      # (Optional) gpu_metrics_*.json 用於精確 cycles 計算
 
 預設行為：
   - 先清空 pytorch_traces/hdt_*.json 與 workload_et/*.et
@@ -32,16 +33,19 @@ Link PyTorch host/device traces -> HDT (ET+), then convert to Chakra ET (.et)
   - 自動應用 AMD GPU 修補
 
 用法：
+  # 一般用法 (預設 2400 MHz)
   python ./src/conver_to_chakra_et.py
+
+  # 指定 9070 XT 的頻率 (例如 2.6 GHz)
+  python ./src/conver_to_chakra_et.py --default-gpu-freq 2600
+
   # 保留舊檔且不強制覆寫
   python ./src/conver_to_chakra_et.py --no-clean --no-force
-  # 只轉指定 ranks
-  python ./src/conver_to_chakra_et.py --ranks 0 1
-  # 以 device_*.json 內容自動命名前綴
-  python ./src/conver_to_chakra_et.py --et-prefix auto
 """
 from __future__ import annotations
 
+import sys
+import time
 import argparse
 import json
 import re
@@ -56,11 +60,27 @@ from typing import List, Dict, Tuple, Optional
 from chakra.src.third_party.utils.protolib import decodeMessage as _decode_msg
 from chakra.src.third_party.utils.protolib import encodeMessage as _encode_msg
 from chakra.schema.protobuf.et_def_pb2 import GlobalMetadata, Node, AttributeProto, COMP_NODE, COMM_COLL_NODE, COMM_SEND_NODE, COMM_RECV_NODE, ALL_REDUCE, ALL_GATHER, REDUCE_SCATTER, ALL_TO_ALL  # type: ignore
-# BROADCAST may not exist in all schema versions; fall back to None
 try:
     from chakra.schema.protobuf.et_def_pb2 import BROADCAST  # type: ignore
 except Exception:
     BROADCAST = None
+
+class Logger(object):
+    """
+    將輸出同時導向終端機與檔案的輔助類別 (Tee)
+    """
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.log = open(filename, "w", encoding="utf-8") # 使用寫入模式
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush() # 確保即時寫入，避免程式崩潰時 log 是空的
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
 
 # --------------------------- AMD GPU 修補 ---------------------------
 
@@ -95,21 +115,8 @@ def apply_amd_gpu_patch():
         original_method = PyTorchConverter.get_protobuf_node_type_from_json_node
 
         def patched_get_protobuf_node_type_from_json_node(self, json_node_map, json_node):
-            """
-            修補版本的節點類型判斷方法
-
-            首先檢查是否為 AMD GPU NCCL 操作，然後回退到原始邏輯
-
-            Args:
-                json_node_map: JSON 節點映射
-                json_node: 要判斷類型的節點
-
-            Returns:
-                int: 節點類型常數
-            """
             # 記錄 GPU 操作用於除錯
             if json_node.is_gpu_op():
-                print(f"[patch] 檢查 GPU 操作: {json_node.name}")
 
                 # 檢查 AMD GPU NCCL Generic kernel (底層 kernel 名稱)
                 if "ncclDevKernel_Generic" in json_node.name:
@@ -117,17 +124,14 @@ def apply_amd_gpu_patch():
                     return COMM_COLL_NODE
 
             # 檢查所有 NCCL 相關操作，包括 PyTorch profiler 生成的名稱
-            # 注意：NCCL 操作可能不是 GPU 操作，所以我們需要檢查所有節點
             if ("nccl:all_reduce" in json_node.name or
                 "nccl:all_gather" in json_node.name or
                 "nccl:reduce_scatter" in json_node.name or
                 "nccl:broadcast" in json_node.name or
                 "nccl:all_to_all" in json_node.name or
                 "ncclDevKernel_Generic" in json_node.name):
-                print(f"[patch] 偵測到 NCCL 集體通訊操作: {json_node.name} -> COMM_COLL_NODE")
                 # 確保 NCCL 操作被標記為 GPU 操作，以便 is_cpu_op 被正確設置為 False
                 json_node.cat = "kernel"  # 設置為 GPU kernel 類別
-                print(f"[patch] 將 NCCL 操作標記為 GPU 操作 (cat='kernel')")
                 return COMM_COLL_NODE
 
             # 對於所有其他情況，使用原始方法處理
@@ -176,26 +180,6 @@ def patch_collective_comm_type_for_amd():
         original_method = PyTorchConverter.get_collective_comm_type
 
         def patched_get_collective_comm_type(self, name: str) -> int:
-            """
-            修補版本的 get_collective_comm_type 方法
-
-            支援 AMD GPU 的 ncclDevKernel_Generic_X 格式並提供智能推測。
-            同時處理標準 NCCL 操作的完整分類。
-
-            Args:
-                name (str): GPU kernel 的名稱
-
-            Returns:
-                int: 對應的 collective communication 類型常數
-
-            AMD GPU NCCL 操作處理策略：
-            1. 首先嘗試從上下文推測具體操作類型
-            2. 對於 ncclDevKernel_Generic_X 格式，預設為 ALL_REDUCE（DDP最常見）
-            3. 記錄警告以便未來改進分類邏輯
-            """
-            # basic logging for debugging
-            print(f"[patch] 檢查通訊操作: {name}")
-
             ln = name.lower()
             # 處理標準 NCCL 操作（精確分類）
             if any(pattern in ln for pattern in ["nccl_all_reduce", "nccl:all_reduce", "c10d::allreduce", "allreduce"]):
@@ -217,7 +201,6 @@ def patch_collective_comm_type_for_amd():
             return original_method(self, name)
 
         # 動態替換類方法（monkey patching）
-        # 這會影響所有後續創建的 PyTorchConverter 實例
         PyTorchConverter.get_collective_comm_type = patched_get_collective_comm_type
         print("[patch] 已成功修補 get_collective_comm_type 方法，支援 AMD GPU NCCL kernels")
         return True
@@ -302,24 +285,69 @@ def link_host_device(rank: int, host: Path, device: Path, out_hdt: Path) -> None
     print("[ok] chakra_trace_link 完成\n")
 
 
-def add_compute_cycles_to_compute_nodes(et_file: Path, hdt_file: Path, device_file: Path = None) -> int:
+# [MODIFIED] 新增 default_freq_mhz 參數，移除 rocm_compat 依賴
+def add_compute_cycles_to_compute_nodes(et_file: Path, hdt_file: Path, device_file: Path = None, pt_dir: Path = None, rank: int = 0, default_freq_mhz: float = 2400.0) -> int:
     """
     為 ET 文件中的 COMPUTE 節點添加 compute_cycles 屬性
 
-    優化策略：優先從 device trace 提取實際 GPU kernel timing，
-    作為後備從 HDT ProfilerStep 推斷。
+    優先順序:
+    1. 讀取 train_rocm_pytorch 產生的 gpu_metrics_{rank}.json (最準確，真實訓練頻率)
+    2. 使用參數傳入的預設頻率 (default_freq_mhz)
 
     參數:
         et_file: ET 文件路徑
-        hdt_file: HDT 文件路徑，用於提取時長信息
-        device_file: 設備 trace 文件路徑（可選），用於提取精確的 GPU kernel timing
+        hdt_file: HDT 文件路徑
+        device_file: 設備 trace 文件路徑
+        pt_dir: PyTorch trace 目錄
+        rank: 當前處理的 rank
+        default_freq_mhz: 保底頻率 (MHz)，由命令列傳入
 
     返回:
         修復的節點數量
     """
     print(f"[fix-compute-cycles] 修復 {et_file.name} 中的 compute_cycles")
 
-    # 方法1：從 device trace 提取實際 GPU kernel timing（更高準確性）
+    actual_freq_ghz = None
+
+    # [1] 嘗試讀取訓練期間記錄的 metrics
+    if pt_dir:
+        # 結構: data/chakra/gpu_metrics/gpu_metrics_0.json
+        metrics_file = pt_dir.parent / "gpu_metrics" / f"gpu_metrics_{rank}.json"
+
+        if metrics_file.exists():
+            try:
+                with metrics_file.open('r') as f:
+                    mdata = json.load(f)
+
+                    median_f = mdata.get("sclk_median_mhz", 0)
+                    avg_f = mdata.get("sclk_avg_mhz", 0)
+                    max_f = mdata.get("sclk_max_mhz", 0)
+
+                    # 智慧判斷邏輯：
+                    # 如果中位數太低 (例如 < 500MHz)，代表大部分時間都在 Idle，
+                    # 這時應該改用 Max (假設有負載時是跑全速) 或 Avg。
+                    if median_f > 500:
+                        sclk = median_f
+                        print(f"[fix-compute-cycles] 使用中位數頻率: {sclk} MHz")
+                    elif max_f > 500:
+                        sclk = max_f
+                        print(f"[fix-compute-cycles] ⚠️ 中位數過低 ({median_f} MHz)，改用最大頻率: {sclk} MHz")
+                    else:
+                        sclk = default_freq_mhz
+                        print(f"[fix-compute-cycles] ⚠️ 偵測到的頻率皆過低 (Max={max_f})，改用預設值")
+
+                    if sclk:
+                        actual_freq_ghz = sclk / 1000.0
+
+            except Exception as e:
+                print(f"[warn] 讀取 metrics 失敗: {e}")
+
+    # [2] 若無 Metrics，使用命令列傳入的保底值 (不進行即時 Probe)
+    if actual_freq_ghz is None:
+        actual_freq_ghz = default_freq_mhz / 1000.0
+        print(f"[fix-compute-cycles] ⚠️ 無法讀取 metrics，使用設定頻率: {default_freq_mhz:.1f} MHz ({actual_freq_ghz:.3f} GHz)")
+
+    # 方法1：從 device trace 提取實際 GPU kernel timing
     gpu_kernel_durations = []
     if device_file and device_file.exists():
         try:
@@ -340,41 +368,43 @@ def add_compute_cycles_to_compute_nodes(et_file: Path, hdt_file: Path, device_fi
                 )
 
                 if is_gpu_kernel:
-                    dur_ns = event.get('dur')
-                    if dur_ns is not None and dur_ns > 0:
+                    raw_dur = event.get('dur')
+                    # [關鍵修正] 確保單位正確：Trace 裡的微秒 (us) -> 奈秒 (ns)
+                    if raw_dur is not None and raw_dur > 0:
+                        dur_ns = raw_dur * 1000.0
                         gpu_kernel_durations.append(dur_ns)
-                        if len(gpu_kernel_durations) >= 100:  # 限制樣本大小避免過度記憶體使用
-                            break
 
             if gpu_kernel_durations:
-                # 使用中位數而非平均值，減少 outlier 影響
-                gpu_kernel_durations.sort()
-                median_kernel_ns = gpu_kernel_durations[len(gpu_kernel_durations) // 2]
+                # [優化過濾]
+                # 1. 過濾掉極短的 System Kernel (例如 < 2us = 2000ns)
+                #    許多 Memcpy DtoD 在您的 trace 中是 1.0us (1000ns)，這些應視為雜訊
+                valid_durations = [d for d in gpu_kernel_durations if d >= 2000]
 
-                # 動態查詢實際 GPU 頻率以獲得精確校準
-                try:
-                    from rocm_compat import get_gpu_frequency
-                    freq_info = get_gpu_frequency(device_id=0)
-                    if freq_info and freq_info.sclk_mhz and freq_info.sclk_mhz > 0:
-                        actual_freq_ghz = freq_info.sclk_mhz / 1000.0
-                        print(f"[fix-compute-cycles] GPU 頻率查詢結果: {freq_info.sclk_mhz:.1f} MHz ({actual_freq_ghz:.3f} GHz)")
-                    else:
-                        print("[warn] 無法查詢 GPU 頻率，回退到預設值 2.4 GHz")
-                        actual_freq_ghz = 2.4
-                except Exception as e:
-                    print(f"[warn] GPU 頻率查詢失敗 ({e})，使用預設值 2.4 GHz")
-                    actual_freq_ghz = 2.4
+                if not valid_durations:
+                    # 如果全部都很短，放寬標準（至少不是 0）
+                    valid_durations = gpu_kernel_durations
 
-                # 使用實際查詢的頻率計算 cycles
+                # 排序
+                valid_durations.sort()
+
+                # 取中位數 (Median) 作為代表
+                median_kernel_ns = valid_durations[len(valid_durations) // 2]
+
+                print(f"[fix-compute-cycles] 掃描 {len(gpu_kernel_durations)} 個事件")
+                print(f"[fix-compute-cycles] 有效運算 Kernel: {len(valid_durations)} 個 (過濾標準: >= 2000ns)")
+
+                # 計算 Cycles
                 estimated_cycles = int(median_kernel_ns * actual_freq_ghz)
-                print(f"[fix-compute-cycles] 從 device trace 提取 {len(gpu_kernel_durations)} 個 GPU kernels，")
-                print(f"[fix-compute-cycles] 中位數 kernel 持續時間: {median_kernel_ns:.0f} ns @ {actual_freq_ghz:.3f} GHz -> 估計 cycles: {estimated_cycles}")
+                print(f"[fix-compute-cycles] Kernel 代表時長: {median_kernel_ns:.0f} ns @ {actual_freq_ghz:.3f} GHz -> 估計 cycles: {estimated_cycles}")
                 avg_compute_cycles = estimated_cycles
             else:
-                print("[info] device trace 中未找到 GPU kernel timing 數據")
+                # 保底機制
+                print("[fix-compute-cycles] ⚠️ 未找到任何 Kernel，使用保底值 50us")
+                avg_compute_cycles = int(50000 * actual_freq_ghz)
 
         except Exception as e:
             print(f"[warn] 無法從 device trace 提取 GPU kernel timing: {e}")
+            avg_compute_cycles = int(1000 * 1000 * actual_freq_ghz)
 
     # 方法2：從 HDT 提取 ProfilerStep 時長（後備方案）
     if not gpu_kernel_durations:
@@ -393,15 +423,17 @@ def add_compute_cycles_to_compute_nodes(et_file: Path, hdt_file: Path, device_fi
         except Exception as e:
             print(f"[warn] 無法從 HDT 提取時長信息: {e}")
 
-        # 計算平均 step 時長（轉換為 cycles，假設 1ms = 2400 cycles @ 2.4GHz）
+        # 計算平均 step 時長（轉換為 cycles）
         if step_durations:
             avg_step_ms = sum(step_durations.values()) / len(step_durations)
-            avg_compute_cycles = int(avg_step_ms * 2400)  # 基於 2.4GHz GPU
+            # 1ms = 1,000,000 ns
+            avg_compute_cycles = int(avg_step_ms * 1000000 * actual_freq_ghz)
             print(f"[fix-compute-cycles] 從 HDT ProfilerStep 計算平均 compute_cycles: {avg_compute_cycles}")
         else:
-            # 默認值：1ms = 2.4e6 cycles（@2.4GHz）
-            avg_compute_cycles = 2400000
-            print(f"[fix-compute-cycles] 使用默認 compute_cycles: {avg_compute_cycles}")
+            if not 'avg_compute_cycles' in locals():
+                # 默認值：1ms
+                avg_compute_cycles = int(1000000 * actual_freq_ghz)
+                print(f"[fix-compute-cycles] 使用默認 compute_cycles: {avg_compute_cycles}")
 
     # 添加屬性到 COMPUTE 節點
     meta, nodes = _decode_et(et_file)
@@ -416,7 +448,7 @@ def add_compute_cycles_to_compute_nodes(et_file: Path, hdt_file: Path, device_fi
                 # 添加 compute_cycles 屬性
                 attr = node.attr.add()
                 attr.name = "compute_cycles"
-                attr.int64_val = avg_compute_cycles
+                attr.int64_val = int(avg_compute_cycles) # 確保是整數
                 fixed_count += 1
 
     # 保存修復後的 ET 文件
@@ -425,7 +457,8 @@ def add_compute_cycles_to_compute_nodes(et_file: Path, hdt_file: Path, device_fi
     return fixed_count
 
 
-def convert_hdt_to_et(hdt: Path, out_et: Path, device_file: Path = None) -> None:
+# [MODIFIED] 傳入 default_freq_mhz
+def convert_hdt_to_et(hdt: Path, out_et: Path, device_file: Path = None, pt_dir: Path = None, rank: int = 0, default_freq_mhz: float = 2400.0) -> None:
     """
     將 HDT (Chakra 中間格式) 轉換為 ET (執行追蹤) 格式
 
@@ -475,7 +508,8 @@ def convert_hdt_to_et(hdt: Path, out_et: Path, device_file: Path = None) -> None
     # === 第三步：AMD GPU 修補增強 ===
     # 確保 COMPUTE 節點具有 compute_cycles 屬性
     try:
-        fixed_count = add_compute_cycles_to_compute_nodes(out_et, hdt, device_file)
+        # [MODIFIED] 傳遞參數
+        fixed_count = add_compute_cycles_to_compute_nodes(out_et, hdt, device_file, pt_dir=pt_dir, rank=rank, default_freq_mhz=default_freq_mhz)
         if fixed_count > 0:
             print(f"[fix] 添加了 {fixed_count} 個 compute_cycles 屬性到 COMPUTE 節點")
     except Exception as e:
@@ -1055,11 +1089,31 @@ def main():
     ap.add_argument("--no-clean", action="store_true", help="不要清空舊的 hdt_*.json 與 *.et")
     ap.add_argument("--no-force", action="store_true", help="不要覆寫已存在的 .et")
     ap.add_argument("--simple-astra", action="store_true", help="生成 ASTRA-sim 兼容的簡化版本（僅通訊節點）")
+    # [MODIFIED] 新增參數，預設 2400 MHz (2.4 GHz)
+    ap.add_argument("--default-gpu-freq", type=float, default=2400.0, help="當 metrics 不存在時的預設 GPU 頻率 (MHz)")
     args = ap.parse_args()
 
     base   = Path(args.base_dir).resolve()
     pt_dir = (base / args.pt_dir).resolve()
     et_dir = (base / args.et_dir).resolve()
+
+    # --- [新增] Log 設定 ---
+    log_dir = base / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    # 使用時間戳記建立 log 檔名，例如: convert_20251125_143000.log
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f"convert_{timestamp}.log"
+
+    # 重導向 stdout 和 stderr
+    # 這樣所有的 print() 和錯誤訊息都會同時出現在螢幕和檔案中
+    sys.stdout = Logger(log_file)
+    sys.stderr = sys.stdout
+
+    print(f"========================================================")
+    print(f"[Log] Log 記錄已啟動: {log_file}")
+    print(f"========================================================\n")
+    # -----------------------
 
     print(f"[paths]\n  base={base}\n  pt_dir={pt_dir}\n  et_dir={et_dir}\n")
 
@@ -1118,7 +1172,7 @@ def main():
                 print(f"[warn] rank {r}: 未找到通訊節點，跳過")
         else:
             # 標準模式：完整轉換 + DAG 修正
-            convert_hdt_to_et(hdt, et, dev)
+            convert_hdt_to_et(hdt, et, dev, pt_dir=pt_dir, rank=r, default_freq_mhz=args.default_gpu_freq)
 
             # 轉檔後：就地修 DAG（清理不一致依賴/循環，並過濾 ASTRA-sim 不支援的節點）
             try:
@@ -1130,6 +1184,7 @@ def main():
                 print(f"[post-fix] DAG 修正失敗（{et.name}）：{e}")
 
     print("\n[done] 轉換完成。請到以下資料夾查看輸出：", et_dir)
+    print(f"[Log] 完整記錄已儲存至: {log_file}")
 
 
 if __name__ == "__main__":

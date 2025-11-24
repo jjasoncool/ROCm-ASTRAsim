@@ -5,39 +5,56 @@ CIFAR-10 Training Framework for ROCm (AMD GPU) with Distributed Profiling
 (Chakra-compatible; aligned with standard practice)
 
 TRACE 檔案大小優化建議：
-======================
-問題：目前設定會產生過大的 trace 檔案
+問題: 目前設定會產生過大的 trace 檔案，超出1-4步會使 run_ns3.py 處理時過載卡死
 - Device trace: ~547MB/GPU (220萬+ 事件)
 - Host trace: ~538MB/process (57萬+ 節點)
 - 總計: ~2.2GB/次訓練
 
+trace-steps 參數的簡單說明：
+- trace-steps 決定程式在分析期間會記錄幾個訓練步驟。每個步驟就是一次完整的前向傳播與反向傳播過程。
+- 例如：設定 --trace-steps 1 時，程式只記錄 1 次訓練步驟的詳細資訊，用來快速檢查通訊是否正常運作。
+- 設定的步數越多，可以收集到更多統計資料（像平均時間、資源使用量），但是產生的檔案會很大，處理這些資料需要更多計算資源，可能會讓後續的 run_ns3.py 程式因負荷太重而當機。
+- 建議値從 1 到 4：這個範圍能提供足夠的資訊去分析系統效能，又不會因為檔案太大而造成系統不穩定。
+
 優化策略：
-1. 【最有效】減少追蹤步數：--trace-steps 8-16 (目前128，可減少85-90%資料量)
+1. 【最有效】減少追蹤步數：--trace-steps 1-4 (目前128，可減少85-90%資料量)
 2. 關閉詳細追蹤：移除 --trace-shapes --trace-mem --trace-stack
 3. 減少 DataLoader workers：--workers 0 (減少多程序追蹤噪音)
 4. 分層追蹤模式：
-   - 快速模式: --trace-steps 4   (通訊模式檢查)
-   - 標準模式: --trace-steps 8   (一般分析)
-   - 深度模式: --trace-steps 16  (詳細除錯)
+   - 快速模式: --trace-steps 1   (通訊模式檢查)
+   - 標準模式: --trace-steps 2   (一般分析)
+   - 深度模式: --trace-steps 4   (詳細除錯)
 
 Usage Examples:
   # 快速模式 (推薦日常使用)
   torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
     --epochs 3 --batch-size 128 --workers 0 \
-    --profile-epoch 2 --trace-wait 32 --trace-steps 4
+    --profile-epoch 2 --trace-wait 32 --trace-steps 1
 
   # 標準模式 (詳細分析)
   torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
     --epochs 3 --batch-size 128 --workers 0 \
-    --profile-epoch 2 --trace-wait 32 --trace-steps 8
+    --profile-epoch 2 --trace-wait 32 --trace-steps 2
 
   # 深度模式 (除錯用)
   torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
     --epochs 3 --batch-size 128 --workers 0 \
-    --profile-epoch 2 --trace-wait 32 --trace-steps 16 \
+    --profile-epoch 2 --trace-wait 32 --trace-steps 4 \
     --trace-shapes --inject-sync-hack
 
 注意：workers=0 使用主程序載入資料，避免多程序追蹤複雜化
+
+參數使用指南：
+1. --inject-sync-hack (建議開啟):
+   針對 AMD ROCm 環境的穩定性補丁。透過注入人工同步事件，解決 Trace Linker 無法對齊 CPU/GPU 時間軸的問題。
+   若關閉此參數，chakra_trace_link 可能會頻繁失敗。
+
+2. --trace-shapes (建議關閉):
+   僅在除錯時使用。開啟後可透過 Tensor 形狀精確計算通訊量，但會導致 Trace 檔案暴增（可能導致 run_ns3.py 記憶體不足）。
+   僅在發現轉檔後的通訊量數據不正確（例如 fallback 到 1MB）時才暫時開啟。
+
+- GPUMonitor 現在會記錄訓練期間的真實頻率，並存成 gpu_metrics/gpu_metrics_{rank}.json
+- 供後續 conver_to_chakra_et.py 讀取以精確計算 cycles
 """
 
 import os
@@ -125,11 +142,13 @@ def _check_device_sync_and_steps(device_json: Path) -> None:
     except Exception as e:
         print(f"[check] skip device check: {e}")
 
-# ---------- GPU 監測（可關閉） ----------
+# ---------- GPU 監測（修正版：支援輸出 JSON） ----------
 class GPUMonitor:
-    def __init__(self, device_id=0, sample_interval=0.1):
+    def __init__(self, device_id=0, sample_interval=0.1, output_dir=None, rank=0):
         self.device_id = device_id
         self.sample_interval = sample_interval
+        self.output_dir = output_dir
+        self.rank = rank
         self.monitoring = False
         self.samples = []
         self._th = None
@@ -144,10 +163,10 @@ class GPUMonitor:
         while self.monitoring:
             try:
                 fi = self._compat.get_gpu_frequency(self.device_id)
-                if fi and fi.sclk_mhz is not None:
-                    self.samples.append({"timestamp": fi.timestamp, "sclk_mhz": fi.sclk_mhz})
+                if fi and fi.sclk_mhz is not None and fi.sclk_mhz > 0:
+                    self.samples.append(fi.sclk_mhz)
             except Exception as e:
-                print(f"[GPUMonitor] Query failed: {e}")
+                pass # 避免監控干擾主程序
             time.sleep(self.sample_interval)
 
     def start(self):
@@ -156,13 +175,41 @@ class GPUMonitor:
         self.samples.clear()
         self._th = threading.Thread(target=self._poll, daemon=True)
         self._th.start()
-        print(f"[GPUMonitor] Started on GPU {self.device_id}")
+        # print(f"[GPUMonitor] Started on GPU {self.device_id}")
 
     def stop(self):
         if not self.monitoring: return
         self.monitoring = False
         if self._th: self._th.join(timeout=2.0)
-        print(f"[GPUMonitor] Stopped on GPU {self.device_id} (samples={len(self.samples)})")
+
+        # [FIX] 計算統計數據並存檔
+        if self.samples:
+            avg_freq = statistics.mean(self.samples)
+            median_freq = statistics.median(self.samples)
+            max_freq = max(self.samples)
+
+            metrics = {
+                "rank": self.rank,
+                "device_id": self.device_id,
+                "sclk_avg_mhz": avg_freq,
+                "sclk_median_mhz": median_freq,
+                "sclk_max_mhz": max_freq,
+                "samples_count": len(self.samples)
+            }
+
+            print(f"[GPUMonitor] Rank {self.rank} GPU Stats: Median={median_freq:.1f} MHz, Max={max_freq:.1f} MHz")
+
+            if self.output_dir:
+                # 確保 output_dir 是 Path 物件
+                out_path = Path(self.output_dir) / f"gpu_metrics_{self.rank}.json"
+                try:
+                    with out_path.open("w", encoding="utf-8") as f:
+                        json.dump(metrics, f, indent=2)
+                    print(f"[GPUMonitor] Metrics saved to {out_path}")
+                except Exception as e:
+                    print(f"[GPUMonitor] Failed to save metrics: {e}")
+        else:
+            print(f"[GPUMonitor] No valid samples collected for Rank {self.rank}")
 
 # ---------- 模型 ----------
 class CIFAR10_CNN(nn.Module):
@@ -234,14 +281,14 @@ def main():
     # 視窗定位與大小 (優化預設值以減少檔案大小)
     ap.add_argument("--profile-epoch", type=int, default=2, help="要擷取的 epoch（1-based）")
     ap.add_argument("--trace-wait", type=int, default=32, help="先略過前 N 步再開始 profile（避開 warm-up）")
-    ap.add_argument("--trace-steps", type=int, default=4, help="視窗內擷取的步數 (建議: 4-16，避免檔案過大)")
+    ap.add_argument("--trace-steps", type=int, default=4, help="視窗內擷取的步數 (建議: 1-4，避免 run_ns3.py 過載)")
     ap.add_argument("--trace-shapes", action="store_true", help="追蹤 tensor 形狀 (增加檔案大小)")
     ap.add_argument("--trace-stack", action="store_true", help="追蹤呼叫堆疊 (增加檔案大小)")
     ap.add_argument("--trace-mem", action="store_true", help="追蹤記憶體使用 (增加檔案大小)")
 
     # 監測與清理
     ap.add_argument("--disable-gpu-monitoring", action="store_true")
-    ap.add_argument("--gpu-sample-interval", type=float, default=0.1)
+    ap.add_argument("--gpu-sample-interval", type=float, default=0.01)
     ap.add_argument("--no-cleanup", action="store_true")
 
     # 工程保險：人工注入 Record/Wait
@@ -297,11 +344,11 @@ def main():
     scaler  = torch.amp.GradScaler('cuda')
     loss_fn = nn.CrossEntropyLoss()
 
-    # 監測
+    # [FIX] 監測初始化 - 傳入 metrics_dir 和 rank
     gpu_mon = None
     if not args.disable_gpu_monitoring:
         dev_id = int(os.environ.get('LOCAL_RANK', 0)) if ddp else 0
-        gpu_mon = GPUMonitor(dev_id, args.gpu_sample_interval)
+        gpu_mon = GPUMonitor(dev_id, args.gpu_sample_interval, output_dir=metrics_dir, rank=rank)
 
     # 名稱
     host_path   = traces_dir / f"host_{rank}.json"

@@ -375,27 +375,27 @@ def add_compute_cycles_to_compute_nodes(et_file: Path, hdt_file: Path, device_fi
                         gpu_kernel_durations.append(dur_ns)
 
             if gpu_kernel_durations:
-                # [優化過濾]
-                # 1. 過濾掉極短的 System Kernel (例如 < 2us = 2000ns)
-                #    許多 Memcpy DtoD 在您的 trace 中是 1.0us (1000ns)，這些應視為雜訊
+                # [保持] 過濾掉極短的 System Kernel
                 valid_durations = [d for d in gpu_kernel_durations if d >= 2000]
 
                 if not valid_durations:
-                    # 如果全部都很短，放寬標準（至少不是 0）
                     valid_durations = gpu_kernel_durations
 
-                # 排序
+                # [修改] 改用 平均值 (Mean) 取代 中位數 (Median)
+                # 平均值 = 總時間 / 總數量，能更好地守恆「總工作量」
+                avg_kernel_ns_val = sum(valid_durations) / len(valid_durations)
+
+                # 為了對比，我們可以印出兩者看看差距
                 valid_durations.sort()
+                median_ns = valid_durations[len(valid_durations) // 2]
 
-                # 取中位數 (Median) 作為代表
-                median_kernel_ns = valid_durations[len(valid_durations) // 2]
+                print(f"[fix-compute-cycles] 統計: 總事件={len(gpu_kernel_durations)}, 有效={len(valid_durations)}")
+                print(f"[fix-compute-cycles] 比較: 中位數={median_ns:.0f} ns vs 平均值={avg_kernel_ns_val:.0f} ns")
+                print(f"[fix-compute-cycles] ⚠️ 採用平均值以反映總計算負載")
 
-                print(f"[fix-compute-cycles] 掃描 {len(gpu_kernel_durations)} 個事件")
-                print(f"[fix-compute-cycles] 有效運算 Kernel: {len(valid_durations)} 個 (過濾標準: >= 2000ns)")
-
-                # 計算 Cycles
-                estimated_cycles = int(median_kernel_ns * actual_freq_ghz)
-                print(f"[fix-compute-cycles] Kernel 代表時長: {median_kernel_ns:.0f} ns @ {actual_freq_ghz:.3f} GHz -> 估計 cycles: {estimated_cycles}")
+                # 使用平均值計算 Cycles
+                estimated_cycles = int(avg_kernel_ns_val * actual_freq_ghz)
+                print(f"[fix-compute-cycles] Kernel 代表時長: {avg_kernel_ns_val:.0f} ns @ {actual_freq_ghz:.3f} GHz -> 估計 cycles: {estimated_cycles}")
                 avg_compute_cycles = estimated_cycles
             else:
                 # 保底機制

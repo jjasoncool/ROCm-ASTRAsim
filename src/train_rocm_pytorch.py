@@ -25,22 +25,38 @@ trace-steps 參數的簡單說明：
    - 標準模式: --trace-steps 2   (一般分析)
    - 深度模式: --trace-steps 4   (詳細除錯)
 
-Usage Examples:
-  # 快速模式 (推薦日常使用)
-  torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
-    --epochs 3 --batch-size 128 --workers 0 \
-    --profile-epoch 2 --trace-wait 32 --trace-steps 1
+Usage Examples for Thesis Experiments:
 
-  # 標準模式 (詳細分析)
-  torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
-    --epochs 3 --batch-size 128 --workers 0 \
-    --profile-epoch 2 --trace-wait 32 --trace-steps 2
+1. 【論文實驗 A：System-Bound / Latency-Sensitive】(CIFAR-10 Simple CNN)
+   - 目的：製造「高 System Overhead」場景，用於驗證 "System-Aware Calibration" 的必要性。
+   - 特性：計算極快 (Tiny Kernels)，CPU 啟動延遲與資料搬運佔比極高。
+   - 設定：workers=0 (單執行緒載入，放大 System Gap)，trace-steps=4 (收集足夠樣本以進行平均值校準)。
 
-  # 深度模式 (除錯用)
-  torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
-    --epochs 3 --batch-size 128 --workers 0 \
-    --profile-epoch 2 --trace-wait 32 --trace-steps 4 \
-    --trace-shapes --inject-sync-hack
+   torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
+     --model cifar10 \
+     --epochs 3 --batch-size 128 --workers 0 \
+     --trace-wait 32 --trace-steps 4 \
+     --inject-sync-hack
+
+2. 【論文實驗 B：Compute-Bound / Bandwidth-Bound】(ResNet-50)
+   - 目的：製造「高運算負載」場景，作為大規模拓撲模擬 (Mesh vs Ring) 的基準對照組。
+   - 特性：Kernel 執行時間長，能有效掩蓋 System Overhead。
+   - 設定：workers=4 (多執行緒載入，確保 GPU 不等待 CPU)，batch-size=128 (滿載)，trace-steps=2 (避免檔案過大)。
+
+   torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
+     --model resnet50 \
+     --epochs 3 --batch-size 128 --workers 0 \
+     --trace-wait 32 --trace-steps 2 \
+     --inject-sync-hack
+
+3. 【快速除錯模式】(Quick Check)
+   - 目的：快速確認 Trace Linker 與 AMD Patch 是否正常運作，不產生龐大檔案。
+
+   torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
+     --model cifar10 \
+     --epochs 1 --batch-size 32 --workers 0 \
+     --trace-wait 10 --trace-steps 1 \
+     --inject-sync-hack
 
 注意：workers=0 使用主程序載入資料，避免多程序追蹤複雜化
 
@@ -144,11 +160,12 @@ def _check_device_sync_and_steps(device_json: Path) -> None:
 
 # ---------- GPU 監測（修正版：支援輸出 JSON） ----------
 class GPUMonitor:
-    def __init__(self, device_id=0, sample_interval=0.1, output_dir=None, rank=0):
+    def __init__(self, device_id=0, sample_interval=0.1, output_dir=None, rank=0, model_name="unknown"):
         self.device_id = device_id
         self.sample_interval = sample_interval
         self.output_dir = output_dir
         self.rank = rank
+        self.model_name = model_name
         self.monitoring = False
         self.samples = []
         self._th = None
@@ -201,7 +218,7 @@ class GPUMonitor:
 
             if self.output_dir:
                 # 確保 output_dir 是 Path 物件
-                out_path = Path(self.output_dir) / f"gpu_metrics_{self.rank}.json"
+                out_path = Path(self.output_dir) / f"gpu_metrics_{self.rank}_{self.model_name}.json"
                 try:
                     with out_path.open("w", encoding="utf-8") as f:
                         json.dump(metrics, f, indent=2)
@@ -229,6 +246,23 @@ class CIFAR10_CNN(nn.Module):
         )
     def forward(self, x):
         return self.classifier(self.features(x))
+
+class ResNet50ForCIFAR(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+        # 使用 torchvision 的 ResNet50，針對 CIFAR-10 調整輸入層
+        from torchvision.models import resnet50, ResNet50_Weights
+        self.resnet = resnet50(weights=None)  # 不使用預訓練權重
+        # 調整第一個卷積層：kernel_size=3, stride=1, padding=1 以適應 32x32 輸入
+        self.resnet.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        # 移除 maxpool 以保留空間維度
+        self.resnet.maxpool = nn.Identity()
+        # 調整最後的全連接層為 10 類別
+        num_ftrs = self.resnet.fc.in_features
+        self.resnet.fc = nn.Linear(num_ftrs, num_classes)
+
+    def forward(self, x):
+        return self.resnet(x)
 
 # ---------- DDP ----------
 def setup_ddp():
@@ -276,6 +310,7 @@ def main():
     ap.add_argument("--batch-size", type=int, default=128)
     ap.add_argument("--workers", type=int, default=0, help="DataLoader workers (0=主程序載入，減少追蹤噪音)")
     ap.add_argument("--omp-threads", type=int, default=2)
+    ap.add_argument("--model", choices=["cifar10", "resnet50"], default="cifar10", help="選擇模型：cifar10 或 resnet50")
     ap.add_argument("--debug-epoch-print", action="store_true")
 
     # 視窗定位與大小 (優化預設值以減少檔案大小)
@@ -312,14 +347,6 @@ def main():
     rank, world, ddp = setup_ddp()
     device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK',0))}" if ddp else "cuda")
 
-    # 清舊檔
-    if is_main(rank) and not args.no_cleanup:
-        rm = 0
-        for p in traces_dir.glob("host_*.json"): p.unlink(missing_ok=True); rm += 1
-        for p in traces_dir.glob("device_*.json"): p.unlink(missing_ok=True); rm += 1
-        for p in traces_dir.glob("*.tmp"): p.unlink(missing_ok=True); rm += 1
-        print(f"[Cleanup] removed {rm} traces under {traces_dir}")
-
     if ddp:
         dist.barrier()
 
@@ -336,10 +363,12 @@ def main():
                          sampler=sampler, num_workers=args.workers, pin_memory=True, drop_last=True)
 
     # 模型/優化器
-    model = CIFAR10_CNN().to(device)
+    if args.model == "cifar10":
+        model = CIFAR10_CNN().to(device)
+    elif args.model == "resnet50":
+        model = ResNet50ForCIFAR().to(device)
     if ddp:
         model = DDP(model, device_ids=[device.index], output_device=device.index, broadcast_buffers=False)
-        model.register_comm_hook(None, make_tagging_allreduce_hook())
     optimiz = optim.AdamW(model.parameters(), lr=1e-3)
     scaler  = torch.amp.GradScaler('cuda')
     loss_fn = nn.CrossEntropyLoss()
@@ -348,11 +377,21 @@ def main():
     gpu_mon = None
     if not args.disable_gpu_monitoring:
         dev_id = int(os.environ.get('LOCAL_RANK', 0)) if ddp else 0
-        gpu_mon = GPUMonitor(dev_id, args.gpu_sample_interval, output_dir=metrics_dir, rank=rank)
+        gpu_mon = GPUMonitor(dev_id, args.gpu_sample_interval, output_dir=metrics_dir, rank=rank, model_name=args.model)
 
-    # 名稱
-    host_path   = traces_dir / f"host_{rank}.json"
-    device_path = traces_dir / f"device_{rank}.json"
+    # [修改] Trace 檔名 - 加入 args.model
+    # 例如: host_0_cifar10.json, device_0_resnet50.json
+    host_path   = traces_dir / f"host_{rank}_{args.model}.json"
+    device_path = traces_dir / f"device_{rank}_{args.model}.json"
+
+    # [修改] 清舊檔邏輯 (選擇性：只清當前模型的舊檔，或全部清)
+    if is_main(rank) and not args.no_cleanup:
+        # 這裡改為只刪除「當前模型」的舊檔，避免誤刪另一個模型的資料
+        rm = 0
+        for p in traces_dir.glob(f"host_*_{args.model}.json"): p.unlink(missing_ok=True); rm += 1
+        for p in traces_dir.glob(f"device_*_{args.model}.json"): p.unlink(missing_ok=True); rm += 1
+        for p in traces_dir.glob(f"*.tmp"): p.unlink(missing_ok=True); rm += 1
+        print(f"[Cleanup] removed {rm} traces for model '{args.model}'")
 
     # 視窗與同步事件
     target_epoch = max(1, int(args.profile_epoch))

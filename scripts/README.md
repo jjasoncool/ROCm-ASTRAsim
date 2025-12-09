@@ -1,194 +1,150 @@
-# `scripts/` 使用說明（ASTRA-sim ns-3 執行工具）
+# `scripts/` 使用說明（ASTRA-sim ns-3 執行與校準工具）
 
-本資料夾保存與 **ASTRA-sim × ns-3** 模擬執行流程相關的腳本（核心：`run_ns3.py`）。\
-目標：以同一批 **Chakra 工作負載（.et 或 JSON）**，快速在不同 **邏輯拓樸** × **物理拓樸** × **系統層策略** × **網路層參數** 下重現並比較結果，且可用 `--virtual-world` 在執行時臨時擴張節點數。
+本資料夾包含 ASTRA-sim × ns-3 網路模擬的執行與校準腳本，核心為 `run_ns3.py`。
 
-> 名詞對齊
-> • **邏輯拓樸 (logical)**：ASTRA-sim 的 `logical-dims`（K 維座標），決定 **collective 如何分相/繞行**。
-> • **物理拓樸 (physical)**：ns-3 的 `TOPOLOGY_FILE`（交換器/連結拓樸），決定 **封包如何排隊/擁塞**。
-> • **world size**：工作負載 rank/節點數（由 `.et` 檔數或 `et_rank_*.json` 檔數決定）。
+## 完整工作流程
 
----
+完整的模擬流程分為三的獨立階段，對應 `src` 和 `scripts` 中的腳本：
 
-## 目錄與基準檔案
+1.  **Trace 生成 (`src/train_rocm_pytorch.py`)**:
+    *   在 ROCm 環境下，使用 PyTorch DDP 進行模型訓練（支援 CIFAR-10 CNN 和 ResNet-50）。
+    *   透過 `torch.profiler` 產生詳細的 host 和 device Kineto JSON trace 檔案。
+    *   使用 `--model-tag` 區分不同模型的輸出。
 
-- **工作負載（輸入）**
-  - `data/chakra/workload_et/`：官方 **protobuf .et**（`*.et` 索引需連續 0..N-1）。
-  - `data/chakra/workload_trace/`：Chakra **JSON**（`manifest.json + et_rank_*.json`）注意：`--virtual-world` 目前僅支援 `.et`。。
+2.  **Trace 轉換 (`src/conver_to_chakra_et.py`)**:
+    *   將 Kineto JSON trace 轉換為 ASTRA-sim 可用的 Chakra ET (`.et`) 格式。
+    *   **關鍵功能**:
+        *   **AMD GPU 兼容性修補**: 自動修復 AMD NCCL kernel 命名問題。
+        *   **系統感知校準**: 對於 System-Bound 的模型（如 CIFAR-10），可使用 `--force-avg-kernel-ns` 將系統開銷攤提到計算節點，使模擬更接近真實時間。
 
-- **ASTRA-sim 基線設定（輸入；執行時會產生 patched 副本）**
-  - `configs/astra-sim/system/system.json`
-  - `configs/astra-sim/ns3/config.txt`
-  - `configs/astra-sim/topos/`（`*.json`＝邏輯拓樸；`*.txt`＝物理拓樸）
-  - `configs/astra-sim/remote_memory.json`
-
-- **本次執行輸出（自動建立）**
-  - `runs/<timestamp>_ns3_run/`
-    - `stdout.log`：ns-3 執行輸出
-    - `command.txt`：本次完整命令列（可重現）
-    - `tmp/`：`system.patched.json`、`config.patched.txt`、`logical_topology.json`、（若使用 `--virtual-world`）`workload_<N>/*.et`
-    - `out/`：`flow.txt`、`trace.txt`、`mix.tr`、`fct.txt`、`pfc.txt`、`qlen.txt`
-
-> **不會修改 baseline**；所有覆寫都寫在 `runs/<timestamp>_ns3_run/tmp/`。
+3.  **網路模擬與校準 (`scripts/run_ns3.py`)**:
+    *   使用轉換後的 `.et` 工作負載執行 ASTRA-sim ns-3 模擬。
+    *   **關鍵功能**:
+        *   **自動化配置**: 自動生成邏輯拓撲、修補系統和網路配置文件。
+        *   **虛擬擴展**: 將小規模（如 2-GPU）的 trace 虛擬擴展到大規模（如 128-GPU）的模擬。
+        *   **自動校準**: 透過比對原始 trace 的真實執行時間與模擬輸出的 cycles，自動計算 `alpha_us` 校準因子，並將結果存入 `runs/calibration_all.csv`。
 
 ---
 
-## 快速開始
+## `run_ns3.py` 快速開始
 
-**情境**：雙卡（world=2），1D 邏輯拓樸，指定 2 節點物理拓樸；網路層沿用 baseline。
-以兩份實測 .et 臨時擴張到 8 節點，2D 邏輯（2×4），並指定 8-node 物理拓樸：
+### 情境 A：System-Bound 模型校準 (CIFAR-10)
 
-    python scripts/run_ns3.py \
-      --workload data/chakra/workload_et \
-      --virtual-world 8 \
-      --topo auto:2d \
-      --phys-topo configs/astra-sim/topos/8_nodes_1_switch_topology.txt \
-      --coll-opt localBWAware
+此情境模擬一個計算量小、系統開銷佔主導的場景，需要啟用**系統感知校準**來獲得有意義的模擬結果。
 
-完成後，結果位於：
+1.  **生成 Trace (CIFAR-10)**
+    *   使用 `workers=0` 放大系統開銷，`--model-tag cifar10` 標記輸出。
+    ```bash
+    torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
+      --model cifar10 --workers 0 \
+      --trace-wait 32 --trace-steps 4 \
+      --model-tag cifar10
+    ```
 
-    runs/<timestamp>_ns3_run/
-      ├─ stdout.log
-      ├─ command.txt
-      ├─ tmp/{system.patched.json,config.patched.txt,logical_topology.json}
-      └─ out/{fct.txt,qlen.txt,pfc.txt,trace.txt,flow.txt,mix.tr}
+2.  **轉換 Trace (啟用系統感知校準)**
+    *   使用 `--force-avg-kernel-ns` 將真實世界的 GPU 時間（包含開銷）攤提回計算節點。
+    *   `609000` ns (609 µs) 是一個基於 CIFAR-10 在 MI250x 上的經驗值。
+    ```bash
+    python src/conver_to_chakra_et.py \
+      --model-tag cifar10 \
+      --force-avg-kernel-ns 609000
+    ```
 
-（若只想做通路驗證而不擴張，可先用 world=2 與 2-node 物理拓樸跑 smoke test，但研究建議用上面 8 節點起跳。）
-
----
-
-## 參數一覽（`run_ns3.py`）
-
-以下表格列出所有參數，分組說明其作用、類型、預設值與範例。這些參數允許自訂模擬，特別適合 AMD ROCm 環境下測試 GPU 訓練網路架構（如擁塞控制）。
-
-### 必要/常用參數
-
-| 參數                | 描述                                                                                            | 類型/預設值                          | 範例值/說明                                                            |
-| ------------------- | ----------------------------------------------------------------------------------------------- | ------------------------------------ | ---------------------------------------------------------------------- |
-| `--workload`        | 工作負載資料夾（`.et` 或 `manifest.json + et_rank_*.json`）。決定 world size。                  | 字串 (必要)                          | `data/chakra/workload_et` – 決定模擬的 GPU 節點數。                    |
-| `--virtual-world N` | 以實測 `.et` 為模板，臨時擴張到 N 份 `.et`（調整 comm_size；保留 compute 形狀）。僅支援 `.et`。 | 整數 (選用, None)                    | `8` – 從雙卡 ET 虛擬擴張到 8-node，模擬資料中心。                      |
-| `--topo`            | 邏輯拓樸（ASTRA-sim）。                                                                         | 字串 (預設 "auto:1d")                | `auto:2d` / `dims:2x4` / `file:/path/to.json` – 決定 collective 路由。 |
-| `--phys-topo`       | 物理拓樸（ns-3）：`*.txt` 檔。若未指定，依 world 自動推測。                                     | 字串 (選用, None)                    | `configs/astra-sim/topos/8_nodes_*.txt` – 決定封包擁塞。               |
-| `--system`          | baseline system.json（產生 patched 副本）。                                                     | 字串 (預設 ".../system.json")        | 自訂路徑 – 用於系統層覆蓋。                                            |
-| `--network`         | baseline ns-3 config.txt（產生 patched 副本）。                                                 | 字串 (預設 ".../config.txt")         | 自訂路徑 – 用於網路層覆蓋。                                            |
-| `--remote`          | baseline remote_memory.json。                                                                   | 字串 (預設 ".../remote_memory.json") | 自訂路徑 – 遠端記憶體設定。                                            |
-| `--ns3-bin`         | ns-3 後端執行檔（可用環境變數）。                                                               | 字串 (預設 ASTRA_NS3_BIN)            | `/workspace/astra-sim/.../ns3.42-AstraSimNetwork-default` – 模擬後端。 |
-
-### 系統層覆蓋（collective/排程；影響演算法流程）
-
-| 參數         | 描述                                            | 類型/預設值       | 範例值/說明                                                      |
-| ------------ | ----------------------------------------------- | ----------------- | ---------------------------------------------------------------- |
-| `--coll-opt` | 覆蓋 `collective-optimization`（集體優化）。    | 字串 (選用, None) | `localBWAware` / `none` – 調整 All-Reduce 拆分，匹配 ROCm 頻寬。 |
-| `--lmbw`     | 覆蓋 `local-mem-bw`（校準 compute/comm 比例）。 | 整數 (選用, None) | `1600` – 匹配 RX 9070 XT 的本地記憶體頻寬。                      |
-
-### 網路層覆蓋（ns-3 佇列/流控；影響排隊/長尾）
-
-| 參數        | 描述                                                | 類型/預設值       | 範例值/說明                                            |
-| ----------- | --------------------------------------------------- | ----------------- | ------------------------------------------------------ |
-| `--qcn`     | 覆蓋 `ENABLE_QCN`（量化擁塞通知）。                 | 整數 (選用, None) | `1` – 啟用 QCN 減速傳輸，避免 GPU 通訊擁塞。           |
-| `--pfc-dyn` | 覆蓋 `USE_DYNAMIC_PFC_THRESHOLD`（動態 PFC 門檻）。 | 整數 (選用, None) | `1` – 動態調整 PFC 防止 buffer 溢位，適合高突發訓練。  |
-| `--buffer`  | 覆蓋 `BUFFER_SIZE`（交換器緩衝區大小）。            | 整數 (選用, None) | `32` / `64` – 影響排隊深度，測試擁塞耐受性。           |
-| `--payload` | 覆蓋 `PACKET_PAYLOAD_SIZE`（封包有效載荷大小）。    | 整數 (選用, None) | `1500` / `9000` – 模擬 MTU/Jumbo Frame，優化傳輸效率。 |
-
-### 其他參數
-
-| 參數           | 描述                                                             | 類型/預設值        | 範例值/說明                        |
-| -------------- | ---------------------------------------------------------------- | ------------------ | ---------------------------------- |
-| `--comm-group` | 傳給 ASTRA-sim 的 `--comm-group-configuration`（通訊群組設定）。 | 字串 (選用, None)  | `empty` – 常用於無特定群組的模擬。 |
-| `--log-dir`    | 本次輸出根目錄。                                                 | 字串 (預設 "runs") | `my_runs` – 自訂輸出資料夾。       |
-| `--dry-run`    | 只產生 patched 檔與指令，不執行。                                | 布林 (選用, False) | – 檢查設定而不跑模擬。             |
-
----
-
-## 路徑補丁原理：`patch_network_cfg`
-
-baseline 的 `configs/astra-sim/ns3/config.txt` 常含**相對路徑**（搬家後易失效），例如：
-
-    TOPOLOGY_FILE ../../scratch/topology/8_nodes_1_switch_topology.txt
-    FCT_OUTPUT_FILE ../../scratch/output/fct.txt
-
-執行時腳本會在 `runs/<timestamp>_ns3_run/tmp/` 產生 `config.patched.txt` 並**改為絕對路徑**：
-- `TOPOLOGY_FILE` → 你指定的 `--phys-topo`（或依 world 推測到的檔案）的 **絕對路徑**。
-- `FLOW_FILE / TRACE_FILE / TRACE_OUTPUT_FILE / FCT_OUTPUT_FILE / PFC_OUTPUT_FILE / QLEN_MON_FILE` → 一律改為 `runs/<timestamp>_ns3_run/out/` 下的 **絕對路徑**（檔名分別為 `flow.txt, trace.txt, mix.tr, fct.txt, pfc.txt, qlen.txt`）。
-- 若提供 `--qcn/--pfc-dyn/--buffer/--payload`，同步覆蓋對應鍵值。
-
-> 目的：**不依賴 CWD、不污染 baseline**，所有輸出固定集中於 `runs/<timestamp>/out/`。
-
----
-
-## 常見情境範例
-
-1. 校準 world=2
+3.  **執行模擬與自動校準**
+    *   `run_ns3.py` 會讀取 `pytorch_traces` 中的 `*_cifar10.json` 來獲取真實執行時間，並與模擬的 cycles 進行校準。
     ```bash
     python scripts/run_ns3.py \
-      --workload data/chakra/workload_et \
+      --workload data/chakra/workload_et --model-tag cifar10 \
       --topo auto:1d \
-      --phys-topo configs/astra-sim/topos/2_nodes_1_switch_topology.txt \
-      --coll-opt localBWAware --lmbw 1600
+      --phys-topo configs/astra-sim/topos/2_nodes_1_switch_topology.txt
     ```
-1. Baseline：2D 邏輯（2×4）、localBWAware、網路層沿用 baseline（以兩份實測 .et 擴張到 8 節點）
+    *   校準結果會自動追加到 `runs/calibration_all.csv`。
+
+### 情境 B：Compute-Bound 模型模擬 (ResNet-50)
+
+此情境模擬一個計算密集型場景，可直接使用 trace 中的數據進行模擬，並虛擬擴展到大規模拓撲。
+
+1.  **生成 Trace (ResNet-50)**
+    ```bash
+    torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
+      --model resnet50 --workers 4 \
+      --trace-wait 32 --trace-steps 2 \
+      --model-tag resnet50
+    ```
+
+2.  **轉換 Trace (標準模式)**
+    *   不使用 `--force-avg-kernel-ns`，讓轉換器根據 trace 中的真實 kernel 時間計算 cycles。
+    ```bash
+    python src/conver_to_chakra_et.py --model-tag resnet50
+    ```
+
+3.  **虛擬擴展並執行大規模模擬**
+    *   使用 2-GPU 的 trace (`--workload`)，虛擬擴展到 128-GPU (`--virtual-world 128`)。
+    *   此模式下通常不進行校準 (`--no-autocalib`)，因為輸入 trace 的 world size (2) 與模擬 (128) 不同。
     ```bash
     python scripts/run_ns3.py \
-      --workload data/chakra/workload_et \
-      --virtual-world 8 \
-      --topo auto:2d \
-      --phys-topo configs/astra-sim/topos/8_nodes_1_switch_topology.txt \
-      --coll-opt localBWAware
-    ```
-1. 校準對照：關閉 localBWAware，調整 `local-mem-bw`
-    ```bash
-    python scripts/run_ns3.py \
-      --workload data/chakra/workload_et \
-      --virtual-world 8 \
-      --topo auto:2d \
-      --phys-topo configs/astra-sim/topos/8_nodes_1_switch_topology.txt \
-      --coll-opt none --lmbw 2000
-    ```
-1. 流控掃描：QCN+動態 PFC、`BUFFER_SIZE=32`、`PACKET_PAYLOAD_SIZE=1000`
-    ```bash
-    python scripts/run_ns3.py \
-      --workload data/chakra/workload_et \
-      --virtual-world 8 \
-      --topo auto:2d \
-      --phys-topo configs/astra-sim/topos/8_nodes_1_switch_topology.txt \
-      --qcn 1 --pfc-dyn 1 --buffer 32 --payload 1000
-    ```
-1. 擴充到更多節點（未來）：自動 3D（接近立方），指定 128-node 物理拓樸
-    ```bash
-    python scripts/run_ns3.py \
-      --workload data/chakra/workload_et \
+      --workload data/chakra/workload_et --model-tag resnet50 \
       --virtual-world 128 \
       --topo auto:3d \
       --phys-topo configs/astra-sim/topos/128_nodes_32_switch_topology.txt \
-      --coll-opt localBWAware --buffer 32 --qcn 1
+      --no-autocalib
     ```
----
-
-## 結果檔案與圖表建議
-
-- `out/fct.txt`：Flow Completion Time（可做 CDF、p95/p99）。
-- `out/qlen.txt`：佇列長度時序（可做 CDF、峰值、平均）。
-- `out/pfc.txt`：PFC 暫停事件（次數、總時長）。
-- `stdout.log`：ASTRA-sim 執行摘要（也可萃取迭代時間）。
-
-建議圖表：**迭代時間 vs K 維**、**FCT CDF**、**Queue 95p**、**PFC 熱圖**。
 
 ---
 
-## 疑難排解（FAQ）
+## `run_ns3.py` 參數詳解
 
-- **world=2 卻看到 8 節點？**
-  邏輯或物理拓樸指到 8-node 檔。程式會檢查邏輯乘積＝world；物理請改對應 `*_nodes_*.txt`，或使用 `--virtual-world` 與一致的物理拓樸。
+### 核心參數
 
-- **baseline 相對路徑失效**
-  檢查 `tmp/config.patched.txt` 是否已改為絕對路徑；輸出一律在 `out/`。
+| 參數 | 描述 | 類型/預設值 | 範例 |
+|---|---|---|---|
+| `--workload` | 工作負載資料夾 (`.et` 檔案)。 | 字串 (必要) | `data/chakra/workload_et` |
+| `--model-tag` | 模型標籤，用於過濾 workload 和 trace 檔案。 | 字串 (選用) | `cifar10`, `resnet50` |
+| `--virtual-world N` | 將 workload 虛擬擴展到 N 個節點。 | 整數 (選用) | `128` |
+| `--topo` | 邏輯拓撲 (ASTRA-sim)。 | 字串 ("auto:1d") | `auto:2d`, `dims:4x4`, `file:topo.json` |
+| `--phys-topo` | 物理拓撲 (ns-3)，未指定時依 world size 自動推測。 | 字串 (選用) | `configs/astra-sim/topos/128_nodes_*.txt` |
+| `--ns3-bin` | ns-3 執行檔路徑。 | 字串 (環境變數 `ASTRA_NS3_BIN`) | |
+| `--system`, `--network`, `--remote` | baseline 設定檔路徑。 | 字串 (預設) | |
 
-- **只想檢查設定**
-  加 `--dry-run`，查看 `tmp/*.patched.*` 與 `command.txt`。
+### 系統層覆蓋 (影響 ASTRA-sim 內部排程)
+
+| 參數 | 描述 | 類型/預設值 | 範例 |
+|---|---|---|---|
+| `--coll-opt` | 集體操作優化策略。 | 字串 (選用) | `localBWAware` |
+| `--lmbw` | 本地記憶體頻寬 (GB/s)。 | 整數 (選用) | `1600` |
+
+### 網路層覆蓋 (影響 ns-3 封包行為)
+
+| 參數 | 描述 | 類型/預設值 | 範例 |
+|---|---|---|---|
+| `--qcn` | 啟用/禁用 QCN (量化擁塞通知)。 | 0 或 1 (選用) | `1` |
+| `--pfc-dyn` | 啟用/禁用動態 PFC 門檻。 | 0 或 1 (選用) | `1` |
+| `--buffer` | 交換器緩衝區大小 (封包數)。 | 整數 (選用) | `64` |
+| `--payload` | 封包 payload 大小 (bytes)。 | 整數 (選用) | `1500` |
+
+### 校準與輸出參數
+
+| 參數 | 描述 | 類型/預設值 | 範例 |
+|---|---|---|---|
+| `--no-autocalib` | 禁用自動校準 `alpha_us`。 | 布林 (選用) | |
+| `--trace-dir` | 指定 PyTorch Kineto trace 的來源目錄以進行校準。 | 字串 (預設 `data/chakra/pytorch_traces`) | |
+| `--calib-db` | 指定校準結果的 CSV 資料庫路徑。 | 字串 (預設 `runs/calibration_all.csv`) | |
+| `--log-dir` | 模擬輸出的根目錄。 | 字串 ("runs") | `my_runs` |
+| `--dry-run` | 僅產生設定檔和命令，不執行模擬。 | 布林 (選用) | |
 
 ---
 
-### 版本記錄（Changelog）
-- 2025-09-16：初版加入參數表、路徑補丁原理、情境範例與擴充佔位。
-- 2025-09-16：整併與修正；加入 --virtual-world、2D/3D 一致範例、路徑補丁說明。
-- 2025-09-18：改參數一覽為表格格式，加入 AMD ROCm 相關提示。
+## 校準原理 (`--no-autocalib` 未啟用時)
+
+當 `run_ns3.py` 執行 `world=2` 的模擬時，它會：
+
+1.  **解析模擬結果**: 從 `stdout.log` 提取 `sim_cycles_step` (模擬的總 wall cycles)。
+2.  **查找真實 Trace**:
+    *   根據 `--model-tag` 在 `--trace-dir` (預設 `data/chakra/pytorch_traces`) 中尋找對應的 Kineto trace (如 `device_0_cifar10.json`)。
+    *   從 trace 中提取 `real_t_step_ms` (真實世界的每步執行時間)。
+3.  **計算 Alpha**:
+    *   `alpha_us = (real_t_step_ms * 1000) / sim_cycles_step`
+    *   `alpha_us` 代表**每個模擬 cycle 對應多少真實世界的微秒 (µs)**。
+4.  **儲存結果**:
+    *   將本次模擬的完整參數、`real_t_*`、`sim_cycles_*` 和計算出的 `alpha_us` 存入 `out/metrics.csv`。
+    *   將這筆紀錄追加到 `--calib-db` (預設 `runs/calibration_all.csv`) 中，方便後續分析比較。

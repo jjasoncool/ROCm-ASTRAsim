@@ -2,45 +2,52 @@
 # -*- coding: utf-8 -*-
 """
 Link PyTorch host/device traces -> HDT (ET+), then convert to Chakra ET (.et)
+PyTorch Trace 轉 Chakra ET 轉換工具 (AMD ROCm 增強版)
+
+主要功能：
+1. **Trace Link & Convert**: 將 PyTorch Profiler (Kineto) 產生的 JSON 轉換為 ASTRA-sim 可用的 ET 格式。
+2. **AMD ROCm 兼容修補**: 自動識別並修復 AMD NCCL Kernel (`ncclDevKernel_Generic`) 命名問題。
+3. **系統感知校準 (System-Aware Calibration)**: 針對小模型 (Tiny Workload) 提供強制校準功能，將 System Overhead 攤提至計算節點。
+4. **多模型支援**: 支援透過 `--model-tag` 處理不同模型的 Trace (如 cifar10, resnet50)。
 
 === AMD GPU 兼容性修補說明 ===
-本腳本包含對 AMD GPU (ROCm/HIP) 的特殊支援修補。
-
-問題：Chakra 原本為 NVIDIA GPU 設計，無法識別 AMD GPU 的 NCCL kernel 命名格式
+問題：Chakra 原本為 NVIDIA GPU 設計，無法識別 AMD GPU 的 NCCL kernel 命名格式。
 - NVIDIA: "ncclKernel_AllReduce_..." (明確指出操作類型)
 - AMD:    "ncclDevKernel_Generic_4(...)" (使用 Generic，不明確指出操作類型)
+解決方案：
+- 動態修補 (Monkey Patching) `PyTorchConverter`，將 "Generic" Kernel 映射為 `ALL_REDUCE` 通訊節點。
 
-解決方案：動態修補 (monkey patching)
-1. 在運行時替換 PyTorchConverter.get_collective_comm_type 方法
-2. 新增對 "ncclDevKernel_Generic" 格式的識別，映射到 ALL_REDUCE
-3. 保持對原有 NVIDIA GPU 格式的完全兼容
-
-優勢：
-- 非入侵性：不修改 Chakra 主程式碼
-- 向前兼容：支援未來 Chakra 版本更新
-- 安全：如果修補失敗，自動回退到原始行為
+=== 系統感知校準 (System-Aware Calibration) ===
+問題：在小任務 (如 CIFAR-10) 中，System Overhead (Launch Latency, Memcpy) 佔據 99% 時間，但模擬器會忽略這些間隙，導致模擬時間嚴重低估。
+解決方案：
+- 使用 `--force-avg-kernel-ns` 強制指定平均 Kernel 時間。
+- 將真實世界的總 GPU 時間 (包含 Overhead) 平均攤提回計算節點，使模擬時間對齊真實時間。
 
 資料夾結構（預設）：
   ./data/chakra/
-    ├─ pytorch_traces/   # host_*.json / device_*.json 來源，同時輸出 hdt_*.json
-    └─ workload_et/      # 輸出 .et (<prefix>.<rank>.et)
-    └─ gpu_metrics/      # (Optional) gpu_metrics_*.json 用於精確 cycles 計算
+    ├─ pytorch_traces/   # 輸入: host_{rank}_{tag}.json, device_{rank}_{tag}.json
+    └─ workload_et/      # 輸出: workload.{tag}.{rank}.et
+    └─ gpu_metrics/      # 輸入: gpu_metrics_{rank}_{tag}.json (由 train_rocm_pytorch.py 產生)
 
-預設行為：
-  - 先清空 pytorch_traces/hdt_*.json 與 workload_et/*.et
-  - 強制覆寫輸出
-  - 自動偵測 ranks（由 host_*.json / device_*.json 的檔名）
-  - 自動應用 AMD GPU 修補
+用法範例：
 
-用法：
-  # 一般用法 (預設 2400 MHz)
-  python ./src/conver_to_chakra_et.py
+  1. 【標準模式】轉換 Compute-Bound 模型 (如 ResNet-50)
+     直接使用 Trace 中的數據與真實頻率進行轉換。
+     $ python src/conver_to_chakra_et.py --model-tag resnet50 --default-gpu-freq 2935
 
-  # 指定 9070 XT 的頻率 (例如 2.6 GHz)
-  python ./src/conver_to_chakra_et.py --default-gpu-freq 2600
+  2. 【校準模式】轉換 System-Bound 模型 (如 CIFAR-10)
+     強制將所有 Kernel 設為 609us (609000ns) 以補償 System Overhead。
+     $ python src/conver_to_chakra_et.py --model-tag cifar10 --force-avg-kernel-ns 609000 --default-gpu-freq 2935
 
-  # 保留舊檔且不強制覆寫
-  python ./src/conver_to_chakra_et.py --no-clean --no-force
+  3. 【一般模式】不指定 Tag (相容舊檔)
+     處理 host_{rank}.json
+     $ python src/conver_to_chakra_et.py
+
+參數說明：
+  --model-tag STR          : 指定模型標籤 (用於檔名過濾與輸出命名)
+  --force-avg-kernel-ns INT: [校準用] 強制指定平均 Kernel 時間 (奈秒)，若設定則忽略 Trace 真實平均值
+  --default-gpu-freq FLOAT : 預設 GPU 頻率 (MHz)，當找不到 metrics 檔案時使用
+  --no-clean               : 保留舊的輸出檔案
 """
 from __future__ import annotations
 
@@ -219,14 +226,40 @@ def run_one(cmd: List[str]) -> bool:
     return out.returncode == 0
 
 
-def detect_ranks(pt_dir: Path, ranks_arg: Optional[List[str]]) -> List[int]:
+def detect_ranks(pt_dir: Path, ranks_arg: Optional[List[str]], tag: str = None) -> List[int]:
     if ranks_arg:
         return sorted(set(int(r) for r in ranks_arg))
-    hosts = {p.stem.split("_")[-1] for p in pt_dir.glob("host_*.json")}
-    devs  = {p.stem.split("_")[-1] for p in pt_dir.glob("device_*.json")}
-    common = sorted({int(r) for r in hosts & devs})
+
+    # 根據 tag 決定搜尋模式
+    # 檔名格式: host_{rank}.json 或 host_{rank}_{tag}.json
+    pattern_host = f"host_*_{tag}.json" if tag else "host_*.json"
+    pattern_device = f"device_*_{tag}.json" if tag else "device_*.json"
+
+    hosts = set()
+    for p in pt_dir.glob(pattern_host):
+        try:
+            # 假設格式固定為 host_{rank}_...
+            parts = p.stem.split('_')
+            if len(parts) >= 2 and parts[1].isdigit():
+                hosts.add(int(parts[1]))
+        except: pass
+
+    devs = set()
+    for p in pt_dir.glob(pattern_device):
+        try:
+            parts = p.stem.split('_')
+            if len(parts) >= 2 and parts[1].isdigit():
+                devs.add(int(parts[1]))
+        except: pass
+
+    common = sorted(hosts & devs)
     if not common:
-        raise SystemExit(f"在 {pt_dir} 找不到成對的 host_*.json / device_*.json")
+        msg = f"匹配 tag='{tag}' 的" if tag else ""
+        print(f"[warn] 在 {pt_dir} 找不到{msg}成對 trace (host_X/device_X)")
+        if tag:
+            print(f"       請確認 train_rocm_pytorch.py 是否有加上 --model {tag} 並成功執行")
+        return []
+
     return common
 
 
@@ -285,14 +318,15 @@ def link_host_device(rank: int, host: Path, device: Path, out_hdt: Path) -> None
     print("[ok] chakra_trace_link 完成\n")
 
 
-# [MODIFIED] 新增 default_freq_mhz 參數，移除 rocm_compat 依賴
-def add_compute_cycles_to_compute_nodes(et_file: Path, hdt_file: Path, device_file: Path = None, pt_dir: Path = None, rank: int = 0, default_freq_mhz: float = 2400.0) -> int:
+# [修改] 增加 force_avg_kernel_ns 與 tag 參數，並支援 Metrics 檔名後綴
+def add_compute_cycles_to_compute_nodes(et_file: Path, hdt_file: Path, device_file: Path = None, pt_dir: Path = None, rank: int = 0, default_freq_mhz: float = 2400.0, force_avg_kernel_ns: float = None, tag: str = None) -> int:
     """
     為 ET 文件中的 COMPUTE 節點添加 compute_cycles 屬性
 
     優先順序:
-    1. 讀取 train_rocm_pytorch 產生的 gpu_metrics_{rank}.json (最準確，真實訓練頻率)
-    2. 使用參數傳入的預設頻率 (default_freq_mhz)
+    1. 強制校準 (--force-avg-kernel-ns) [新增]
+    2. 讀取 train_rocm_pytorch 產生的 gpu_metrics_{rank}_{tag}.json (真實訓練頻率)
+    3. 使用參數傳入的預設頻率 (default_freq_mhz)
 
     參數:
         et_file: ET 文件路徑
@@ -300,7 +334,9 @@ def add_compute_cycles_to_compute_nodes(et_file: Path, hdt_file: Path, device_fi
         device_file: 設備 trace 文件路徑
         pt_dir: PyTorch trace 目錄
         rank: 當前處理的 rank
-        default_freq_mhz: 保底頻率 (MHz)，由命令列傳入
+        default_freq_mhz: 保底頻率 (MHz)
+        force_avg_kernel_ns: 強制指定的平均 Kernel 時間 (ns) [新增]
+        tag: 模型標籤，用於讀取對應 metrics [新增]
 
     返回:
         修復的節點數量
@@ -311,8 +347,9 @@ def add_compute_cycles_to_compute_nodes(et_file: Path, hdt_file: Path, device_fi
 
     # [1] 嘗試讀取訓練期間記錄的 metrics
     if pt_dir:
-        # 結構: data/chakra/gpu_metrics/gpu_metrics_0.json
-        metrics_file = pt_dir.parent / "gpu_metrics" / f"gpu_metrics_{rank}.json"
+        # [修改] 根據 tag 決定 metrics 檔名
+        metrics_filename = f"gpu_metrics_{rank}_{tag}.json" if tag else f"gpu_metrics_{rank}.json"
+        metrics_file = pt_dir.parent / "gpu_metrics" / metrics_filename
 
         if metrics_file.exists():
             try:
@@ -323,9 +360,7 @@ def add_compute_cycles_to_compute_nodes(et_file: Path, hdt_file: Path, device_fi
                     avg_f = mdata.get("sclk_avg_mhz", 0)
                     max_f = mdata.get("sclk_max_mhz", 0)
 
-                    # 智慧判斷邏輯：
-                    # 如果中位數太低 (例如 < 500MHz)，代表大部分時間都在 Idle，
-                    # 這時應該改用 Max (假設有負載時是跑全速) 或 Avg。
+                    # 智慧判斷邏輯
                     if median_f > 500:
                         sclk = median_f
                         print(f"[fix-compute-cycles] 使用中位數頻率: {sclk} MHz")
@@ -338,102 +373,120 @@ def add_compute_cycles_to_compute_nodes(et_file: Path, hdt_file: Path, device_fi
 
                     if sclk:
                         actual_freq_ghz = sclk / 1000.0
+                        print(f"[fix-compute-cycles] ✅ 載入頻率記錄 ({metrics_filename}): {sclk:.1f} MHz")
 
             except Exception as e:
                 print(f"[warn] 讀取 metrics 失敗: {e}")
+        else:
+            # 若無檔案，不報錯，繼續往下走 (可能沒開監控)
+            pass
 
-    # [2] 若無 Metrics，使用命令列傳入的保底值 (不進行即時 Probe)
+    # [2] 若無 Metrics，使用命令列傳入的保底值
     if actual_freq_ghz is None:
         actual_freq_ghz = default_freq_mhz / 1000.0
         print(f"[fix-compute-cycles] ⚠️ 無法讀取 metrics，使用設定頻率: {default_freq_mhz:.1f} MHz ({actual_freq_ghz:.3f} GHz)")
 
-    # 方法1：從 device trace 提取實際 GPU kernel timing
-    gpu_kernel_durations = []
-    if device_file and device_file.exists():
-        try:
-            with device_file.open('r') as f:
-                device_data = json.load(f)
+    avg_compute_cycles = 0
 
-            trace_events = device_data.get('traceEvents', [])
-            for event in trace_events:
-                # 查找 GPU kernel 執行事件
-                cat = event.get('cat', '')
-                name = event.get('name', '')
+    # [新增] 策略 B：強制校準邏輯 (最高優先順序)
+    if force_avg_kernel_ns is not None:
+        print(f"========================================================")
+        print(f"[fix-compute-cycles] ⚠️⚠️⚠️ 啟用系統感知強制校準 (System-Aware Calibration) ⚠️⚠️⚠️")
+        print(f"[fix-compute-cycles] 目標: 將 System Overhead 攤提至計算節點")
+        print(f"[fix-compute-cycles] 強制設定平均 Kernel 時間: {force_avg_kernel_ns} ns")
 
-                # 識別 GPU kernel：hipLaunchKernel 或具有 kernel 信息的操作
-                is_gpu_kernel = (
-                    cat == 'cuda_runtime' and 'hipLaunchKernel' in name
-                ) or (
-                    event.get('args', {}).get('kernel') is not None
-                )
+        estimated_cycles = int(force_avg_kernel_ns * actual_freq_ghz)
+        avg_compute_cycles = estimated_cycles
 
-                if is_gpu_kernel:
-                    raw_dur = event.get('dur')
-                    # [關鍵修正] 確保單位正確：Trace 裡的微秒 (us) -> 奈秒 (ns)
-                    if raw_dur is not None and raw_dur > 0:
-                        dur_ns = raw_dur * 1000.0
-                        gpu_kernel_durations.append(dur_ns)
+        print(f"[fix-compute-cycles] 計算結果: {force_avg_kernel_ns:.0f} ns @ {actual_freq_ghz:.3f} GHz -> {estimated_cycles} cycles")
+        print(f"========================================================")
 
-            if gpu_kernel_durations:
-                # [保持] 過濾掉極短的 System Kernel
-                valid_durations = [d for d in gpu_kernel_durations if d >= 2000]
+        # 即使強制校準，我們直接跳到寫入階段，略過 Trace 分析
+        # 但為了代碼結構，我們將 gpu_kernel_durations 設為空，讓後面邏輯不執行
+        gpu_kernel_durations = []
 
-                if not valid_durations:
-                    valid_durations = gpu_kernel_durations
+    else:
+        # [原有邏輯] 策略 A：基於 Trace 真實計算
+        # 方法1：從 device trace 提取實際 GPU kernel timing
+        gpu_kernel_durations = []
+        if device_file and device_file.exists():
+            try:
+                with device_file.open('r') as f:
+                    device_data = json.load(f)
 
-                # [修改] 改用 平均值 (Mean) 取代 中位數 (Median)
-                # 平均值 = 總時間 / 總數量，能更好地守恆「總工作量」
-                avg_kernel_ns_val = sum(valid_durations) / len(valid_durations)
+                trace_events = device_data.get('traceEvents', [])
+                for event in trace_events:
+                    cat = event.get('cat', '')
+                    name = event.get('name', '')
+                    is_gpu_kernel = (
+                        cat == 'cuda_runtime' and 'hipLaunchKernel' in name
+                    ) or (
+                        event.get('args', {}).get('kernel') is not None
+                    )
 
-                # 為了對比，我們可以印出兩者看看差距
-                valid_durations.sort()
-                median_ns = valid_durations[len(valid_durations) // 2]
+                    if is_gpu_kernel:
+                        raw_dur = event.get('dur')
+                        # [單位修正] Trace 裡的單位是 us, 需轉為 ns
+                        if raw_dur is not None and raw_dur > 0:
+                            dur_ns = raw_dur * 1000.0
+                            gpu_kernel_durations.append(dur_ns)
 
-                print(f"[fix-compute-cycles] 統計: 總事件={len(gpu_kernel_durations)}, 有效={len(valid_durations)}")
-                print(f"[fix-compute-cycles] 比較: 中位數={median_ns:.0f} ns vs 平均值={avg_kernel_ns_val:.0f} ns")
-                print(f"[fix-compute-cycles] ⚠️ 採用平均值以反映總計算負載")
+                if gpu_kernel_durations:
+                    # 過濾掉小於 2000 ns (2 us) 的微小核心
+                    valid_durations = [d for d in gpu_kernel_durations if d >= 2000]
+                    if not valid_durations:
+                        valid_durations = gpu_kernel_durations
 
-                # 使用平均值計算 Cycles
-                estimated_cycles = int(avg_kernel_ns_val * actual_freq_ghz)
-                print(f"[fix-compute-cycles] Kernel 代表時長: {avg_kernel_ns_val:.0f} ns @ {actual_freq_ghz:.3f} GHz -> 估計 cycles: {estimated_cycles}")
-                avg_compute_cycles = estimated_cycles
-            else:
-                # 保底機制
-                print("[fix-compute-cycles] ⚠️ 未找到任何 Kernel，使用保底值 50us")
+                    # [統計] 使用平均值 (Mean)
+                    avg_kernel_ns_val = sum(valid_durations) / len(valid_durations)
+
+                    # 為了對比，印出中位數
+                    valid_durations.sort()
+                    median_ns = valid_durations[len(valid_durations) // 2]
+
+                    print(f"[fix-compute-cycles] 掃描 {len(gpu_kernel_durations)} 個事件")
+                    print(f"[fix-compute-cycles] 有效運算 Kernel: {len(valid_durations)} 個")
+                    print(f"[fix-compute-cycles] 比較: 中位數={median_ns:.0f} ns vs 平均值={avg_kernel_ns_val:.0f} ns")
+                    print(f"[fix-compute-cycles] Trace 分析結果 (Mean): {avg_kernel_ns_val:.0f} ns")
+
+                    estimated_cycles = int(avg_kernel_ns_val * actual_freq_ghz)
+                    avg_compute_cycles = estimated_cycles
+                    print(f"[fix-compute-cycles] -> 估計 cycles: {estimated_cycles}")
+                else:
+                    print("[fix-compute-cycles] ⚠️ 未找到任何 Kernel，使用保底值 50us")
+                    avg_compute_cycles = int(50000 * actual_freq_ghz)
+
+            except Exception as e:
+                print(f"[warn] 無法從 device trace 提取 GPU kernel timing: {e}")
                 avg_compute_cycles = int(50000 * actual_freq_ghz)
 
-        except Exception as e:
-            print(f"[warn] 無法從 device trace 提取 GPU kernel timing: {e}")
-            avg_compute_cycles = int(1000 * 1000 * actual_freq_ghz)
+        # 方法2：從 HDT 提取 ProfilerStep 時長（後備方案）
+        # 只有在方法 1 (Device Trace) 失敗且沒有強制校準時才執行
+        if not gpu_kernel_durations and avg_compute_cycles == 0:
+            step_durations = {}
+            try:
+                with hdt_file.open('r') as f:
+                    hdt_data = json.load(f)
 
-    # 方法2：從 HDT 提取 ProfilerStep 時長（後備方案）
-    if not gpu_kernel_durations:
-        step_durations = {}
-        try:
-            with hdt_file.open('r') as f:
-                hdt_data = json.load(f)
+                for node in hdt_data.get('nodes', []):
+                    name = node.get('name', '')
+                    if name.startswith('ProfilerStep#'):
+                        step_num = int(name.replace('ProfilerStep#', ''))
+                        dur = node.get('dur')
+                        if dur is not None:
+                            step_durations[step_num] = dur
+            except Exception as e:
+                print(f"[warn] 無法從 HDT 提取時長信息: {e}")
 
-            for node in hdt_data.get('nodes', []):
-                name = node.get('name', '')
-                if name.startswith('ProfilerStep#'):
-                    step_num = int(name.replace('ProfilerStep#', ''))
-                    dur = node.get('dur')
-                    if dur is not None:
-                        step_durations[step_num] = dur
-        except Exception as e:
-            print(f"[warn] 無法從 HDT 提取時長信息: {e}")
-
-        # 計算平均 step 時長（轉換為 cycles）
-        if step_durations:
-            avg_step_ms = sum(step_durations.values()) / len(step_durations)
-            # 1ms = 1,000,000 ns
-            avg_compute_cycles = int(avg_step_ms * 1000000 * actual_freq_ghz)
-            print(f"[fix-compute-cycles] 從 HDT ProfilerStep 計算平均 compute_cycles: {avg_compute_cycles}")
-        else:
-            if not 'avg_compute_cycles' in locals():
-                # 默認值：1ms
-                avg_compute_cycles = int(1000000 * actual_freq_ghz)
-                print(f"[fix-compute-cycles] 使用默認 compute_cycles: {avg_compute_cycles}")
+            if step_durations:
+                avg_step_ms = sum(step_durations.values()) / len(step_durations)
+                # 1ms = 1,000,000 ns
+                avg_compute_cycles = int(avg_step_ms * 1000000 * actual_freq_ghz)
+                print(f"[fix-compute-cycles] 從 HDT ProfilerStep 計算平均 compute_cycles: {avg_compute_cycles}")
+            else:
+                if avg_compute_cycles == 0: # 確保有值
+                    avg_compute_cycles = int(1000000 * actual_freq_ghz)
+                    print(f"[fix-compute-cycles] 使用預設 compute_cycles (1ms): {avg_compute_cycles}")
 
     # 添加屬性到 COMPUTE 節點
     meta, nodes = _decode_et(et_file)
@@ -448,7 +501,7 @@ def add_compute_cycles_to_compute_nodes(et_file: Path, hdt_file: Path, device_fi
                 # 添加 compute_cycles 屬性
                 attr = node.attr.add()
                 attr.name = "compute_cycles"
-                attr.int64_val = int(avg_compute_cycles) # 確保是整數
+                attr.int64_val = int(avg_compute_cycles)
                 fixed_count += 1
 
     # 保存修復後的 ET 文件
@@ -458,7 +511,7 @@ def add_compute_cycles_to_compute_nodes(et_file: Path, hdt_file: Path, device_fi
 
 
 # [MODIFIED] 傳入 default_freq_mhz
-def convert_hdt_to_et(hdt: Path, out_et: Path, device_file: Path = None, pt_dir: Path = None, rank: int = 0, default_freq_mhz: float = 2400.0) -> None:
+def convert_hdt_to_et(hdt: Path, out_et: Path, device_file: Path = None, pt_dir: Path = None, rank: int = 0, default_freq_mhz: float = 2400.0, force_avg_kernel_ns: float = None, tag: str = None) -> None:
     """
     將 HDT (Chakra 中間格式) 轉換為 ET (執行追蹤) 格式
 
@@ -509,7 +562,16 @@ def convert_hdt_to_et(hdt: Path, out_et: Path, device_file: Path = None, pt_dir:
     # 確保 COMPUTE 節點具有 compute_cycles 屬性
     try:
         # [MODIFIED] 傳遞參數
-        fixed_count = add_compute_cycles_to_compute_nodes(out_et, hdt, device_file, pt_dir=pt_dir, rank=rank, default_freq_mhz=default_freq_mhz)
+        fixed_count = add_compute_cycles_to_compute_nodes(
+            out_et,
+            hdt,
+            device_file,
+            pt_dir=pt_dir,
+            rank=rank,
+            default_freq_mhz=default_freq_mhz,
+            force_avg_kernel_ns=force_avg_kernel_ns, # 傳遞校準值
+            tag=tag
+        )
         if fixed_count > 0:
             print(f"[fix] 添加了 {fixed_count} 個 compute_cycles 屬性到 COMPUTE 節點")
     except Exception as e:
@@ -1091,6 +1153,9 @@ def main():
     ap.add_argument("--simple-astra", action="store_true", help="生成 ASTRA-sim 兼容的簡化版本（僅通訊節點）")
     # [MODIFIED] 新增參數，預設 2400 MHz (2.4 GHz)
     ap.add_argument("--default-gpu-freq", type=float, default=2400.0, help="當 metrics 不存在時的預設 GPU 頻率 (MHz)")
+    # [新增] 支援強制校準與模型標籤
+    ap.add_argument("--force-avg-kernel-ns", type=float, default=None, help="System-Aware Calibration: 強制指定平均 Kernel 時間 (ns)")
+    ap.add_argument("--model-tag", type=str, default=None, help="指定模型標籤 (e.g., cifar10, resnet50) 用於過濾檔案與命名輸出")
     args = ap.parse_args()
 
     base   = Path(args.base_dir).resolve()
@@ -1114,7 +1179,9 @@ def main():
     print(f"[Log] Log 記錄已啟動: {log_file}")
     print(f"========================================================\n")
     # -----------------------
-
+    if args.model_tag:
+        print(f"[Config] Processing Model Tag: {args.model_tag}")
+    print(f"[Config] Force Calibration: {args.force_avg_kernel_ns} ns" if args.force_avg_kernel_ns else "[Config] Trace-based Cycle Calculation")
     print(f"[paths]\n  base={base}\n  pt_dir={pt_dir}\n  et_dir={et_dir}\n")
 
     # 檢查工具是否存在
@@ -1123,36 +1190,42 @@ def main():
     if shutil.which("chakra_converter") is None:
         print("[warn] 找不到 chakra_converter（請確認已安裝且在 PATH）")
 
-    # 預設清空舊檔
-    if not args.no_clean:
+    # [修改] 若指定 tag 則不全域清理，避免誤刪其他實驗數據
+    if not args.no_clean and not args.model_tag:
         clean_outputs(pt_dir, et_dir)
+    elif args.model_tag:
+        print(f"[info] 指定了 --model-tag {args.model_tag}，跳過全域清理")
 
     # 決定要處理哪些 rank
-    ranks = detect_ranks(pt_dir, args.ranks)
+    ranks = detect_ranks(pt_dir, args.ranks, tag=args.model_tag)
     print(f"[ranks] 將處理：{ranks}\n")
 
     force = not args.no_force
 
     for r in ranks:
-        host = pt_dir / f"host_{r}.json"
-        dev  = pt_dir / f"device_{r}.json"
+        # [修改] 組合檔名 (支援有 tag 與無 tag)
+        suffix = f"_{args.model_tag}" if args.model_tag else ""
+
+        # 優先找帶有 tag 的檔案 (例如 host_0_resnet50.json)
+        host = pt_dir / f"host_{r}{suffix}.json"
+        dev  = pt_dir / f"device_{r}{suffix}.json"
+
+        # Fallback: 若找不到帶後綴的，找無後綴的 (相容舊檔 host_0.json)
+        if not host.exists() and not suffix: host = pt_dir / f"host_{r}.json"
+        if not dev.exists() and not suffix: dev = pt_dir / f"device_{r}.json"
+
         if not host.exists() or not dev.exists():
-            print(f"[skip] rank {r} 檔案不完整：{host.name if host.exists() else '缺 host'} / {dev.name if dev.exists() else '缺 device'}")
+            print(f"[skip] rank {r} 檔案不完整 (找不到 host/device trace)")
             continue
 
         # HDT 放在 pytorch_traces 內
-        hdt = pt_dir / f"hdt_{r}.json"
+        hdt = pt_dir / f"hdt_{r}{suffix}.json"
 
         # 決定輸出的 et 檔名
-        prefix = args.et_prefix
-        if prefix == "auto":
-            try:
-                prefix = infer_prefix_from_device(dev)
-                print(f"[auto-prefix] rank {r}: 主要 collective 推測為 '{prefix}'")
-            except Exception as e:
-                print(f"[auto-prefix] rank {r}: 無法自動判斷（{e}），改用 'workload'")
-                prefix = "workload"
-        et  = et_dir / f"{prefix}.{r}.et"
+        # [修改] 輸出檔名也加上 tag (例如 workload.resnet50.0.et)
+        prefix = infer_prefix_from_device(dev) if args.et_prefix == "auto" else args.et_prefix
+        final_prefix = f"{prefix}.{args.model_tag}" if args.model_tag else prefix
+        et  = et_dir / f"{final_prefix}.{r}.et"
 
         if et.exists() and not force:
             print(f"[skip] {et} 已存在。用 --no-force 可維持、或移除該檔再重跑。")
@@ -1166,13 +1239,12 @@ def main():
             # ASTRA-sim 兼容模式：直接從 HDT 生成簡化 ET
             print(f"[simple-astra] 生成 ASTRA-sim 兼容版本 for rank {r}")
             comm_nodes = extract_comm_nodes_from_hdt(hdt)
-            if comm_nodes:
-                create_astra_sim_et(comm_nodes, et, r)
-            else:
-                print(f"[warn] rank {r}: 未找到通訊節點，跳過")
+            if comm_nodes: create_astra_sim_et(comm_nodes, et, r)
         else:
             # 標準模式：完整轉換 + DAG 修正
-            convert_hdt_to_et(hdt, et, dev, pt_dir=pt_dir, rank=r, default_freq_mhz=args.default_gpu_freq)
+            convert_hdt_to_et(hdt, et, dev, pt_dir=pt_dir, rank=r, default_freq_mhz=args.default_gpu_freq,
+                              force_avg_kernel_ns=args.force_avg_kernel_ns,
+                              tag=args.model_tag)
 
             # 轉檔後：就地修 DAG（清理不一致依賴/循環，並過濾 ASTRA-sim 不支援的節點）
             try:

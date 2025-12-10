@@ -63,7 +63,7 @@ except Exception:
 ET_PAT = re.compile(r"^(?P<prefix>.*)\.(?P<rank>\d+)\.et$")
 KINETO_STEP_PAT = re.compile(r"^ProfilerStep#\d+$")  # Pytorch Profiler 的 step 名稱
 # 嘗試辨識 NCCL/collective 名稱（不同版本/後端字串會不同，留多一點關鍵字）
-KINETO_COMM_HINTS = ("nccl", "rccl", "all_reduce", "allreduce", "all_gather", "reduce_scatter", "alltoall")
+KINETO_COMM_HINTS = ("nccl", "rccl", "all_reduce", "allreduce", "allgather", "all_gather", "reduce_scatter", "alltoall", "broadcast", "bytes")
 
 # Calibration CSV 欄位定義
 CALIB_FIELDS = [
@@ -487,12 +487,12 @@ def list_trace_groups(trace_dir: Path, tag: str = None) -> list[tuple[int, dict[
 
     return []
 
-def _dur_units_to_ms(trace_obj: dict, dur_val: float) -> float:
+def _dur_units_to_ms(ev_obj: dict, dur_val: float) -> float:
     """
     將 Trace 中的持續時間數值 (dur) 統一轉換為毫秒 (ms)。
 
     [修訂歷史 - Critical Fix]
-    原本邏輯會讀取 trace_obj["displayTimeUnit"]。
+    原本邏輯會讀取 ev_obj["displayTimeUnit"]。
     但實測發現：AMD/PyTorch Profiler 雖然標註 "ms"，但內部數值 (如 87) 其實是微秒 (us)。
     - 若信賴 "ms" 標籤 -> 87ms -> 總時間膨脹 1000 倍 -> ResNet Alpha 暴增至 2.25。
     - 若視為 "us" (物理事實) -> 87us -> 總時間正常 -> ResNet Alpha 回歸 0.002。
@@ -500,15 +500,31 @@ def _dur_units_to_ms(trace_obj: dict, dur_val: float) -> float:
     因此，這裡採取「強制轉型」策略，無視 JSON 標頭的單位宣告。
     """
 
-    # [已移除] 不再讀取 displayTimeUnit，因為它在 PyTorch Kineto 中是誤導資訊
-    # unit = str(trace_obj.get("displayTimeUnit", "")).lower()
-    # if unit == "ms": return float(dur_val)
-
     # [物理定義]
     # Google Chrome Trace Event Format 規範定義 dur 單位為 微秒 (microseconds)。
     # 我們需要回傳 毫秒 (milliseconds) 給 ASTRA-sim 進行後續計算。
     # 公式： ms = us / 1000.0
-    return float(dur_val) / 1000.0
+    name = str(ev_obj.get("name", ""))
+    val = float(dur_val)
+
+    # 1. 絕對特徵判定：如果是 ProfilerStep，必定是 CPU 端時間 (ns)
+    if "ProfilerStep" in name:
+        # 如果視為 ns (除以 100萬) 結果 < 1.0 ms，這不合理，代表它其實是 us
+        if (val / 1_000_000.0) < 1.0:
+            return val / 1_000.0     # 視為 us
+        return val / 1_000_000.0     # 視為 ns
+
+    # 2. 絕對特徵判定：如果是通訊 (nccl) 或計算 (Kernel)，通常是 us
+    # 加強防呆：若沒有名字特徵，才退回到數值門檻法
+
+    # 數值門檻法 (作為最後一道防線)
+    # 邏輯：Kernel 不太可能跑超過 10秒 (10^7 us)，Step 不太可能短於 0.01ms (10^4 ns)
+    # 但為了包含極短 Step，我們依賴上面的 Name Check。
+    # 這裡保留門檻是為了處理那些沒有名字特徵的雜項事件。
+    if val > 10_000_000:
+        return val / 1_000_000.0 # 視為 ns
+    else:
+        return val / 1_000.0     # 視為 us
 
 def _extract_step_and_comm_ms(trace_path: Path) -> tuple[list[float], float | None]:
     """
@@ -537,15 +553,20 @@ def _extract_step_and_comm_ms(trace_path: Path) -> tuple[list[float], float | No
         name = str(ev.get("name", "")).lower()
         cat  = str(ev.get("cat", "")).lower()
         # 將 dur 統一換算成毫秒（Kineto 可能為 us；若 displayTimeUnit=="ms" 則維持 ms）
-        d_ms = _dur_units_to_ms(obj, ev.get("dur", 0.0))
+        d_ms = _dur_units_to_ms(ev, ev.get("dur", 0.0))
 
         # 判定一步的界線：PyTorch Profiler 會發出 "ProfilerStep#<n>"
         if KINETO_STEP_PAT.match(str(ev.get("name", ""))):
             steps_ms.append(d_ms)
 
-        # 判定通訊事件：名稱或分類包含 nccl/rccl/all_reduce/all_gather 等關鍵字
-        # （RCCL 是 ROCm 上的 NCCL 對應實作）
-        if any(h in name for h in KINETO_COMM_HINTS) or any(h in cat for h in KINETO_COMM_HINTS):
+        # 條件 A: 名稱或分類包含通訊關鍵字 (nccl, allreduce, bytes...)
+        is_comm_candidate = any(h in name for h in KINETO_COMM_HINTS) or any(h in cat for h in KINETO_COMM_HINTS)
+
+        # 條件 B: 必須「不是」Kernel 實作 (避免重複計算 GPU 執行時間)
+        # ROCm Trace 常有 "ncclKernel" 或 "RingKernel"，這些屬於 Compute/Kernel 類別，不應計入 Network Comm
+        is_not_kernel = ('kernel' not in name) and ('kernel' not in cat)
+
+        if is_comm_candidate and is_not_kernel:
             comm_sum_ms += d_ms
             any_comm = True
 
@@ -576,6 +597,8 @@ def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[
     per_rank_net_comm = []
     per_rank_kernel = []
 
+    print(f"[INFO] 正在分析 Trace (Source: {src})...")
+
     for r, p in sorted(ranks.items()):
         obj = _load_json(p)
         if not obj:
@@ -595,7 +618,7 @@ def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[
                 continue
             name = str(ev.get('name', ''))
             cat = str(ev.get('cat', ''))
-            d_ms = _dur_units_to_ms(obj, ev.get('dur', 0.0))
+            d_ms = _dur_units_to_ms(ev, ev.get('dur', 0.0))
             lname = name.lower()
             lcat = cat.lower()
 
@@ -603,11 +626,16 @@ def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[
             if KINETO_STEP_PAT.match(name):
                 step_durations.append(d_ms)
 
-            # network-only: has bytes= token and not kernel category
-            if '|bytes=' in lname:
+            # 邏輯：(名稱或分類包含通訊關鍵字) AND (不是 Kernel)
+            # KINETO_COMM_HINTS 包含了 'nccl', 'rccl', 'bytes', 'allreduce' 等
+            is_comm_candidate = any(h in lname for h in KINETO_COMM_HINTS) or any(h in lcat for h in KINETO_COMM_HINTS)
+            is_not_kernel = ('kernel' not in lname) and ('kernel' not in lcat)
+
+            if is_comm_candidate and is_not_kernel:
                 net_ms_total += d_ms
 
-            # kernel events: kernel category OR known devkernel name patterns
+            # 3. 抓取 Kernel 時間 (計算)
+            # 包含 kernel category 或名字裡有 kenerl/nccldevkernel
             if 'kernel' in lcat or 'nccldevkernel' in lname or 'devkernel' in lname:
                 kernel_ms_total += d_ms
 
@@ -796,6 +824,151 @@ def export_metrics(out_dir: Path, row: dict) -> None:
         writer.writerow(row)
     print(f"[INFO] 指標輸出 → {csv_path}")
 
+# =============================================================================
+# [優化版] 模擬執行核心函式 (記憶體緩衝模式 - High Performance)
+# =============================================================================
+def run_simulation(cmd: list, stdout_path: Path, logroot: Path) -> int:
+    """
+    執行 NS3 模擬，採用全記憶體緩衝以最大化效能。
+
+    優化重點：
+    1. 移除逐行寫檔 I/O，改用記憶體 list 暫存。
+    2. 僅在最後一次性寫入 stdout.log。
+    3. 保留所有即時監控、靜默偵測與錯誤診斷邏輯。
+
+    Args:
+        cmd: 執行指令列表
+        stdout_path: stdout.log 的完整路徑
+        logroot: 若執行失敗需要清理的根目錄
+
+    Returns:
+        int: 程序回傳碼 (0=成功, 非0=失敗)
+    """
+
+    # 準備記憶體緩衝區 (完全不開檔，減少 I/O)
+    full_log_buffer = []
+
+    start_time = time.time()
+    last_output_time = start_time
+    qp_enabled_seen = False
+    simulation_started = False
+
+    try:
+        # 使用 Popen 啟動子程序
+        # bufsize=1 確保我們可以即時讀到 stdout，不會被 OS 卡住
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, # 將 stderr 合併到 stdout
+            universal_newlines=True,
+            bufsize=1
+        )
+
+        # 逐行讀取輸出 (即時監控迴圈)
+        for line in process.stdout:
+            current_time = time.time()
+            elapsed = current_time - start_time
+
+            line_strip = line.rstrip()
+            formatted_line = f"[{elapsed:6.1f}s] {line_strip}\n"
+            # 1. 存入記憶體
+            full_log_buffer.append(formatted_line)
+
+            # 2. 螢幕顯示
+            print(formatted_line.rstrip())
+
+            # 3. 靜默/卡死偵測邏輯 (完全保留)
+            line_lower = line.lower()
+
+            # 狀態更新
+            if "qp is enabled" in line_lower:
+                qp_enabled_seen = True
+                print(f"[INFO] NS3 網路模擬開始執行...")
+            elif qp_enabled_seen and ("maxrtt" in line_lower or "finished" in line_lower):
+                simulation_started = True
+
+            # 計算靜默時間
+            silence_duration = current_time - last_output_time
+
+            # 根據階段決定警告門檻
+            if qp_enabled_seen and not simulation_started:
+                # NS3 計算密集階段：容忍 120 秒
+                warning_threshold = 120
+                if silence_duration > warning_threshold:
+                    print(f"[WARN] NS3 模擬已靜默 {silence_duration:.1f} 秒（正常現象，網路模擬進行中）")
+                    print(f"[INFO] 如確實卡死可按 Ctrl+C 中斷")
+                    last_output_time = current_time # 重置以免洗版
+            else:
+                # 一般階段：容忍 30 秒
+                warning_threshold = 30
+                if silence_duration > warning_threshold:
+                    print(f"[WARN] 已 {silence_duration:.1f} 秒無新輸出，可能卡死...")
+                    print(f"[INFO] 如需中斷請按 Ctrl+C")
+                    last_output_time = current_time
+
+            last_output_time = current_time
+
+        # 等待程序完全結束
+        process.wait()
+
+        # 模擬結束後，一次性將記憶體內容寫入硬碟
+        try:
+            with stdout_path.open("w", encoding="utf-8") as lf:
+                lf.writelines(full_log_buffer)
+        except Exception as io_err:
+            print(f"[WARN] 無法寫入 Log 檔案: {io_err}")
+
+        # 檢查回傳碼
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(process.returncode, cmd)
+
+    except subprocess.CalledProcessError as e:
+        print("-" * 80)
+        print(f"[ERR] NS3 執行失敗，退出碼: {e.returncode}")
+
+        # 錯誤診斷邏輯 (直接分析記憶體中的資料，不用再讀檔，速度更快)
+        # 將 list 轉為大字串以便搜尋
+        all_log_text = "".join(full_log_buffer)
+
+        if "Node 0 in ctrl_dep graph, but not found in index" in all_log_text:
+            print(f"[DIAG] 檢測到工作負載檔案損壞/不兼容錯誤")
+            print(f"[ISSUE] 這通常是 Chakra ET 格式版本與 ASTRA-sim 版本不匹配造成的")
+            print(f"[FIX] 解決方案: 請重新生成工作負載，或使用 --workload 指定兼容範例")
+        elif "file might be corrupted" in all_log_text:
+            print(f"[DIAG] 檢測到檔案損壞錯誤")
+        elif "Permission denied" in all_log_text:
+            print(f"[DIAG] 檢測到權限錯誤")
+            print(f"[FIX] 請嘗試執行: chmod -R 755 /workspace")
+        else:
+            print(f"[DIAG] 通用錯誤，請檢查 {stdout_path} 獲取詳細資訊")
+
+        # 清理失敗的目錄
+        if logroot.exists():
+            shutil.rmtree(logroot)
+            print(f"[INFO] 執行失敗，已刪除 {logroot}")
+
+        return e.returncode # 回傳非 0
+
+    except KeyboardInterrupt:
+        print("\n[INFO] 用戶中斷執行")
+        if 'process' in locals():
+            process.terminate()
+            time.sleep(1)
+            if process.poll() is None:
+                print("[INFO] 強制終止進程...")
+                process.kill()
+
+        # 即使中斷，也嘗試把目前跑到的 Log 寫入，方便查看卡在哪
+        if full_log_buffer:
+             try:
+                with stdout_path.open("w", encoding="utf-8") as lf:
+                    lf.writelines(full_log_buffer)
+             except: pass
+
+        return 130 # 標準的中斷退出碼
+
+    return 0 # 成功
+
 # ---------- 主流程 ----------
 def main():
     ap = argparse.ArgumentParser(description="Run ASTRA-sim ns-3 with Chakra workload")
@@ -974,98 +1147,12 @@ def main():
     print(f"[INFO] 提示: 執行過程中可按 Ctrl+C 中斷")
     print("-" * 80)
 
-    with stdout_path.open("w", encoding="utf-8") as lf:
-        try:
-            # 使用 Popen 以便即時顯示輸出
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                     universal_newlines=True, bufsize=1)
+    # 呼叫剛剛寫好的函式
+    ret_code = run_simulation(cmd, stdout_path, logroot)
 
-            start_time = time.time()
-            last_output_time = start_time
-            line_count = 0
-            qp_enabled_seen = False
-            simulation_started = False
-
-            for line in process.stdout:
-                # 同時寫入檔案和顯示在終端
-                lf.write(line)
-                lf.flush()
-
-                current_time = time.time()
-                line_count += 1
-
-                # 顯示帶時間戳的輸出
-                elapsed = current_time - start_time
-                print(f"[{elapsed:6.1f}s] {line.rstrip()}")
-
-                # 檢測 NS3 執行階段
-                line_lower = line.lower()
-                if "qp is enabled" in line_lower:
-                    qp_enabled_seen = True
-                    print(f"[INFO] NS3 網路模擬開始執行（可能進入靜默計算階段）...")
-                elif qp_enabled_seen and ("maxrtt" in line_lower or "finished" in line_lower):
-                    simulation_started = True
-
-                # 智能無輸出警告 - 考慮 NS3 執行階段
-                silence_duration = current_time - last_output_time
-                if qp_enabled_seen and not simulation_started:
-                    # NS3 模擬階段：延長警告時間到 120 秒
-                    warning_threshold = 120
-                    if silence_duration > warning_threshold:
-                        print(f"[WARN] NS3 模擬已靜默 {silence_duration:.1f} 秒（正常現象，網路模擬進行中）")
-                        print(f"[INFO] 如確實卡死可按 Ctrl+C 中斷")
-                        last_output_time = current_time  # 重置以避免重複警告
-                else:
-                    # 初始化或結果階段：30 秒警告
-                    warning_threshold = 30
-                    if silence_duration > warning_threshold:
-                        print(f"[WARN] 已 {silence_duration:.1f} 秒無新輸出，可能卡死...")
-                        print(f"[INFO] 如需中斷請按 Ctrl+C")
-                        last_output_time = current_time  # 重置以避免重複警告
-
-                last_output_time = current_time
-
-            # 等待進程完成
-            process.wait()
-            if process.returncode != 0:
-                raise subprocess.CalledProcessError(process.returncode, cmd)
-
-        except subprocess.CalledProcessError as e:
-            print("-" * 80)
-            print(f"[ERR] NS3 執行失敗，退出碼: {e.returncode}")
-
-            # 分析常見錯誤並提供解決建議
-            if stdout_path.exists():
-                stderr_content = stdout_path.read_text(encoding="utf-8", errors="ignore")
-                if "Node 0 in ctrl_dep graph, but not found in index" in stderr_content:
-                    print(f"[DIAG] 檢測到工作負載檔案損壞/不兼容錯誤")
-                    print(f"[ISSUE] 這通常是 Chakra ET 格式版本與 ASTRA-sim 版本不匹配造成的")
-                    print(f"[FIX] 解決方案:")
-                    print(f"      1. 重新生成工作負載檔案（使用兼容版本的 Chakra）")
-                    print(f"      2. 或使用已知兼容的工作負載：")
-                    print(f"         --workload tutorials/micro2024/chakra-demo/demo1/allreduce")
-                    print(f"      3. 檢查 Chakra schema 版本是否與 ASTRA-sim 期望版本一致")
-                elif "file might be corrupted" in stderr_content:
-                    print(f"[DIAG] 檢測到檔案損壞錯誤")
-                    print(f"[FIX] 請檢查工作負載檔案完整性，或嘗試重新生成")
-                elif "Permission denied" in stderr_content:
-                    print(f"[DIAG] 檢測到權限錯誤")
-                    print(f"[FIX] 請檢查 Docker 容器內檔案權限，執行: chmod -R 755 /workspace")
-                else:
-                    print(f"[DIAG] 通用錯誤，請檢查 {stdout_path} 獲取詳細資訊")
-
-            shutil.rmtree(logroot)
-            print(f"[INFO] 執行失敗，已刪除 {logroot}")
-            raise SystemExit(f"[ERR] ns-3 後端退出碼 {e.returncode}")
-        except KeyboardInterrupt:
-            print("\n[INFO] 用戶中斷執行")
-            if 'process' in locals():
-                process.terminate()
-                time.sleep(2)  # 給進程時間終止
-                if process.poll() is None:  # 如果還沒終止
-                    print("[INFO] 強制終止進程...")
-                    process.kill()
-            raise SystemExit("[INFO] 執行被中斷")
+    # 檢查回傳碼，若失敗直接退出
+    if ret_code != 0:
+        raise SystemExit(f"[ERR] 模擬執行失敗 (Code {ret_code})")
 
     print(f"[INFO] 完成。stdout → {stdout_path}")
     print(f"[INFO] FCT/QLEN/PFC/TRACE 等輸出 → {out_dir}")

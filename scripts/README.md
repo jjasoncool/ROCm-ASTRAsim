@@ -2,6 +2,64 @@
 
 本資料夾包含 ASTRA-sim × ns-3 網路模擬的執行與校準腳本，核心為 `run_ns3.py`。
 
+---
+
+# ASTRA-sim 網路參數校準方法論 (Network Parameter Calibration Methodology)
+
+**在執行模擬之前，必須先建立正確的參數校準流程。**
+
+本節詳述如何將真實硬體環境的測量數據，轉換為模擬器 (`topology.txt`) 中的精確參數。此過程包含三個關鍵步驟：**測量 (Measurement)**、**分析 (Analysis)** 與 **計算 (Calculation)**。
+
+## 1. 測量階段：獲取物理基準 (Physical Baselines)
+我們不應使用硬體規格書上的理論峰值，而應使用如 `rccl-tests` 等微基準測試工具測量「有效性能」。
+
+*   **有效頻寬 (Effective Bandwidth)**: 使用大封包測量 Bus Bandwidth，作為 `topology.txt` 頻寬設定的依據。
+*   **端對端延遲 (End-to-End Latency, $T_{RCCL}$)**: 使用小封包 (e.g., 4 bytes) 測量 Round-Trip Time 或 One-Way Latency。這是校準的核心數據。
+
+## 2. 分析階段：拓撲結構拆解
+ASTRA-sim 與 NS-3 的延遲參數是定義在「單條鏈路 (Per-Link)」上的，而非端對端。因此，直接填入測量到的 $T_{RCCL}$ 是錯誤的。我們必需分析訊號經過的路徑：
+
+*   **定義跳數 ($N_{hops}$)**: 訊號從來源 GPU 到達目的 GPU 所經過的實體線路數量。
+    *   **直連 (P2P)**: $N_{hops} = 1$ (GPU $\rightarrow$ GPU)
+    *   **單層 Switch**: $N_{hops} = 2$ (GPU $\rightarrow$ Switch $\rightarrow$ GPU)
+    *   **多層 Switch (e.g., Fat-Tree)**: $N_{hops} = 4$ (GPU $\rightarrow$ Leaf $\rightarrow$ Spine $\rightarrow$ Leaf $\rightarrow$ GPU)
+
+## 3. 計算階段：延遲分配公式
+根據物理疊加原理，總延遲約等於各段鏈路延遲之和（忽略 Switch 內部排隊與處理時間的簡化模型）。
+
+我們使用以下公式推導單條鏈路的設定值 $T_{link}$：
+
+$$T_{link} = \frac{T_{RCCL} - T_{overhead}}{N_{hops}}$$
+
+*   **$T_{link}$**: 填入 `topology.txt` 的目標參數。
+*   **$T_{RCCL}$**: 實測的端對端延遲。
+*   **$T_{overhead}$**: 軟體與驅動開銷。若採取「有效延遲 (Effective Latency)」策略，可將此項設為 0，將軟體開銷平均攤提至物理鏈路中，以簡化模擬模型。
+
+---
+
+## 範例應用：雙節點單 Switch 架構校準
+
+以下展示如何應用上述方法論於實際案例。
+
+### 步驟 1: 測量
+在 AMD 雙 GPU 環境下，使用 `rccl-tests` (小封包) 測得端對端延遲 $T_{RCCL} \approx 25 \mu s$。
+
+### 步驟 2: 分析
+拓撲為 `2_nodes_1_switch`。路徑為 `GPU 0` $\rightarrow$ `Switch` $\rightarrow$ `GPU 1`。
+路徑經過 2 條線路，因此 $N_{hops} = 2$。
+
+### 步驟 3: 計算
+代入公式 (假設軟體開銷已攤提)：
+
+$$T_{link} = \frac{25 \mu s}{2} = 12.5 \mu s$$
+
+### 結論
+在 `topology.txt` 中，鏈路延遲應設定為 **12.5 $\mu$s**。
+*   若直接填入 25 $\mu$s，模擬器會計算 $25 \times 2 = 50 \mu s$，導致模擬結果嚴重偏差。
+*   此 12.5 $\mu$s 為物理常數，當未來擴展至 128 節點 (Fat-Tree, 4 hops) 時，模擬器將自動計算 $12.5 \times 4 = 50 \mu s$，正確反映大規模網路的物理特性。
+
+---
+
 ## 完整工作流程
 
 完整的模擬流程分為三的獨立階段，對應 `src` 和 `scripts` 中的腳本：

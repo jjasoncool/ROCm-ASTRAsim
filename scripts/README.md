@@ -44,6 +44,22 @@ $$T_{link} = \frac{T_{RCCL} - T_{overhead}}{N_{hops}}$$
 ### 步驟 1: 測量
 在 AMD 雙 GPU 環境下，使用 `rccl-tests` (小封包) 測得端對端延遲 $T_{RCCL} \approx 25 \mu s$。
 
+此外，使用 `rocm-bandwidth-test` 測量記憶體頻寬，以決定 `lmbw` 參數。
+
+**測量結果 (rocm-bandwidth-test):**
+```text
+          RocmBandwidthTest Version: 2.6.0
+          Device: 1,  AMD Radeon RX 9070 XT
+          Device: 2,  AMD Radeon RX 9070 XT
+
+          Unidirectional copy peak bandwidth GB/s
+          D/D       1           2
+          1         540.849     14.045
+          2         14.046      540.064
+```
+由此可知，本地記憶體頻寬 (Local Memory Bandwidth) 約為 **540 GB/s**。
+因此，後續模擬指令中建議加入 `--lmbw 540` (預設為 1600)。
+
 ### 步驟 2: 分析
 拓撲為 `2_nodes_1_switch`。路徑為 `GPU 0` $\rightarrow$ `Switch` $\rightarrow$ `GPU 1`。
 路徑經過 2 條線路，因此 $N_{hops} = 2$。
@@ -115,6 +131,8 @@ $$T_{link} = \frac{25 \mu s}{2} = 12.5 \mu s$$
       --workload data/chakra/workload_et --model-tag cifar10 \
       --topo auto:1d \
       --phys-topo configs/astra-sim/topos/2_nodes_1_switch_topology.txt
+      --coll-opt localBWAware \
+      --lmbw 540
     ```
     *   校準結果會自動追加到 `runs/calibration_all.csv`。
 
@@ -136,17 +154,17 @@ $$T_{link} = \frac{25 \mu s}{2} = 12.5 \mu s$$
     python src/conver_to_chakra_et.py --model-tag resnet50
     ```
 
-3.  **虛擬擴展並執行大規模模擬**
-    *   使用 2-GPU 的 trace (`--workload`)，虛擬擴展到 128-GPU (`--virtual-world 128`)。
-    *   此模式下通常不進行校準 (`--no-autocalib`)，因為輸入 trace 的 world size (2) 與模擬 (128) 不同。
+3.  **基準校準 (Baseline Calibration - 建議)**
+    *   在擴展前，先在小規模 (2-GPU) 環境下驗證模擬準確度。
     ```bash
     python scripts/run_ns3.py \
       --workload data/chakra/workload_et --model-tag resnet50 \
-      --virtual-world 128 \
-      --topo auto:3d \
-      --phys-topo configs/astra-sim/topos/128_nodes_32_switch_topology.txt \
-      --no-autocalib
+      --topo auto:1d \
+      --phys-topo configs/astra-sim/topos/2_nodes_1_switch_topology.txt
+      --coll-opt localBWAware \
+      --lmbw 540
     ```
+    *   檢查 `runs/calibration_all.csv` 確認誤差 (ResNet50 通常 < 5%)。
 
 ---
 
@@ -206,3 +224,46 @@ $$T_{link} = \frac{25 \mu s}{2} = 12.5 \mu s$$
 4.  **儲存結果**:
     *   將本次模擬的完整參數、`real_t_*`、`sim_cycles_*` 和計算出的 `alpha_us` 存入 `out/metrics.csv`。
     *   將這筆紀錄追加到 `--calib-db` (預設 `runs/calibration_all.csv`) 中，方便後續分析比較。
+
+---
+
+## 4. 進階實驗：ResNet50 大規模擴展分析 (Scalability Analysis)
+
+本節說明如何基於已校準的 2-GPU ResNet50 模型，進行 128-GPU 的虛擬擴展模擬，並探討其學術價值。
+
+### 學術價值與實驗目的
+1.  **低成本架構探索 (Cost-effective Exploration)**:
+    *   建置 128 個高階 GPU 的實體叢集成本極高。透過 ASTRA-sim，我們僅需在 2 個 GPU 上採樣 (Profiling)，即可準確預測模型在數百個節點上的行為。
+2.  **瓶頸識別 (Bottleneck Identification)**:
+    *   ResNet50 雖為 Compute-Bound，但在大規模分佈式訓練下，All-Reduce 通訊開銷可能隨著節點數增加而成為瓶頸。此實驗可驗證目前的網路拓撲與頻寬是否足以支撐 128 節點的線性加速。
+3.  **協同設計 (HW/SW Co-design)**:
+    *   透過模擬結果，研究人員可以回答：「如果網路頻寬翻倍，訓練速度能提升多少？」或「更換 Switch 拓撲是否有助於效能？」，從而指導未來的硬體採購與資料中心設計。
+
+### 操作步驟
+
+#### 步驟 1: 確認校準基線 (Baseline Validation)
+在擴張前，需確認小規模 (2-GPU) 的模擬誤差在可接受範圍內。
+*   檢查 `runs/calibration_all.csv`。
+*   **ResNet50 範例**: 相對誤差 `rel_err_comm` < 2% 為優良基線，可進行擴張。
+*   **CIFAR-10 注意**: 若誤差過大 (e.g., > 50%)，代表 System Overhead 模型失準，不建議進行大規模擴張預測。
+
+#### 步驟 2: 執行虛擬擴張 (Virtual Expansion)
+使用 2-GPU 的 trace 驅動 128-GPU 的模擬環境。
+
+```bash
+# ResNet50: 2 GPUs -> 128 GPUs Expansion
+python scripts/run_ns3.py \
+  --workload data/chakra/workload_et --model-tag resnet50 \
+  --virtual-world 128 \
+  --topo auto:3d \
+  --phys-topo configs/astra-sim/topos/128_nodes_32_switch_topology.txt \
+  --no-autocalib \
+  --lmbw 540
+```
+
+#### 步驟 3: 分析加速比 (Speedup Analysis)
+模擬完成後，分析 `out/metrics.csv` 中的 `sim_t_step_ms` (每步模擬時間)。
+
+*   **理想時間 (Ideal Time)**: $T_{ideal} = T_{compute\_2gpu} / (128/2)$ (假設完美線性加速)
+*   **模擬時間 (Simulated Time)**: $T_{sim}$ (包含網路擁塞與通訊延遲)
+*   **通訊效率 (Efficiency)**: $\frac{T_{ideal}}{T_{sim}} \times 100\%$

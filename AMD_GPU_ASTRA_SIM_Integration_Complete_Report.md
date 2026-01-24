@@ -4,6 +4,147 @@
 
 針對 GPU 計算溝通效率進行論文分析與貢獻，主要改善 GPU 協作時的效率。本報告記錄了從 AMD GPU 兼容性問題發現、深入原始碼分析、到成功建立完整 ASTRA-sim 工具鏈的技術突破過程。
 
+## 📖 基礎架構定義與原理說明 (Architecture & Workflow Definitions)
+
+### 1. 軟體庫來源與定義 (Libraries Definition)
+
+- **CIFAR-10 Library**:
+  - **來源**: `torchvision.datasets`
+  - **用途**: 提供標準化的 CIFAR-10 資料集下載與載入功能。
+  - **程式碼**: `torchvision.datasets.CIFAR10(root=data_dir, ...)`
+
+- **ResNet Library**:
+  - **來源**: `torchvision.models`
+  - **用途**: 提供標準的 ResNet-50 模型架構。
+  - **修改**: 在本專案中 (`ResNet50ForCIFAR` 類別)，我們修改了第一層卷積層 (Conv1) 以適應 CIFAR-10 的小尺寸圖片 (32x32 像素)，並移除了 MaxPool 層以保留特徵細節。
+
+### 2. AMD GPU 環境設定與偵測
+
+- **環境建置**:
+  - 使用 **ROCm (Radeon Open Compute)** 軟體堆疊的 Docker 容器。
+  - 核心套件: `pytorch` (編譯為 ROCm 版本), `torchvision`, `rocm-smi` (監控工具)。
+
+- **如何偵測 AMD 卡**:
+  - PyTorch 在 ROCm 環境下會將 AMD GPU 對映為 `cuda` 介面。
+  - **程式呼叫**: `torch.cuda.is_available()` 回傳 True，`torch.cuda.get_device_name(0)` 會顯示 AMD 顯卡名稱 (如 `AMD Radeon RX 9070 XT`)。
+  - **Lib 呼叫設定**: `import torch` 自動載入 ROCm 後端。
+
+- **如何測試成功執行**:
+  - 執行指令: `torchrun --standalone --nproc_per_node=2 src/train_rocm_pytorch.py ...`
+  - 成功指標:
+    1. Console 顯示 `[Rank 0] World=2` (抓到兩張卡)。
+    2. `rocm-smi` 顯示兩張 GPU 使用率上升。
+    3. 產生 Trace 檔案 (`.json`) 於 `data/chakra/pytorch_traces/`。
+
+### 3. 模型與資料定義 (Model & Data Definitions)
+
+本研究設計了兩組對照實驗，統一採用 CIFAR-10 資料集作為輸入，但在模型架構上採用截然不同的配置。這分別代表了分散式訓練中的兩種極端負載情境：**延遲限制 (Latency-Bound)** 與 **頻寬限制 (Bandwidth-Bound)**。
+
+#### 3.1 實驗資料集與負載規格 (Dataset Specifications & Workload Profiles)
+
+為了評估系統在不同通訊粒度下的表現，我們定義了以下兩種實驗配置：
+
+* **實驗組 A：Simple CNN (Latency-Bound Benchmark)**
+    * **模型代號**: `cifar10` (對應程式碼中的 `CIFAR10_CNN` 類別)。
+    * **架構特性**: 淺層卷積網路，運算量極低。
+    * **負載特性**:
+        * **小封包通訊**: 由於模型參數少，產生的梯度資料量極小。
+        * **高頻觸發**: 單次迭代運算時間極短，導致 GPU 與 CPU 之間的同步 (Synchronization) 頻率極高。
+    * **驗證目的**: 用於壓力測試系統的 **啟動延遲 (Startup Latency)** 與驅動程式開銷 (Driver Overhead)。這是後續報告中出現較大模擬誤差的主要來源（系統開銷主導）。
+
+* **實驗組 B：ResNet-50 高負載配置 (Bandwidth-Bound Benchmark)**
+    * **模型代號**: `resnet50` (對應程式碼中的 `ResNet50ForCIFAR` 類別)。
+    * **架構特性**: 採用 ResNet-50 標準架構的參數量級 (約 2,550 萬參數)，但調整輸入層以適配 CIFAR-10 解析度。
+    * **負載特性**:
+        * **大封包通訊**: 基於標準 ResNet-50 參數估算，在單精度浮點數 (FP32) 下，其梯度交換的理論資料量約為 **97 MiB** 級別。
+        * **計算密集**: 較長的卷積運算時間使得通訊延遲 (Latency) 的影響被掩蓋，傳輸時間主要取決於頻寬。
+    * **驗證目的**: 用於驗證模擬器對 **網路頻寬 (Network Bandwidth)** 與 PCIe/xGMI 傳輸效率的建模準確度。這是後續報告中展現高精確度（誤差 < 2%）的實驗基礎。
+
+> **註**: 97 MiB 為基於標準 ResNet-50 參數計數 (Parameter Count) 的理論推估值 ($25.5 \times 10^6 \times 4 \text{ bytes} \div 1024^2 \approx 97.2 \text{ MiB}$)。實際傳輸量會因模型層數修改與通訊優化而產生些微差異。
+
+#### 3.2 基礎架構與模型修改 (Infrastructure & Modifications)
+
+* **軟體庫來源**:
+    * `torchvision.datasets.CIFAR10`: 用於標準化影像輸入 (32x32 pixel) 與預處理。
+    * `torchvision.models.resnet50`: 提供標準 ResNet-50 骨幹。
+* **模型適配 (Adaptation)**:
+    * 針對 ResNet-50，我們實作了 `ResNet50ForCIFAR` 類別，進行了以下關鍵修改以適應 32x32 的輸入尺寸：
+        1.  **修改卷積層**: 將第一層 `Conv1` 的 Kernel Size 由 7x7 縮減為 3x3，Stride 由 2 改為 1。
+        2.  **移除池化層**: 移除 `MaxPool` 層。
+    * **修改目的**: 防止特徵圖 (Feature Map) 在深層網路中因過度降採樣 (Downsampling) 而消失 (變為 1x1)，確保模型能進行有效運算並產生符合預期的通訊負載。
+
+#### 3.3 運算流程與通訊機制 (Execution Flow & Communication)
+
+在分散式資料平行 (DistributedDataParallel, DDP) 架構下，模型特性直接決定了通訊行為：
+
+1.  **前向傳播 (Forward Propagation)**:
+    * GPU 讀取批次影像進行特徵提取。ResNet-50 在此階段的運算時間遠高於 Simple CNN 基準模型。
+2.  **後向傳播 (Backward Propagation)**:
+    * **關鍵機制**: 系統計算損失函數對參數的梯度 (Gradients)。
+    * **通訊觸發**: 當梯度產生後，DDP 立即觸發 **AllReduce** 操作。
+    * **實驗差異**:
+        * **Simple CNN**: 頻繁觸發微小的 AllReduce，系統瓶頸在於 Handshake (握手) 時間。
+        * **ResNet-50**: 觸發巨量的 AllReduce，系統瓶頸在於 Link Bandwidth (連線頻寬)。
+
+### 4. 雙卡平行運算與通訊機制 (Dual-GPU Parallelism & Communication Mechanisms)
+
+本研究採用 **分散式資料平行 (Distributed Data Parallel, DDP)** 作為核心並行策略。此架構的效能瓶頸取決於「計算」與「通訊」之間的交互作用，這也是 ASTRA-sim 模擬的重點分析對象。
+
+#### 4.1 資料平行運作原理 (Operational Principles of DDP)
+
+* **模型複製與資料切分 (Model Replication & Data Sharding)**:
+    * 系統初始化時，兩張 GPU (Rank 0, Rank 1) 載入完全相同的模型權重。
+    * 訓練資料集透過 `DistributedSampler` 進行互斥切分，確保每個 Step 中各 GPU 讀取不同的資料子集 (Mini-batch)。
+* **獨立前向傳播 (Independent Forward Pass)**:
+    * 在前向傳播階段，各 GPU 獨立計算，無需進行任何通訊。此階段在 Trace 中表現為連續的計算核心 (Compute Kernels) 執行。
+
+#### 4.2 梯度同步與通訊觸發 (Gradient Synchronization & Triggering)
+
+在反向傳播 (Backward Pass) 階段，系統必須聚合所有 GPU 的梯度以更新參數。本研究關注以下關鍵機制：
+
+1.  **反向傳播掛鉤 (Backward Hooks)**:
+    * DDP 在每個模型參數 (Parameter) 上註冊了 Autograd Hook。
+    * 當某一層的梯度計算完成 (Gradient Ready) 時，該 Hook 會立即被觸發，標誌著該層參數已準備好進行同步。
+
+2.  **梯度桶裝機制 (Gradient Bucketing)**:
+    * **學術意義**: 為了避免對每個參數單獨發起 AllReduce (導致極高的啟動延遲/Latency Overhead)，DDP 將多個參數的梯度填入預先分配的緩衝區 (Bucket)。
+    * **觸發條件**: 當一個 Bucket 被填滿 (預設 25MB) 或反向傳播結束時，系統才會發起一次非同步的 **AllReduce** 通訊。
+    * **模擬器對應**: ASTRA-sim 讀取的 Trace 中，通訊節點 (Communication Node) 的大小即對應於這些 Bucket 的大小。
+        * *ResNet-50*: 產生少數且巨大的 Bucket (頻寬敏感)。
+        * *Simple CNN*: 由於參數量少，無法填滿 Bucket，導致通訊頻繁但封包細碎 (延遲敏感)。
+
+#### 4.3 集合通訊演算法 (Collective Communication Algorithm)
+
+* **AllReduce 操作**:
+    * **數學定義**: 對於第 $k$ 個參數，Rank $i$ 最終獲得的值為 $\theta_{final}^{(k)} = \frac{1}{N} \sum_{j=0}^{N-1} \theta_{j}^{(k)}$，其中 $N$ 為 GPU 總數。
+    * **拓撲實作**: 在 AMD ROCm 平台上，此操作透過 **RCCL (ROCm Communication Collectives Library)** 實作。
+    * **實體路徑**:
+        * 在雙卡環境下，資料透過 PCIe Gen4 x8 或 xGMI (Infinity Fabric) 直接互連傳輸。
+        * `run_ns3.py` 透過載入網路拓撲設定檔 (Network Topology)，模擬封包在這些實體鏈路上的排隊延遲 (Queuing Delay) 與傳輸時間 (Transmission Time)。
+
+#### 4.4 計算與通訊重疊 (Communication-Computation Overlap)
+
+* **效能關鍵**: 理想的分散式訓練應具備高度的重疊率。即在 GPU 計算第 $L$ 層梯度的同時，網路卡 (NIC/DMA) 正在傳輸第 $L+1$ 層的梯度。
+* **Trace 分析**:
+    * 我們的 `conver_to_chakra_et.py` 工具會保留原始 Trace 中的時間戳記與依賴關係。
+    * ASTRA-sim 執行時，會依據這些依賴關係模擬「計算」與「通訊」的並行執行。若通訊時間長於計算時間 (如 ResNet-50 在低頻寬網路下)，則會產生暴露通訊時間 (Exposed Communication Time)，這即是系統效能的損失。
+
+### 5. 模擬器 (Simulator) 角色與擴展
+
+- **模擬器做什麼 (ASTRA-sim/Chakra)**:
+  - **不執行運算**: 模擬器不真的跑 AI 計算。
+  - **模擬行為**: 讀取真實訓練錄製下來的 Trace (運算時間 + 通訊量)，模擬在不同網路環境 (頻寬、延遲、拓撲) 下的執行效率。
+  - **抓取內容**:
+    - **Compute Time**: 每個 Operator (如 Conv2d) 算多久。
+    - **Comm Size**: 每次 AllReduce 要傳多少資料。
+
+- **擴展方式 (Scaling)**:
+  - **模擬擴張**: 修改模擬設定檔 (`network.json`, `system.json`) 將節點數從 2 改為 8, 16, 128 等。
+  - **傳輸變化**:
+    - 隨著節點變多，AllReduce 需要更多次的資料交換與轉發。
+    - **Topology (拓撲)**: Ring, Mesh, Torus 等不同連接方式會導致資料傳輸路徑不同，產生不同的 **Latency (延遲)** 與 **Congestion (塞車)**。
+    - **ResNet Dataset App**: ResNet50 是一個運算較重、參數較多 (約 25MB) 的模型，相較於 CIFAR10 CNN，它對網路頻寬的需求更高，更能凸顯網路架構在擴展時的瓶頸。
+
 ## ❌ 核心技術挑戰
 
 ### 🔍 根本問題分析
@@ -23,7 +164,7 @@
 - 依賴關係過於嚴格造成死鎖
 - 統計處理階段掛起
 
-## � 深入原始碼分析發現
+## 深入原始碼分析發現
 
 ### ASTRA-sim 架構解析
 
@@ -78,96 +219,120 @@ string workload_filename = et_filename + "." + to_string(sys->id) + ".et";
 
 ### 🎯 策略 1: 整合式轉換工具 (`src/conver_to_chakra_et.py`)
 
-#### 核心創新: `--simple-astra` 模式
-我們成功將原有的轉換工具升級為一站式解決方案：
+#### 核心創新: 系統感知校準與模型標籤支援
+我們將轉換工具升級為支援多模型 (Multi-Model) 與系統校準 (System-Aware Calibration) 的一站式解決方案：
 
 ```python
-def create_astra_sim_et(comm_nodes: List[Dict], output_file: Path, rank: int) -> None:
-    """創建 ASTRA-sim 兼容的簡化 ET 檔案"""
-    with output_file.open("wb") as et:
-        # 1. 寫入標準 metadata
-        metadata = GlobalMetadata(version="0.0.4")
-        _encode_msg(et, metadata)
+# [New] 系統感知校準與 Compute Cycles 修復
+def add_compute_cycles_to_compute_nodes(..., force_avg_kernel_ns: float = None, tag: str = None):
+    """
+    為 ET 文件中的 COMPUTE 節點添加 compute_cycles 屬性
 
-        # 2. 創建真實通訊節點 (從 HDT 提取)
-        for i, comm_node in enumerate(comm_nodes):
-            node = Node()
-            node.id = i
-            node.name = f"AMD_GPU_COMM_{rank}_{i}"
-            node.type = COMM_COLL_NODE
+    策略 A: 基於 Trace 真實計算 (Compute-Bound, e.g., ResNet50)
+    - 從 device trace 提取實際 GPU kernel timing
+    - 計算平均值並轉換為 cycles
 
-            # 必要屬性
-            node.attr.append(AttributeProto(name="is_cpu_op", bool_val=False))
-            node.attr.append(AttributeProto(name="comm_type", int64_val=ALL_REDUCE))
-
-            # 從真實 trace 提取通訊大小
-            comm_size = extract_comm_size_from_node(comm_node)
-            node.attr.append(AttributeProto(name="comm_size", int64_val=comm_size))
-
-            # 智能依賴設計: 避免過度序列化
-            if i > 0:
-                node.data_deps.append(i - 1)  # 簡單鏈式依賴
-
-            _encode_msg(et, node)
+    策略 B: 強制校準 (System-Bound, e.g., CIFAR10)
+    - 對於小模型，System Overhead 佔據 99% 時間，直接使用 Trace 會導致模擬時間被低估
+    - 使用 --force-avg-kernel-ns 將 System Overhead 攤提回計算節點
+    """
+    if force_avg_kernel_ns is not None:
+        print(f"[fix-compute-cycles] ⚠️ 啟用系統感知強制校準 (System-Aware Calibration)")
+        estimated_cycles = int(force_avg_kernel_ns * actual_freq_ghz)
+        # ...
 ```
 
 #### 使用方式
 ```bash
-# 一鍵生成 ASTRA-sim 兼容版本
-python src/conver_to_chakra_et.py --et-dir data/chakra/workload_et/astra_sim --et-prefix astra_sim --simple-astra
+# 1. 標準模式 (ResNet50): 使用真實 Trace 數據
+python src/conver_to_chakra_et.py --model-tag resnet50 --default-gpu-freq 2935
 
-# 自動生成正確命名的檔案
-# astra_sim.0.et, astra_sim.1.et
+# 2. 校準模式 (CIFAR10): 強制指定 Kernel 時間以補償 System Overhead
+python src/conver_to_chakra_et.py --model-tag cifar10 --force-avg-kernel-ns 609000
+
+# 輸出: workload_et/workload.resnet50.0.et
 ```
 
-### 🔧 策略 2: AMD GPU 動態修補系統
+### 🔧 策略 2: AMD GPU 雙重動態修補系統 (Dual Monkey-Patching)
 
-#### 保持原有的 AMD GPU 支援
+我們發現單一修補不足以處理 AMD GPU 的所有情況，因此實作了雙重修補機制，分別針對「節點類型識別」與「通訊類型識別」進行攔截：
+
+#### 1. 節點類型修補 (Node Type Patching)
+Chakra 預設無法將 AMD 的 Generic Kernel 識別為通訊節點 (COMM_COLL_NODE)，導致它們被誤判為普通計算或被丟棄。
+
+```python
+def apply_amd_gpu_patch():
+    """修補 get_protobuf_node_type_from_json_node"""
+    def patched_get_node_type(self, json_node_map, json_node):
+        # [Fix] 將 AMD Generic Kernel 強制標記為集體通訊節點
+        if "ncclDevKernel_Generic" in json_node.name:
+            return COMM_COLL_NODE
+
+        # [Fix] 確保所有 NCCL 操作都被視為 GPU Kernel
+        if "nccl:" in json_node.name:
+            json_node.cat = "kernel"
+            return COMM_COLL_NODE
+
+        return original_method(self, json_node_map, json_node)
+
+    PyTorchConverter.get_protobuf_node_type_from_json_node = patched_get_node_type
+```
+
+#### 2. 通訊類型修補 (Comm Type Patching)
+當節點被識別為通訊節點後，還需要正確判斷它是 AllReduce、AllGather 還是其他類型。
+
 ```python
 def patch_collective_comm_type_for_amd():
-    """動態修補 Chakra 的 get_collective_comm_type 方法"""
-
-    def patched_get_collective_comm_type(self, name: str) -> int:
-        # 檢測 AMD GPU NCCL kernels
-        if "ncclDevKernel_Generic_4" in name:
-            print(f"[patch] 偵測到 AMD GPU NCCL Generic kernel: {name} -> ALL_REDUCE")
+    """修補 get_collective_comm_type"""
+    def patched_get_comm_type(self, name: str) -> int:
+        ln = name.lower()
+        # [Fix] 針對 AMD 格式進行寬鬆匹配 (Fuzzy Match)
+        if "nccldevkernel_generic" in ln or "nccldevkernel" in ln:
+            # 由於 Generic Kernel 不含類型資訊，預設回退為 ALL_REDUCE
             return ALL_REDUCE
-        elif "ncclDevKernel_Generic" in name:
-            return ALL_REDUCE
-
-        # 保持原有 NVIDIA GPU 支援
         return original_method(self, name)
 
-    # 運行時替換
-    PyTorchConverter.get_collective_comm_type = patched_get_collective_comm_type
+    PyTorchConverter.get_collective_comm_type = patched_get_comm_type
 ```
 
-### 🎯 策略 3: 依賴關係優化
+### 🎯 策略 3: DAG 依賴圖自動修復 (Auto DAG Repair)
 
 #### 問題根源分析
-原始複雜版本失敗的原因：
-1. **過度依賴鏈**: 50 個節點形成嚴格的序列依賴
-2. **Rank 不平衡**: rank 0 (50 nodes) vs rank 1 (46 nodes)
-3. **死鎖風險**: 複雜依賴可能導致某些 ranks 永遠無法完成
+原始版本失敗的主要原因並非「節點過多」，而是**依賴關係異常**：
+1. **循環依賴 (Cycles)**: A -> B -> A，導致模擬器死鎖。
+2. **無效依賴**: 指向不存在或已被移除的節點 ID。
+3. **不支援節點**: ASTRA-sim 不支援 CPU-side Compute 或 Metadata 節點，這些節點的存在會干擾排程。
 
-#### 解決策略: 智能簡化
+#### 解決策略: 就地圖形修復 (`fix_et_dag_inplace`)
+不再粗暴地刪除節點，而是智慧修復 DAG 結構，保留完整通訊模式：
+
 ```python
-# 檢測並簡化過多的通訊節點
-original_comm_count = len(comm_nodes)
-if len(comm_nodes) > 10:  # 避免過多節點
-    kept_comm_nodes = comm_nodes[:10]
-    print(f"[simple] 保留前 10 個通訊節點，移除 {len(comm_nodes) - 10} 個")
+def fix_et_dag_inplace(et_file: Path, break_cycles: bool = True, astra_sim_compat: bool = True):
+    """
+    就地修正 DAG 結構以符合 ASTRA-sim 要求：
+    1. ASTRA-sim 兼容性過濾: 移除 ProcessGroup/Metadata 與 CPU-side COMP 節點。
+    2. 依賴清理: 移除自依賴 (Self-Dependencies) 與無效 ID 引用。
+    3. 循環斷開 (Cycle Breaking): 使用 DFS 演算法檢測並移除 Back-edges。
+    4. 屬性補全: 自動補齊通訊節點缺失的 comm_size 或 group_id。
+    """
+    # ... (程式碼略) ...
+    if break_cycles:
+        # 使用 DFS 三色標記法 (White/Gray/Black) 檢測循環
+        # 遇到 Gray 節點表示發現 Back-edge，予以移除
+        pass
 ```
 
 ## 🧪 實驗驗證與性能分析
 
-### 📊 測試結果對比
+### 📊 測試結果對比 (ResNet-50 真實工作負載)
 
-| 測試版本 | 節點數 | 檔案大小 | 執行時間 | Wall Time (cycles) | Comm Time (cycles) | 狀態 |
-|----------|--------|----------|----------|-------------------|-------------------|------|
-| **標準 Microbenchmark** | 1 | 81 bytes | 0.2s | 62,148 | 62,148 | ✅ 成功 |
-| **AMD GPU 原始複雜版** | 50+46 | 13KB | >60s timeout | 未完成 | 未完成 | ❌ 掛起 |
-| **AMD GPU 簡化版** | 1+1 | 162 bytes | 0.2s | 62,148 | 62,148 | ✅ 成功 |
+我們使用最新的 ResNet-50 訓練 Trace 進行驗證，結果顯示該工具鏈已能處理大規模 Compute-Bound 任務。
+
+| 測試版本 | 模型 | 執行時間 | Wall Time (cycles) | Comm Time (cycles) | 狀態 |
+|----------|------|----------|-------------------|-------------------|------|
+| **標準 Microbenchmark** | N/A | 0.2s | 62,148 | 62,148 | ✅ 成功 |
+| **AMD GPU 原始複雜版** | ResNet50 | >60s | N/A (Deadlock) | N/A | ❌ 失敗 |
+| **AMD GPU 修復版** | ResNet50 | **39m 32s** | **274,982,000** | **2,242,680** | ✅ 成功 |
 
 ### 🔍 關鍵技術突破驗證
 
@@ -601,25 +766,19 @@ def patch_collective_comm_type_for_amd():
     PyTorchConverter.get_collective_comm_type = enhanced_get_collective_comm_type
 ```
 
-#### 2. 完整轉換工具鏈
-創建了 `amd_et_to_astra_sim.py` 轉換工具：
+#### 2. 完整轉換工具鏈 (已整合)
+我們將所有功能整合至 `src/conver_to_chakra_et.py`，不再需要獨立的轉換腳本：
 
 ```python
-def convert_amd_gpu_et_to_astra_sim(hdt_dir: str, output_dir: str, num_ranks: int = 2):
-    """將 AMD GPU HDT 檔案轉換為 ASTRA-sim 兼容格式"""
-
-    # 1. 從 HDT JSON 提取通訊節點
-    comm_nodes = extract_comm_nodes_from_hdt(hdt_file)
-
-    # 2. 轉換為 ASTRA-sim protobuf 格式
-    node = ChakraNode()
-    node.type = COMM_COLL_NODE
-    node.attr.append(ChakraAttr(name="is_cpu_op", bool_val=False))
-    node.attr.append(ChakraAttr(name="comm_type", int64_val=ALL_REDUCE))
-    node.attr.append(ChakraAttr(name="comm_size", int64_val=comm_size))
-
-    # 3. 使用 protobuf 序列化
-    encode_message(et, node)
+def main():
+    # ...
+    # 支援一鍵式轉換流程
+    if args.simple_astra:
+        create_astra_sim_et(comm_nodes, et, r)
+    else:
+        # 標準模式：完整轉換 + DAG 修復 + Cycle 校準
+        convert_hdt_to_et(...)
+        fix_et_dag_inplace(...)
 ```
 
 #### 3. ASTRA-sim 集成配置
@@ -681,10 +840,10 @@ PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 ### 📁 重要檔案位置
 
 ```
-✅ 主要轉換工具: src/conver_to_chakra_et.py (包含動態修補)
-✅ ASTRA-sim 轉換: src/amd_et_to_astra_sim.py
-✅ 測試檔案: /tmp/amd_simple_et/simple_amd.{0,1}.et
-✅ 完整資料: data/chakra/ (HDT + ET 檔案)
+✅ 主要轉換工具: src/conver_to_chakra_et.py (All-in-One 整合版)
+✅ 訓練程式: src/train_rocm_pytorch.py (產出 host/device traces)
+✅ 模擬腳本: scripts/run_ns3.py (ASTRA-sim 啟動器)
+✅ 完整資料: data/chakra/ (HDT + ET 檔案 + Logs)
 ```
 
 ## ⚠️ 發現的性能限制

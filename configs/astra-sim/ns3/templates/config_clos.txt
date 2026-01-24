@@ -3,13 +3,13 @@ USE_DYNAMIC_PFC_THRESHOLD 1
 
 PACKET_PAYLOAD_SIZE 1000
 
-TOPOLOGY_FILE ../../scratch/topology/128_nodes_16_switch_topology.txt
-FLOW_FILE ../../scratch/output/flow.txt
-TRACE_FILE ../../scratch/output/trace.txt
-TRACE_OUTPUT_FILE ../../scratch/output/mix.tr
-FCT_OUTPUT_FILE ../../scratch/output/fct.txt
-PFC_OUTPUT_FILE ../../scratch/output/pfc.txt
-QLEN_MON_FILE ../../scratch/output/qlen.txt
+TOPOLOGY_FILE /workspace/data/ASTRA-sim/scratch/topology/128_nodes_16_switch_topology.txt
+FLOW_FILE /workspace/data/ASTRA-sim/scratch/output/flow.txt
+TRACE_FILE /workspace/data/ASTRA-sim/scratch/output/trace.txt
+TRACE_OUTPUT_FILE /workspace/data/ASTRA-sim/scratch/output/mix.tr
+FCT_OUTPUT_FILE /workspace/data/ASTRA-sim/scratch/output/fct.txt
+PFC_OUTPUT_FILE /workspace/data/ASTRA-sim/scratch/output/pfc.txt
+QLEN_MON_FILE /workspace/data/ASTRA-sim/scratch/output/qlen.txt
 QLEN_MON_START 0
 QLEN_MON_END 20000
 
@@ -20,7 +20,7 @@ CC_MODE 12
 ALPHA_RESUME_INTERVAL 1
 RATE_DECREASE_INTERVAL 4
 CLAMP_TARGET_RATE 0
-RP_TIMER 900 
+RP_TIMER 900
 EWMA_GAIN 0.00390625
 FAST_RECOVERY_TIMES 1
 RATE_AI 50Mb/s

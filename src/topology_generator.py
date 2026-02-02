@@ -87,12 +87,13 @@ def write_json(filepath, data):
 def format_topology_content(total_nodes, switches, gpus, links):
     """
     格式化拓撲內容 (關鍵修正)
-    Line 1: Total_Nodes Switch_Count GPU_Count
+    Line 1: Total_Nodes Switch_Count Total_Links
     Line 2: Switch IDs (用空白分隔)
     Line 3+: Links
     """
     # Header
-    content = f"{total_nodes} {len(switches)} {len(gpus)}\n"
+    # 修正: 第三個參數必須是 len(links)，而非 len(gpus)
+    content = f"{total_nodes} {len(switches)} {len(links)}\n"
 
     # Line 2: List of Switch IDs (關鍵修正！)
     if switches:

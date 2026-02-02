@@ -942,10 +942,19 @@ def run_simulation(cmd: list, stdout_path: Path, logroot: Path) -> int:
         else:
             print(f"[DIAG] 通用錯誤，請檢查 {stdout_path} 獲取詳細資訊")
 
-        # 清理失敗的目錄
+        # 清理失敗的目錄：僅保留 stdout.log
         if logroot.exists():
-            shutil.rmtree(logroot)
-            print(f"[INFO] 執行失敗，已刪除 {logroot}")
+            try:
+                for item in logroot.iterdir():
+                    if item.name == "stdout.log":
+                        continue
+                    if item.is_dir():
+                        shutil.rmtree(item)
+                    else:
+                        item.unlink()
+                print(f"[INFO] 執行失敗，已刪除其他輸出，保留 {stdout_path}")
+            except Exception as cleanup_err:
+                print(f"[WARN] 清理失敗輸出時發生錯誤: {cleanup_err}")
 
         return e.returncode # 回傳非 0
 
@@ -1006,6 +1015,8 @@ def main():
     ap.add_argument("--trace-dir", default=None, help="覆蓋 traces 位置（預設為 ../data/chakra/pytorch_traces）")
     # [新增] 模型標籤
     ap.add_argument("--model-tag", type=str, default=None, help="模型標籤 (e.g., cifar10, resnet50)，用於選擇對應的 .et 與 trace")
+    # [新增這行] 除錯開關
+    ap.add_argument("--debug-ns3", action="store_true", help="啟用 NS-3 底層詳細 Log (用於偵測卡死)")
 
     args = ap.parse_args()
 
@@ -1104,6 +1115,13 @@ def main():
     # [修改] 傳入 tag
     workload_arg, workload_desc = build_workload_arg(workload_dir2, args.model_tag)
     print(f"[INFO] workload-configuration 以 {workload_desc}")
+
+    # ================= NS3 debug =================
+    if args.debug_ns3:
+        print("[DEBUG] 已啟用 NS-3 底層 Log (AstraSimNetwork=level_all)")
+        # 讓 NS-3 吐出每一個執行的函式名稱，證明它活著
+        os.environ["NS_LOG"] = "Node=level_info|prefix_func"
+    # ======================================================
 
     # 組指令
     cmd = [

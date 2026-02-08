@@ -43,10 +43,15 @@ PyTorch Trace 轉 Chakra ET 轉換工具 (AMD ROCm 增強版)
      處理 host_{rank}.json
      $ python src/conver_to_chakra_et.py
 
+  4. 【壓力測試模式】生成 All-to-All 合成負載
+     將原本的 AllReduce 替換為 All-to-All，用於測試 Twisted Torus 拓撲。
+     $ python src/conver_to_chakra_et.py --model-tag resnet50 --replace-comm all_to_all
+
 參數說明：
   --model-tag STR          : 指定模型標籤 (用於檔名過濾與輸出命名)
   --force-avg-kernel-ns INT: [校準用] 強制指定平均 Kernel 時間 (奈秒)，若設定則忽略 Trace 真實平均值
   --default-gpu-freq FLOAT : 預設 GPU 頻率 (MHz)，當找不到 metrics 檔案時使用
+  --replace-comm STR       : [壓力測試] 強制替換通訊模式 (目前支援: 'all_to_all')
   --no-clean               : 保留舊的輸出檔案
 """
 from __future__ import annotations
@@ -1139,6 +1144,66 @@ def map_comm_sizes_from_hdt_to_et(hdt_file: Path, et_file: Path) -> dict:
     return {'updated': updated, 'before_total': before_total, 'after_total': after_total}
 
 
+# --------------------------- [NEW] 通訊模式替換功能 ---------------------------
+
+def override_comm_type_inplace(et_file: Path, target_pattern: str) -> int:
+    """
+    [Synthetic Workload]
+    強制將 ET 中的集合通訊操作替換為指定的模式 (例如 All-to-All)。
+    用於生成網路壓力測試的合成負載。
+
+    Args:
+        et_file: ET 檔案路徑
+        target_pattern: 目標模式 ('all_to_all')
+
+    Returns:
+        替換的節點數量
+    """
+    print(f"[override] 正在將 {et_file.name} 的通訊模式替換為: {target_pattern.upper()}")
+
+    target_enum = None
+    if target_pattern == "all_to_all":
+        target_enum = ALL_TO_ALL
+    else:
+        print(f"[override] 未知的模式 {target_pattern}，跳過替換")
+        return 0
+
+    meta, nodes = _decode_et(et_file)
+    replaced_count = 0
+
+    for n in nodes:
+        # 檢查是否為集合通訊節點
+        if n.type == COMM_COLL_NODE:
+            # 尋找 comm_type 屬性
+            comm_attr = None
+            for attr in n.attr:
+                if attr.name == "comm_type":
+                    comm_attr = attr
+                    break
+
+            # 如果屬性存在且原本是 ALL_REDUCE，則替換
+            # (我們只替換 AllReduce，保留 Broadcast/AllGather 等其他操作，除非這就是目的)
+            if comm_attr:
+                current_val = comm_attr.int64_val
+                if current_val == ALL_REDUCE:
+                    comm_attr.int64_val = target_enum
+                    replaced_count += 1
+            else:
+                # 如果沒有 comm_type，強制添加並設為目標
+                new_attr = n.attr.add()
+                new_attr.name = "comm_type"
+                new_attr.int64_val = target_enum
+                replaced_count += 1
+
+    if replaced_count > 0:
+        _encode_et(et_file, meta, nodes)
+        print(f"[override] ✅ 成功將 {replaced_count} 個節點轉換為 {target_pattern.upper()}")
+    else:
+        print(f"[override] ⚠️ 沒有發現可替換的 AllReduce 節點")
+
+    return replaced_count
+
+
 # --------------------------- 主流程 ---------------------------
 
 def main():
@@ -1156,6 +1221,9 @@ def main():
     # [新增] 支援強制校準與模型標籤
     ap.add_argument("--force-avg-kernel-ns", type=float, default=None, help="System-Aware Calibration: 強制指定平均 Kernel 時間 (ns)")
     ap.add_argument("--model-tag", type=str, default=None, help="指定模型標籤 (e.g., cifar10, resnet50) 用於過濾檔案與命名輸出")
+    # [新增] 壓力測試參數
+    ap.add_argument("--replace-comm", type=str, default=None, help="[壓力測試] 強制替換通訊模式 (例如: all_to_all)")
+
     args = ap.parse_args()
 
     base   = Path(args.base_dir).resolve()
@@ -1177,6 +1245,8 @@ def main():
 
     print(f"========================================================")
     print(f"[Log] Log 記錄已啟動: {log_file}")
+    if args.replace_comm:
+        print(f"[Stress Test] ⚠️ 啟用通訊模式替換: ALL_REDUCE -> {args.replace_comm.upper()}")
     print(f"========================================================\n")
     # -----------------------
     if args.model_tag:
@@ -1225,6 +1295,11 @@ def main():
         # [修改] 輸出檔名也加上 tag (例如 workload.resnet50.0.et)
         prefix = infer_prefix_from_device(dev) if args.et_prefix == "auto" else args.et_prefix
         final_prefix = f"{prefix}.{args.model_tag}" if args.model_tag else prefix
+
+        # [新增] 若啟用替換模式，檔名加上後綴
+        if args.replace_comm == "all_to_all":
+            final_prefix += "_all2all"
+
         et  = et_dir / f"{final_prefix}.{r}.et"
 
         if et.exists() and not force:
@@ -1254,6 +1329,13 @@ def main():
                       f"unsupported={stats['unsupported_nodes_removed']}")
             except Exception as e:
                 print(f"[post-fix] DAG 修正失敗（{et.name}）：{e}")
+
+            # [新增] 執行通訊模式替換
+            if args.replace_comm:
+                try:
+                    override_comm_type_inplace(et, args.replace_comm)
+                except Exception as e:
+                    print(f"[override] 通訊模式替換失敗: {e}")
 
     print("\n[done] 轉換完成。請到以下資料夾查看輸出：", et_dir)
     print(f"[Log] 完整記錄已儲存至: {log_file}")

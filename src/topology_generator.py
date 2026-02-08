@@ -41,7 +41,7 @@ ASTRA-sim 拓撲與設定自動生成器 (Topology & Config Generator)
            --type fattree \
            --nodes 128 \
            --bw-intra 65Gbps --lat-intra 0.014ms \
-           --bw-inter 65Gbps --lat-inter 0.001ms
+           --bw-inter 65Gbps --lat-inter 0.005ms
 """
 
 import argparse

@@ -13,7 +13,7 @@
         "halvingDoubling"
     ],
     "all-to-all-implementation": [
-        "halvingDoubling"
+        "ring"
     ],
     "collective-optimization": "localBWAware",
     "local-mem-bw": 540,

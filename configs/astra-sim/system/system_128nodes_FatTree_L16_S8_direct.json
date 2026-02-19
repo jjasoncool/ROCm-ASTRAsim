@@ -4,24 +4,16 @@
     "active-chunks-per-dimension": 1,
     "preferred-dataset-splits": 4,
     "all-reduce-implementation": [
-        "ring",
-        "ring",
-        "ring"
+        "halvingDoubling"
     ],
     "all-gather-implementation": [
-        "ring",
-        "ring",
-        "ring"
+        "halvingDoubling"
     ],
     "reduce-scatter-implementation": [
-        "ring",
-        "ring",
-        "ring"
+        "halvingDoubling"
     ],
     "all-to-all-implementation": [
-        "ring",
-        "ring",
-        "ring"
+        "direct"
     ],
     "collective-optimization": "localBWAware",
     "local-mem-bw": 540,

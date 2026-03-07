@@ -347,6 +347,10 @@ def main():
         "--output", type=str, default="data/chakra/fixed_workload",
         help="修復後檔案的輸出目錄（預設：data/chakra/fixed_workload）"
     )
+    ap.add_argument(
+        "--prefix", type=str, default=None,
+        help="指定要檢查的檔案前綴 (例如: resnet50_all2all_1GB)"
+    )
     args = ap.parse_args()
 
     # 如果是修復模式，直接執行修復
@@ -364,6 +368,9 @@ def main():
     # 找所有 prefix.{num}.et 檔案，並依 {num} 數值排序（對應 rank）
     all_files = list(trace_dir.glob("*.et"))
     files = [p for p in all_files if PATTERN.match(p.name)]
+    # [新增] 如果有指定前綴，過濾掉不相關的檔案
+    if args.prefix:
+        files = [p for p in files if PATTERN.match(p.name).group(1) == args.prefix]
     files.sort(key=lambda p: int(PATTERN.match(p.name).group(2)))  # group(2) 是數字部分
 
     if not files:

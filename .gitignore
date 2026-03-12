@@ -1,3 +1,4 @@
+env/
 log/
 !data/ASTRA-sim/scratch/output/flow.txt
 data/chakra/*.et
@@ -16,3 +17,4 @@ __pycache__/
 data/chakra/pytorch_traces/*.json
 data/chakra/gpu_metrics/*.json
 data/chakra/workload_et/*.et
+thesis_figures/

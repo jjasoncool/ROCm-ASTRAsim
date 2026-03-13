@@ -285,6 +285,51 @@ def fig_5_4():
 
 
 # ============================================================
+# Fig 6.1: Cost Breakdown (Stacked Bar)
+# ============================================================
+def fig_6_1():
+    fig, ax = plt.subplots(figsize=(4.5, 3.5))
+
+    categories = ['Fat-Tree\n(L16\_S8)', 'Torus /\nTwisted Torus']
+    gpu    = [2.944, 2.944]
+    server = [3.600, 3.600]
+    nic    = [0.384, 0.384]
+    switch = [5.756, 0.000]
+
+    x = np.arange(len(categories))
+    width = 0.45
+    colors_cost = [C_ORANGE, C_BLUE, C_GREEN, C_RED]
+
+    ax.bar(x, gpu, width, label='GPU (128×RX 9070 XT)', color=colors_cost[0], edgecolor='black', linewidth=0.4)
+    ax.bar(x, server, width, bottom=gpu, label='Server platform (16×)', color=colors_cost[1], edgecolor='black', linewidth=0.4)
+    ax.bar(x, nic, width, bottom=[g+s for g, s in zip(gpu, server)], label='NIC (32×ConnectX-6 Lx)', color=colors_cost[2], edgecolor='black', linewidth=0.4)
+    ax.bar(x, switch, width, bottom=[g+s+n for g, s, n in zip(gpu, server, nic)], label='Switch (24×SN2700)', color=colors_cost[3], edgecolor='black', linewidth=0.4)
+
+    totals = [sum(t) for t in zip(gpu, server, nic, switch)]
+    for i, total in enumerate(totals):
+        ax.text(x[i], total + 0.15, f'NT\${total:.1f}M', ha='center', fontweight='bold', fontsize=9)
+
+    ax.axhline(y=10.0, color=C_GRAY, linestyle='--', linewidth=0.8)
+    ax.text(0.98, 10.25, 'NT\$10M budget', ha='right', fontsize=7, color=C_GRAY,
+            transform=ax.get_yaxis_transform())
+    ax.annotate('Switches = 45\%\nof total cost', xy=(0.22, 10.5), xytext=(0.55, 12.5),
+                fontsize=7, color=C_RED, fontweight='bold',
+                arrowprops=dict(arrowstyle='->', color=C_RED, lw=1))
+
+    ax.set_ylabel('Total Cost (NT\$ millions)')
+    ax.set_xticks(x)
+    ax.set_xticklabels(categories, fontsize=9)
+    ax.set_ylim(0, 14)
+    ax.legend(loc='upper right', fontsize=6, framealpha=0.9)
+    ax.set_title('Hardware Cost Breakdown (128 GPUs)')
+    plt.tight_layout()
+    plt.savefig(f'{outdir}/fig_6_1_cost.pdf')
+    plt.savefig(f'{outdir}/fig_6_1_cost.png')
+    plt.close()
+    print("  Fig 6.1 done")
+
+
+# ============================================================
 # Run all
 # ============================================================
 if __name__ == '__main__':
@@ -295,5 +340,6 @@ if __name__ == '__main__':
     fig_5_2()
     fig_5_3()
     fig_5_4()
-    print(f"\n=== All 5 figures generated in {outdir}/ ===")
+    fig_6_1()
+    print(f"\n=== All 6 figures generated in {outdir}/ ===")
     print("Each figure has both .pdf (for LaTeX/Word) and .png (for preview)")

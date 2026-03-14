@@ -1,204 +1,337 @@
-# ROCm ASTRA-sim：分散式深度學習網路模擬框架
+# ROCm-ASTRAsim: Trace-Driven Simulation Pipeline for AMD GPU AI Clusters
 
-本專案提供一個完整的工作流程，用於在 AMD ROCm GPU 環境下，從 PyTorch 分散式訓練中擷取性能追蹤，並轉換為 ASTRA-sim ns-3 網路模擬器可用的格式，以進行大規模網路拓撲的效能分析與研究。
+> [繁體中文](README_zh.md) | **English**
 
-## 核心功能
+> **Thesis:** *"Cost-Effective Twisted Torus for AI Training: An ASTRA-sim Evaluation Using Traces from Consumer-Grade AMD GPUs with ROCm"*
+> National Cheng Kung University (NCKU), Graduate Institute of Computer Science and Information Engineering, 2026
 
-*   **端到端工作流程**: 從 PyTorch/ROCm 訓練到 ASTRA-sim/ns-3 網路模擬的完整解決方案。
-*   **模型支援**: 內建支援 **CIFAR-10 (System-Bound)** 與 **ResNet-50 (Compute-Bound)** 兩種典型工作負載。
-*   **AMD ROCm 優化**:
-    *   透過 `rocm_compat.py` 監控真實 GPU 頻率。
-    *   在 `conver_to_chakra_et.py` 中動態修補 Chakra 以兼容 AMD GPU 的 trace 格式。
-*   **系統感知校準 (System-Aware Calibration)**:
-    *   專為 System-Bound 工作負載設計，透過 `--force-avg-kernel-ns` 將系統開銷（如 Kernel Launch Latency）攤提到計算節點，使模擬時間更貼近真實世界。
-*   **自動化模擬與校準**:
-    *   `run_ns3.py` 自動化拓撲生成、參數配置、虛擬擴展與模擬執行。
-    *   自動比對真實 trace 時間與模擬 cycles，計算校準因子 `alpha_us`，並彙總至 `runs/calibration_all.csv`。
+This repository implements a three-stage trace-driven simulation pipeline that — to the best of our knowledge — is one of the first publicly documented pipelines for collecting real training traces from **AMD ROCm/RCCL hardware** and feeding them into **ASTRA-sim** for cluster-scale AI network simulation.
 
-## 專案架構
+---
+
+## Repository Structure
 
 ```
 .
-├── rocm/
-│   └── dockerfile          # Docker 環境定義 (ROCm + PyTorch + ASTRA-sim)
 ├── src/
-│   ├── train_rocm_pytorch.py  # [階段 1] PyTorch 分散式訓練 + Kineto 追蹤生成
-│   ├── conver_to_chakra_et.py # [階段 2] Trace 轉換：JSON -> HDT -> Chakra ET
-│   └── rocm_compat.py         # ROCm 監控與兼容性工具
+│   ├── train_rocm_pytorch.py      # Stage 1 — DDP training + Kineto trace generation
+│   ├── conver_to_chakra_et.py     # Stage 2 — Kineto JSON → Chakra ET (with AMD patches)
+│   ├── scale_et_comm_workload.py  # Workload augmentation (All-to-All stress test)
+│   ├── topology_generator.py      # Torus/Twisted-Torus topology file generator
+│   └── rocm_compat.py             # ROCm GPU frequency monitor
 ├── scripts/
-│   └── run_ns3.py          # [階段 3] ASTRA-sim ns-3 模擬執行與校準
-├── configs/                # ASTRA-sim 基準設定檔
-├── data/
-│   ├── chakra/
-│   │   ├── pytorch_traces/ # (輸入) PyTorch Kineto 原始追蹤 (*.json)
-│   │   ├── gpu_metrics/    # (輸入) 訓練期間的 GPU 頻率紀錄
-│   │   └── workload_et/   # (輸出) Chakra ET 檔案 (*.et)
-│   └── cifar10/           # 訓練資料集
-├── runs/                   # 模擬結果與校準數據庫
-└── tutorials/              # 教學範例
+│   ├── run_ns3.py                 # Stage 3 — ASTRA-sim ns-3 orchestration + calibration
+│   ├── README.md                  # Calibration methodology and run_ns3.py reference
+│   └── commands.md                # Complete command reference for all experiments
+├── configs/astra-sim/
+│   ├── system/                    # ASTRA-sim system configs per topology
+│   ├── topos/                     # ns-3 physical topology files
+│   └── ns3/                       # ns-3 network parameter configs
+├── data/chakra/
+│   ├── pytorch_traces/            # (input) Kineto JSON traces from Stage 1
+│   ├── gpu_metrics/               # (input) GPU frequency records
+│   └── workload_et/               # (output) Chakra ET files (.et)
+├── docs/
+│   ├── astra-sim/                 # ASTRA-sim configuration documentation
+│   └── archive/                   # Development logs and debugging reports (historical)
+├── runs/                          # Simulation results + calibration_all.csv
+├── tutorials/                     # Academic tutorial materials (MICRO'24, ASPLOS'23)
+├── viz/                           # Interactive topology visualizer (3D Twisted Torus)
+├── rocm/dockerfile                # Docker environment (ROCm + PyTorch + ASTRA-sim)
+└── docker-compose.yaml
 ```
 
-## 三階段工作流程
+---
 
-### 階段 1：生成訓練追蹤 (`train_rocm_pytorch.py`)
+## Hardware Platform
 
-此腳本在 ROCm 環境下執行 PyTorch 分散式訓練，並使用 `torch.profiler` 生成 Kineto 格式的 host/device trace。
+All real-hardware measurements are performed on:
 
-**常用指令**:
+| Component | Specification |
+|---|---|
+| CPU | AMD Ryzen 7 5800X |
+| GPUs | 2× AMD Radeon RX 9070 XT (Navi 48, 16 GB GDDR6) |
+| GPU interconnect | PCIe Gen4 x8 (via host PCIe root complex) |
+| OS | Ubuntu 24.04 |
+| Container | `rocm/pytorch:rocm6.4.4_ubuntu24.04_py3.12_pytorch_release_2.7.1` |
+
+**Measured physical parameters:**
+
+| Parameter | Value | Method |
+|---|---|---|
+| Inter-node effective bandwidth | 65 Gbps | `rccl-tests` 512 MB AllReduce |
+| Per-link effective latency | 14 µs | `rccl-tests` 4 B + empirical calibration |
+| Local GPU memory bandwidth | 540 GB/s | `rocm-bandwidth-test` |
+
+> **Note on consumer GPU limitation:** AMD Radeon (RDNA) GPUs lack GPUDirect RDMA. All inter-node transfers are CPU-mediated (bounce-buffer through host RAM). The calibrated 14 µs effective latency absorbs this software-stack overhead rather than reflecting physical propagation delay.
+
+---
+
+## Three-Stage Pipeline
+
+### Stage 1 — Trace Collection (`src/train_rocm_pytorch.py`)
+
+Runs PyTorch DDP training with the Kineto profiler to generate per-rank `host_*.json` and `device_*.json` traces.
 
 ```bash
-# 生成 CIFAR-10 (System-Bound) 的 Trace
-# --model-tag 用於標記輸出檔案，方便後續階段識別
-torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
-  --model cifar10 --workers 0 \
-  --trace-wait 32 --trace-steps 4 \
-  --model-tag cifar10
-
-# 生成 ResNet-50 (Compute-Bound) 的 Trace
+# ResNet-50 (bandwidth-bound, primary calibration workload)
 torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
   --model resnet50 --workers 4 \
   --trace-wait 32 --trace-steps 2 \
   --model-tag resnet50
+
+# Simple CNN / CIFAR-10 (latency-bound, scope-boundary diagnostic)
+torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
+  --model cifar10 --workers 0 \
+  --trace-wait 32 --trace-steps 4 \
+  --model-tag cifar10
 ```
 
-**輸出**:
-*   `data/chakra/pytorch_traces/host_0_cifar10.json`, `device_0_cifar10.json`, ...
-*   `data/chakra/gpu_metrics/gpu_metrics_0_cifar10.json`, ...
+**Output:** `data/chakra/pytorch_traces/host_0_resnet50.json`, `device_0_resnet50.json`, …
 
-**提示**:
-*   `--inject-sync-hack`: 建議在 ROCm 環境下開啟此選項，它透過注入額外同步事件來解決 `chakra_trace_link` 可能發生的 CPU/GPU 時間軸對不齊問題，提升 trace 連結成功率。
+**Key flags:**
+- `--inject-sync-hack` — Inject extra sync events to stabilize `chakra_trace_link` on ROCm (recommended)
+- `--trace-steps 1–4` — Keep traces small; large traces (>5000 nodes) may cause ns-3 simulation hangs
 
-### 階段 2：轉換 Trace 為 Chakra ET (`conver_to_chakra_et.py`)
+### Stage 2 — Trace Conversion (`src/conver_to_chakra_et.py`)
 
-此腳本將 Kineto JSON trace 轉換為 ASTRA-sim 使用的 Chakra ET (`.et`) 格式，並包含 AMD GPU 兼容性修補。
+Converts Kineto JSON to Chakra ET (`.et`) format, applying **two AMD-specific patches** beyond the upstream HIP kernel recognition added in Chakra commit `df5204c`:
 
-**常用指令**:
+| Patch | Problem | Fix |
+|---|---|---|
+| **Patch 1 — RCCL node classification** | `ncclDevKernel_Generic` misidentified as `COMP_NODE` | Intercepts `get_protobuf_node_type_from_json_node` to classify all `ncclDevKernel_Generic*` variants as `COMM_COLL_NODE` |
+| **Patch 2 — RCCL collective type** | Generic kernel names carry no collective type info | Maps all `ncclDevKernel_Generic*` to `ALL_REDUCE` (correct for DDP workloads) |
+| **DAG repair pass** | Self-dependencies, cycles, dangling refs crash ASTRA-sim ETFeeder | DFS cycle detection + self-dep removal + dangling ref pruning |
 
 ```bash
-# 轉換 CIFAR-10 (啟用系統感知校準)
-# --force-avg-kernel-ns 將開銷攤提到計算節點，使模擬更真實
+# ResNet-50 — standard mode (use real kernel durations from trace)
+python ./src/conver_to_chakra_et.py --model-tag resnet50
+
+# CIFAR-10 — system-aware calibration mode
+# --force-avg-kernel-ns redistributes real step time back into compute nodes
 python ./src/conver_to_chakra_et.py \
   --model-tag cifar10 \
   --force-avg-kernel-ns 609000
-
-# 轉換 ResNet-50 (標準模式)
-# 不需攤提，直接依賴 trace 中的 kernel 時間
-python ./src/conver_to_chakra_et.py --model-tag resnet50
 ```
 
-**輸出**:
-*   `data/chakra/workload_et/workload.cifar10.0.et`, ...
-*   `data/chakra/workload_et/workload.resnet50.0.et`, ...
+**Output:** `data/chakra/workload_et/et.resnet50.0.et`, `et.resnet50.1.et`, …
 
-### 階段 3：執行網路模擬與校準 (`run_ns3.py`)
+### Stage 3 — Simulation (`scripts/run_ns3.py`)
 
-此腳本是模擬流程的總指揮，負責配置、執行與分析。
-
-**常用指令**:
+Orchestrates ASTRA-sim + ns-3, performing configuration generation, virtual scale-up, simulation execution, and automatic calibration.
 
 ```bash
-# [校準] 執行 2-GPU CIFAR-10 模擬，並自動校準 alpha_us
-# 腳本會自動尋找 pytorch_traces/*_cifar10.json 以獲取真實時間
-python ./scripts/run_ns3.py \
-  --workload data/chakra/workload_et --model-tag cifar10 \
-  --topo auto:1d \
-  --phys-topo configs/astra-sim/topos/2_nodes_1_switch_topology.txt
-
-# [模擬] 將 2-GPU ResNet-50 虛擬擴展到 128-GPU，並在 3D Mesh 拓撲上模擬
-# 大規模模擬通常不進行校準 (--no-autocalib)
+# 2-GPU calibration run (ResNet-50, ~39 min)
 python ./scripts/run_ns3.py \
   --workload data/chakra/workload_et --model-tag resnet50 \
-  --virtual-world 128 \
-  --topo auto:3d \
-  --phys-topo configs/astra-sim/topos/128_nodes_32_switch_topology.txt \
-  --no-autocalib
+  --topo auto:1d \
+  --phys-topo configs/astra-sim/topos/2_nodes_1_switch_topology.txt \
+  --coll-opt localBWAware --lmbw 540
+
+# 128-GPU Torus simulation
+python scripts/run_ns3.py \
+  --workload data/chakra/workload_et --model-tag resnet50 \
+  --topo file:configs/astra-sim/topos/logical_128nodes_Torus_4x4x8.json \
+  --phys-topo configs/astra-sim/topos/128nodes_Torus_4x4x8.txt \
+  --system configs/astra-sim/system/system_128nodes_Torus_4x4x8.json \
+  --virtual-world 128 --lmbw 540 --no-autocalib
+
+# 128-GPU Twisted Torus simulation
+python scripts/run_ns3.py \
+  --workload data/chakra/workload_et --model-tag resnet50 \
+  --topo file:configs/astra-sim/topos/logical_128nodes_TwistedTorus_4x4x8.json \
+  --phys-topo configs/astra-sim/topos/128nodes_TwistedTorus_4x4x8.txt \
+  --system configs/astra-sim/system/system_128nodes_TwistedTorus_4x4x8.json \
+  --virtual-world 128 --lmbw 540 --no-autocalib
+
+# 128-GPU Fat-Tree simulation
+python scripts/run_ns3.py \
+  --workload data/chakra/workload_et --model-tag resnet50 \
+  --topo file:configs/astra-sim/topos/logical_128nodes_FatTree_L16_S8.json \
+  --phys-topo configs/astra-sim/topos/128nodes_FatTree_L16_S8.txt \
+  --system configs/astra-sim/system/system_128nodes_FatTree_L16_S8.json \
+  --virtual-world 128 --lmbw 540 --no-autocalib
 ```
 
-**輸出**:
-*   `runs/<timestamp>_*_ns3_run/`: 包含 `stdout.log` 和 `out/metrics.csv` 的詳細執行結果。
-*   `runs/calibration_all.csv`: 所有校準運行的歷史紀錄資料庫，包含 `alpha_us` 等關鍵指標。
+See [scripts/commands.md](scripts/commands.md) for the complete command reference including All-to-All stress tests.
 
 ---
 
-## 🛠️ 工具深度解析
+## Calibration
 
-### `train_rocm_pytorch.py`
-此工具的核心是在 ROCm 環境下進行 PyTorch 分散式訓練，並精確地擷取性能追蹤。
+Calibration runs at 2-GPU scale and produces a factor α (µs/cycle) that maps simulation cycles to wall-clock time. Run it before any large-scale simulation to validate your specific hardware setup.
 
-*   **關鍵參數**:
-    *   `--model`: 選擇 `cifar10` (System-Bound) 或 `resnet50` (Compute-Bound)。
-    *   `--workers`: DataLoader 的工作執行緒數。設為 `0` 可放大 CPU System Overhead，用於研究 System-Aware Calibration。
-    *   `--trace-steps`: 指定要追蹤的訓練步數。建議設為 `1-4` 以避免 trace 檔案過大。
-    *   `--model-tag`: 為輸出檔案（trace, gpu_metrics）加上標籤，便於管理不同模型的實驗。
-    *   `--inject-sync-hack`: 透過注入額外同步事件，提高 ROCm 上 trace 連結的穩定性。
+- **ResNet-50 (bandwidth-bound):** < 2% relative communication error — pipeline is valid for this regime.
+- **CIFAR-10 (latency-bound):** ~91% error — software-stack overhead (RCCL handshake, kernel launch latency) dominates communication time and is not modeled by ASTRA-sim. **Do not use this pipeline for latency-dominated workloads.**
 
-### `conver_to_chakra_et.py`
-此工具負責將 PyTorch Kineto trace 轉換為 ASTRA-sim 相容的 Chakra ET 格式。
+The α value and per-run calibration results are logged to `runs/calibration_all.csv`. See [scripts/README.md](scripts/README.md) for the full calibration methodology.
 
-*   **關鍵參數**:
-    *   `--model-tag`: 讀取對應 tag 的 trace 檔案進行轉換。
-    *   `--force-avg-kernel-ns`: **系統感知校準**的關鍵。此參數會強制設定一個平均的 Kernel 執行時間（奈秒），將真實世界的系統開銷攤提到計算節點上。
-    *   `--default-gpu-freq`: 當 `gpu_metrics` 檔案不存在時，使用的預設 GPU 頻率。
+---
 
-### `scripts/run_ns3.py`
-此腳本是整個模擬流程的啟動器與控制器。
+## Topology Configurations
 
-*   **關鍵參數**:
-    *   `--workload` & `--model-tag`: 指定要模擬的 `.et` 工作負載。
-    *   `--virtual-world`: 將少量 GPU 的 trace（例如 2-GPU）虛擬擴展成大規模叢集（例如 128-GPU），自動調整通訊量。
-    *   `--topo` & `--phys-topo`: 分別定義 ASTRA-sim 的邏輯拓撲與 ns-3 的物理拓撲。
-    *   `--no-autocalib`: 禁用自動校準。在大規模虛擬擴展模擬時建議開啟。
-    *   `--calib-db`: 指定儲存所有校準結果的 CSV 檔案路徑。
+Three pre-configured topologies are provided for 128-node evaluation:
 
-## 🔧 進階配置
+| Parameter | Fat-Tree (L16_S8) | Torus (4×4×8) | Twisted Torus (4×4×8) |
+|---|---|---|---|
+| Physical switches | **24** | **0** | **0** |
+| Inter-node BW (Z-axis / intra-node) | 65 Gbps | 65 Gbps | 65 Gbps |
+| Inter-node BW (X/Y-axis / inter-node) | 65 Gbps | **25 Gbps** | **25 Gbps** |
+| Per-link latency | GPU→Leaf: 14 µs; Leaf→Spine: 5 µs | Z: 14 µs; X,Y: 5 µs | Z: 14 µs; X,Y: 5 µs |
+| Collective algorithm | halvingDoubling | ring × 3 | ring × 3 |
+| Twist (X wrap-around) | — | none | Y offset +1 |
 
-### Docker 環境
-若要使用特定版本的 ROCm 或 PyTorch，可以在啟動 `docker-compose` 時傳入環境變數：
-```bash
-# 範例：使用 ROCm 6.1 和 PyTorch 2.3.0
-VERSION=rocm6.1_ubuntu22.04_py3.10_pytorch_2.3.0 docker-compose up
+**Twisted Torus wiring** (X-axis wrap-around):
+```
+(x=3, y, z) → (x=0, (y+1) mod 4, z)
 ```
 
-### ASTRA-sim 配置
-所有 ASTRA-sim 的基準設定檔都位於 `configs/astra-sim/` 目錄下。`run_ns3.py` 在執行時會讀取這些檔案，並根據命令列參數（如 `--coll-opt`, `--buffer` 等）在 `runs/<timestamp>/tmp/` 目錄下生成一個 patch 過的版本，而不會修改原始設定檔。
+---
 
-*   `system/system.json`: 定義系統層行為，如 collective optimization 策略。
-*   `ns3/config.txt`: 定義 ns-3 網路層參數，如 PFC、QCN、緩衝區大小等。
-*   `topos/*.txt`: ns-3 使用的物理拓撲檔案。
+## All-to-All Stress Test (Workload Augmentation)
 
-## 🐛 常見問題 (FAQ)
+When running AllReduce with the original trace, communication is typically hidden by GPU computation and no topology difference is observable. To stress the network and expose topological differences, use `src/scale_et_comm_workload.py` to scale up communication volume.
 
-**Q: 訓練追蹤檔案 (`.json`) 為空或不完整？**
-A: 這通常是因為 `torch.profiler` 沒有足夠的時間來 warm-up 或擷取事件。請確保 `--trace-wait` 和 `--trace-steps` 的值足夠大。對於快速的迭代，`--trace-wait 32 --trace-steps 4` 是一個好的起點。
+### What it does
 
-**Q: 在 ROCm 上執行 `conver_to_chakra_et.py` 時，`chakra_trace_link` 失敗？**
-A: 這很可能是因為 CPU 和 GPU 的時間戳無法對齊。請在執行 `train_rocm_pytorch.py` 時加上 `--inject-sync-hack` 參數，這有助於提高連結成功率。
+`scale_et_comm_workload.py` reads an existing set of ET files (by prefix) and produces a new set with every `COMM_COLL_NODE` patched in-place:
 
-**Q: `run_ns3.py` 執行時出現 "Node ... not found in index" 錯誤？**
-A: 這個錯誤通常表示 `.et` 檔案的格式與 ASTRA-sim feeder 的版本不相容。請確認您使用的 Chakra 版本與 ASTRA-sim 的版本是匹配的。可以嘗試使用 `src/tests/validate_et.py` 進行基本格式檢查。
+1. **`comm_type`** → forced to `ALL_TO_ALL` (from the original `ALL_REDUCE`)
+2. **`comm_size`** → set to the specified byte count (e.g. 1 GB = 1,073,741,824 bytes)
 
-## 🧪 測試與驗證
+Original compute nodes and DAG structure are preserved unchanged, so the simulation still interleaves computation and communication realistically. Only the communication semantics and volume change.
 
-專案包含一系列測試腳本，以確保環境配置正確且各個工具鏈階段功能正常。
+### File naming
 
-```bash
-# 檢查 Python 環境與 Chakra/HTA 版本
-python ./src/tests/check_version.py
-
-# 檢查生成的 PyTorch trace 是否包含必要事件，適合轉換
-python ./src/tests/check_trace_ready.py
-
-# 驗證轉換後的 .et 檔案格式是否基本正確
-python ./src/tests/validate_et.py
+```
+Input:   et.<prefix>.<rank>.et        (e.g. et.resnet50_all2all.0.et)
+Output:  et.<prefix><suffix>.<rank>.et (e.g. et.resnet50_all2all_1GB.0.et)
 ```
 
-## 📚 教學範例
+The suffix is auto-generated from `--bytes` if `--suffix` is not specified:
 
-`tutorials/` 資料夾中包含了多個基於學術會議的完整教學範例，提供更深入的應用場景和練習。
+| `--bytes` | Auto-suffix |
+|---|---|
+| `1G` / `1073741824` | `_1GB` |
+| `128MB` / `128M` | `_128MB` |
+| `512K` | `_512KB` |
 
-探索 `tutorials/` 目錄中的完整範例：
-- **hoti2024/**: HOT Interconnects 2024 示範
-- **micro2024/**: MICRO 2024 研討會材料
-- **asplos2023/**: ASPLOS 2023 練習
+### Usage
 
-建議使用者在熟悉三階段工作流程後，進一步探索這些教學內容。
+```bash
+# Step 1 — convert the original ResNet-50 trace (if not done yet)
+python src/conver_to_chakra_et.py --model-tag resnet50_all2all
+
+# Step 2 — scale to 1 GB All-to-All (produces et.resnet50_all2all_1GB.*.et)
+python src/scale_et_comm_workload.py \
+  --workload-dir data/chakra/workload_et \
+  --prefix resnet50_all2all \
+  --bytes 1G
+
+# Step 3 — run simulations with the scaled workload (--payload 12000 to manage ns-3 event count)
+python scripts/run_ns3.py \
+  --workload data/chakra/workload_et \
+  --model-tag resnet50_all2all_1GB \
+  --topo file:configs/astra-sim/topos/logical_128nodes_TwistedTorus_4x4x8.json \
+  --phys-topo configs/astra-sim/topos/128nodes_TwistedTorus_4x4x8.txt \
+  --system configs/astra-sim/system/system_128nodes_TwistedTorus_4x4x8_direct.json \
+  --virtual-world 128 --payload 12000 --lmbw 540 --no-autocalib
+```
+
+> **Note:** The 1 GB All-to-All is a simulation-only stress test. It is not executable on physical hardware (a 128-node All-to-All at 1 GB per peer would require buffers far exceeding 16 GB VRAM). The tool is designed to saturate network links and expose topology differences in simulation.
+
+---
+
+## Environment Setup
+
+### Docker (recommended)
+
+```bash
+docker-compose up
+# or specify a specific ROCm/PyTorch version:
+VERSION=rocm6.4.4_ubuntu24.04_py3.12_pytorch_release_2.7.1 docker-compose up
+```
+
+### Environment Validation
+
+```bash
+# 1. Hardware layer
+rocm-bandwidth-test
+
+# 2. Communication layer
+rccl-tests/build/all_reduce_perf -b 512M -e 512M -f 2 -g 2
+
+# 3. Framework layer
+torchrun --standalone --nproc_per_node=2 src/train_rocm_pytorch.py --model resnet50 --epochs 1
+
+# 4. Trace format check
+python src/tests/check_trace_ready.py
+python src/tests/validate_et.py
+```
+
+---
+
+## Topology Visualizer
+
+An interactive 3D visualization of the Twisted Torus topology is available:
+
+```
+viz/twisted_torus_3d.html
+```
+
+Open in any browser to explore the 4×4×8 Twisted Torus wiring pattern.
+
+---
+
+## FAQ
+
+**Q: ns-3 simulation hangs indefinitely without any output?**
+A: This is caused by oversized ET files. Keep `--trace-steps` at 1–4 when generating traces. Files with >5000 nodes may exhaust ASTRA-sim's ETFeeder resources.
+
+**Q: `"Node X in ctrl_dep graph, but not found in index"` error from ASTRA-sim?**
+A: The ET file has a DAG integrity issue (self-dependency or cycle). Run `conver_to_chakra_et.py` again — the built-in DAG repair pass (`fix_et_dag_inplace`) should resolve this automatically.
+
+**Q: `chakra_trace_link` fails on ROCm with misaligned timestamps?**
+A: Add `--inject-sync-hack` to `train_rocm_pytorch.py`. This injects synchronization events to align CPU (ms) and GPU (µs) timestamps before trace linking.
+
+**Q: Why is CIFAR-10 calibration error ~91% while ResNet-50 is 1.18%?**
+A: CIFAR-10's shallow architecture completes computation so quickly that fixed software-stack overhead (kernel launch, RCCL handshake, ~25 µs) dominates communication time. ASTRA-sim models only network transfer time, not host-side OS overhead. ResNet-50's deep architecture produces enough compute time to render this overhead negligible. See thesis Section 4.3 for detailed analysis.
+
+---
+
+## Historical Development Reports
+
+Early-stage debugging and integration reports documenting issues encountered and resolved during pipeline development are preserved in [`docs/archive/`](docs/archive/). These are no longer relevant to normal usage but may be useful for understanding the AMD adaptation challenges.
+
+| File | Contents |
+|---|---|
+| [ASTRA-sim_Analysis_Report.md](docs/archive/ASTRA-sim_Analysis_Report.md) | Alpha calibration analysis, compute-cycle parsing issues, ns-3 hang investigation |
+| [AMD_GPU_ASTRA_SIM_Integration_Complete_Report.md](docs/archive/AMD_GPU_ASTRA_SIM_Integration_Complete_Report.md) | HIP runtime incompatibility, RCCL kernel naming, DAG repair — initial breakthrough report |
+
+---
+
+## Citation
+
+If you use this pipeline or the simulation results, please cite:
+
+```bibtex
+@mastersthesis{chen2026twisted,
+  author  = {jjasoncool},
+  title   = {Cost-Effective Twisted Torus for AI Training: An ASTRA-sim Evaluation
+             Using Traces from Consumer-Grade AMD GPUs with ROCm},
+  school  = {National Cheng Kung University},
+  year    = {2026},
+  note    = {Code available at \url{https://github.com/jjasoncool/ROCm-ASTRAsim}}
+}
+```
+
+---
+
+## Related Resources
+
+- [ASTRA-sim](https://github.com/astra-sim/astra-sim) — Distributed ML training simulator
+- [Chakra](https://github.com/mlcommons/chakra) — Execution Trace format by Meta
+- [ns-3](https://www.nsnam.org/) — Packet-level network simulator
+- [RCCL](https://github.com/ROCm/rccl) — ROCm Collective Communication Library
+- [rccl-tests](https://github.com/ROCm/rccl-tests) — RCCL micro-benchmarks
+- [TPU v4 paper](https://dl.acm.org/doi/10.1145/3579371.3589350) — Google's Twisted Torus reference (ISCA'23)

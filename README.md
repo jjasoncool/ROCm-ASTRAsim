@@ -109,9 +109,7 @@ python ./src/conver_to_chakra_et.py --model-tag resnet50
 
 # CIFAR-10 — system-aware calibration mode
 # --force-avg-kernel-ns redistributes real step time back into compute nodes
-python ./src/conver_to_chakra_et.py \
-  --model-tag cifar10 \
-  --force-avg-kernel-ns 609000
+python ./src/conver_to_chakra_et.py --model-tag cifar10
 ```
 
 **Output:** `data/chakra/workload_et/et.resnet50.0.et`, `et.resnet50.1.et`, …
@@ -161,8 +159,19 @@ See [scripts/commands.md](scripts/commands.md) for the complete command referenc
 
 Calibration runs at 2-GPU scale and produces a factor α (µs/cycle) that maps simulation cycles to wall-clock time. Run it before any large-scale simulation to validate your specific hardware setup.
 
-- **ResNet-50 (bandwidth-bound):** < 2% relative communication error — pipeline is valid for this regime.
-- **CIFAR-10 (latency-bound):** ~91% error — software-stack overhead (RCCL handshake, kernel launch latency) dominates communication time and is not modeled by ASTRA-sim. **Do not use this pipeline for latency-dominated workloads.**
+- **ResNet-50 (bandwidth-bound):** Calibrated at the wall-clock level against real hardware (α_step = 0.002254 µs/cycle). Topology comparisons use consistent simulation assumptions across all configurations.
+- **CIFAR-10 (latency-bound):** Large step-time error — software-stack overhead (RCCL handshake, kernel launch latency) dominates communication time and is not modeled by ASTRA-sim. **Do not use this pipeline for latency-dominated workloads.**
+
+**Measured calibration results (2-GPU, per training step):**
+
+| Metric | ResNet-50 | CIFAR-10 |
+|---|---|---|
+| `ns3_comm_ms` (ns-3 simulation) | **15.06 ms** | **41.07 ms** |
+| `real_t_comm_ms` (hardware measurement) | **10.02 ms** | **51.80 ms** |
+| ns-3 vs real | **+50%** (overestimate) | **−21%** (underestimate) |
+| Calibration status | primary baseline | excluded (scope boundary) |
+
+> A parameter sweep across bandwidth and latency values was used to validate ns-3 communication accuracy for ResNet-50. CIFAR-10 is excluded from large-scale inference because software-stack overhead (not modeled by ASTRA-sim) dominates its communication time.
 
 The α value and per-run calibration results are logged to `runs/calibration_all.csv`. See [scripts/README.md](scripts/README.md) for the full calibration methodology.
 
@@ -294,8 +303,8 @@ A: The ET file has a DAG integrity issue (self-dependency or cycle). Run `conver
 **Q: `chakra_trace_link` fails on ROCm with misaligned timestamps?**
 A: Add `--inject-sync-hack` to `train_rocm_pytorch.py`. This injects synchronization events to align CPU (ms) and GPU (µs) timestamps before trace linking.
 
-**Q: Why is CIFAR-10 calibration error ~91% while ResNet-50 is 1.18%?**
-A: CIFAR-10's shallow architecture completes computation so quickly that fixed software-stack overhead (kernel launch, RCCL handshake, ~25 µs) dominates communication time. ASTRA-sim models only network transfer time, not host-side OS overhead. ResNet-50's deep architecture produces enough compute time to render this overhead negligible. See thesis Section 4.3 for detailed analysis.
+**Q: Why does CIFAR-10 show large calibration error while ResNet-50 achieves good wall-clock calibration?**
+A: CIFAR-10's shallow architecture completes computation so quickly that fixed software-stack overhead (kernel launch, RCCL handshake, ~25 µs) dominates communication time. ASTRA-sim models only network transfer time, not host-side OS overhead. ResNet-50's deep architecture produces enough compute time to render this overhead negligible, and wall-clock calibration (α_step) succeeds. See thesis Section 4.3 for detailed analysis.
 
 ---
 

@@ -247,3 +247,48 @@ python scripts/run_ns3.py \
   --lmbw 540 \
   --no-autocalib
 ```
+
+## 128 nodes Torus all-to-all 512MB
+
+```bash
+python scripts/run_ns3.py \
+  --workload data/chakra/workload_et \
+  --model-tag resnet50_all2all_512MB \
+  --topo file:configs/astra-sim/topos/logical_128nodes_Torus_4x4x8.json \
+  --phys-topo configs/astra-sim/topos/128nodes_Torus_4x4x8.txt \
+  --system configs/astra-sim/system/system_128nodes_Torus_4x4x8_direct.json \
+  --virtual-world 128 \
+  --payload 12000 \
+  --lmbw 540 \
+  --no-autocalib
+```
+
+## 128 nodes Twisted Torus all-to-all 512MB
+
+```bash
+python scripts/run_ns3.py \
+  --workload data/chakra/workload_et \
+  --model-tag resnet50_all2all_512MB \
+  --topo file:configs/astra-sim/topos/logical_128nodes_TwistedTorus_4x4x8.json \
+  --phys-topo configs/astra-sim/topos/128nodes_TwistedTorus_4x4x8.txt \
+  --system configs/astra-sim/system/system_128nodes_TwistedTorus_4x4x8_direct.json \
+  --virtual-world 128 \
+  --payload 12000 \
+  --lmbw 540 \
+  --no-autocalib
+```
+
+## 128 nodes FatTree all-to-all 512MB
+
+```bash
+python scripts/run_ns3.py \
+  --workload data/chakra/workload_et \
+  --model-tag resnet50_all2all_512MB \
+  --topo file:configs/astra-sim/topos/logical_128nodes_FatTree_L16_S8.json \
+  --phys-topo configs/astra-sim/topos/128nodes_FatTree_L16_S8.txt \
+  --system configs/astra-sim/system/system_128nodes_FatTree_L16_S8_direct.json \
+  --virtual-world 128 \
+  --payload 12000 \
+  --lmbw 540 \
+  --no-autocalib
+```

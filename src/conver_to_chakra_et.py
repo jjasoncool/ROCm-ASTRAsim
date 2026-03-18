@@ -883,32 +883,74 @@ def extract_comm_nodes_from_hdt(hdt_file: Path) -> List[Dict]:
 
 
 def extract_comm_size_from_node(node: Dict) -> int:
-    """從節點中提取通訊大小（以字節為單位）"""
-    # 檢查 inputs 中的張量大小
+    """從節點中提取通訊大小（以字節為單位）
+
+    優先順序：
+    1. attrs 中的 in_msg_nelems × dtype_size（HDT record_param_comms 格式）
+    2. attrs 中的 comm_size（若已明確設定）
+    3. inputs.values 中的 tensor descriptor（格式: [storage_id, ptr, offset, nelems, dtype_code, device]）
+    4. 保底 1024 bytes
+    """
+    attrs = node.get('attrs', [])
+
+    # --- 優先：從 HDT attrs 讀取 in_msg_nelems ---
+    in_nelems = None
+    dtype_str = None
+    for attr in attrs:
+        if attr.get('name') == 'in_msg_nelems':
+            in_nelems = int(attr.get('value', 0))
+        elif attr.get('name') == 'dtype':
+            dtype_str = attr.get('value', '')
+        elif attr.get('name') == 'comm_size':
+            v = int(attr.get('value', 0))
+            if v > 0:
+                return v
+
+    if in_nelems and in_nelems > 0:
+        dtype_bytes = 4  # float32
+        if dtype_str:
+            dl = dtype_str.lower()
+            if 'half' in dl or 'float16' in dl or 'bf16' in dl or 'bfloat' in dl:
+                dtype_bytes = 2
+            elif 'double' in dl or 'float64' in dl:
+                dtype_bytes = 8
+        return in_nelems * dtype_bytes
+
+    # --- Fallback：從 inputs.values 的 tensor descriptor 提取 ---
+    # PyTorch tensor descriptor 格式: [storage_id, ptr, offset, nelems, dtype_code, "cuda:X"]
+    # 最後一個元素是 device string，倒數第二個是 dtype code，倒數第三個是 nelems
     inputs = node.get('inputs', {})
     values = inputs.get('values', [])
-    total_size = 0
+    total_nelems = 0
 
     for value in values:
-        if isinstance(value, list) and len(value) >= 4:
-            try:
-                # 計算張量大小 (假設 Float32 = 4 bytes)
-                shape_elements = 1
-                for dim in value[:-2]:  # 除了最後兩個元素（dtype, device）
-                    if isinstance(dim, int):
-                        shape_elements *= dim
-                tensor_size = shape_elements * 4
-                total_size += tensor_size
-            except (ValueError, TypeError):
-                total_size += 1024 * 1024  # 1MB 預設
+        # 處理巢狀 list: [[storage_id, ptr, offset, nelems, dtype_code, "cuda:0"]]
+        tensors = value if isinstance(value, list) else []
+        # 如果是 list of list（巢狀一層），展開
+        if tensors and isinstance(tensors[0], list):
+            tensors_to_check = tensors
+        elif isinstance(value, list) and len(value) >= 4 and isinstance(value[-1], str) and 'cuda' in str(value[-1]):
+            tensors_to_check = [value]
+        else:
+            continue
 
-    # 檢查屬性中是否有明確的大小信息
-    attrs = node.get('attrs', [])
-    for attr in attrs:
-        if attr.get('name') == 'comm_size':
-            return int(attr.get('value', total_size))
+        for td in tensors_to_check:
+            if (isinstance(td, list) and len(td) >= 4
+                    and isinstance(td[-1], str) and 'cuda' in td[-1]):
+                # PyTorch tensor descriptor: [tensor_id, storage_id, offset, nelems, elem_bytes, device]
+                # td[-3] = nelems, td[-2] = element size in bytes (e.g., 4 for float32)
+                try:
+                    nelems = int(td[-3])
+                    elem_bytes = int(td[-2])
+                    if nelems > 0 and 1 <= elem_bytes <= 8:
+                        total_nelems += nelems * elem_bytes
+                except (ValueError, TypeError, IndexError):
+                    pass
 
-    return max(total_size, 1024 * 1024)  # 至少 1MB
+    if total_nelems > 0:
+        return total_nelems
+
+    return 1024  # 保底 1KB
 
 
 def create_astra_sim_et(comm_nodes: List[Dict], output_file: Path, rank: int) -> None:
@@ -1329,6 +1371,17 @@ def main():
                       f"unsupported={stats['unsupported_nodes_removed']}")
             except Exception as e:
                 print(f"[post-fix] DAG 修正失敗（{et.name}）：{e}")
+
+            # [修正] 從 HDT 回填正確的 comm_size 到 ET
+            # 標準模式的 convert_hdt_to_et 可能因找不到 size_bytes 等屬性而 fallback 到 1024
+            # 此步驟使用 HDT 中的 in_msg_nelems 等欄位計算真實通訊量並寫回 ET
+            try:
+                size_stats = map_comm_sizes_from_hdt_to_et(hdt, et)
+                print(f"[comm-size] {et.name}: updated={size_stats['updated']}, "
+                      f"before={size_stats['before_total']} bytes, "
+                      f"after={size_stats['after_total']} bytes")
+            except Exception as e:
+                print(f"[comm-size] comm_size 回填失敗（{et.name}）：{e}")
 
             # [新增] 執行通訊模式替換
             if args.replace_comm:

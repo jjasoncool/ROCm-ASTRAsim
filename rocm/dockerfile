@@ -40,7 +40,9 @@ RUN pip install protobuf==5.29.0
 
 # 安裝 ASTRA-sim
 ENV ASTRA_SIM="/workspace/astra-sim"
-RUN git clone --recursive https://github.com/astra-sim/astra-sim.git ${ASTRA_SIM}
+RUN git clone --recursive https://github.com/astra-sim/astra-sim.git ${ASTRA_SIM} && \
+    cd ${ASTRA_SIM} && git checkout 28f18ea && \
+    git submodule update --init --recursive
 WORKDIR ${ASTRA_SIM}
 RUN ./build/astra_analytical/build.sh
 ENV ASTRA_SIM_BIN=${ASTRA_SIM}/build/astra_analytical/build/bin/AstraSim_Analytical_Congestion_Aware
@@ -56,12 +58,16 @@ RUN sed -i 's/\bformat(/fmt::format(/g' conf.h details/conf_impl.h details/templ
     && echo '#include <spdlog/fmt/fmt.h>' | cat - details/conf_impl.h > temp && mv temp details/conf_impl.h \
     && echo '#include <spdlog/fmt/fmt.h>' | cat - details/template_impl.h > temp && mv temp details/template_impl.h
 WORKDIR ${ASTRA_SIM}
+# [OPTIONAL DEBUG] Patch Statistics.cc to emit per-AllReduce timing logs.
+# Remove the two lines below for production builds.
+COPY patch_statistics_debug.py /tmp/
+RUN python3 /tmp/patch_statistics_debug.py ${ASTRA_SIM}/astra-sim/workload/Statistics.cc
 RUN ./build/astra_ns3/build.sh -c 2>&1 | tee /workspace/ns3_build_log.txt
 
 # 安裝 Chakra (從 astra-sim fork)
 # 修正 AMD GPU trace 無法被偵測的問題
 RUN git clone https://github.com/astra-sim/chakra.git /workspace/chakra && \
-    cd /workspace/chakra && \
+    cd /workspace/chakra && git checkout bf222b2 && \
     pip install --no-cache-dir .
 
 # https://github.com/mlcommons/chakra/issues/195

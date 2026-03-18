@@ -40,7 +40,7 @@ ASTRA-sim NS-3 網路模擬器執行腳本
 5. 校準管理：自動校準和資料庫維護
 """
 
-import argparse, json, math, os, re, subprocess, sys, time, shutil, csv, hashlib
+import argparse, json, math, os, re, subprocess, sys, time, shutil, csv, hashlib, shlex
 from pathlib import Path
 from statistics import median
 
@@ -70,6 +70,7 @@ CALIB_FIELDS = [
     'mode', 'tag', 'calib_id', 'world', 'logical_dims', 'topo_desc',
     'qcn', 'pfc_dyn', 'buffer', 'payload', 'coll_opt', 'lmbw',
     'alpha_us', 'alpha_comm_us', 'alpha_gpu_us', 'sim_cycles_step', 'sim_cycles_comm', 'sim_cycles_gpu', 'sim_t_step_ms', 'sim_t_comm_ms',
+    'ns3_comm_ms', 'ns3_rel_err_comm',
     'real_t_step_ms', 'real_t_comm_ms', 'real_t_net_comm_ms', 'real_t_kernel_ms', 'run_dir', 'rel_err_step', 'rel_err_comm', 'sim_t_comm_ms_comm', 'rel_err_comm_comm',
     'flags'  # 執行狀態標記（例如 comm_equals_wall_no_compute）
 ]
@@ -81,8 +82,10 @@ def list_et_rank_files(workload_dir: Path, tag: str = None) -> dict[int, Path]:
     for p in workload_dir.glob("*.et"):
         m = ET_PAT.match(p.name)
         if m:
-            # 新增過濾邏輯：若指定 tag，檔名必須包含該字串
-            if tag and tag not in m.group("prefix"):
+            # [Critical Bug Fix] 精確匹配 tag：使用 prefix == "et.{tag}"
+            # 原本邏輯 `tag not in prefix` 會誤匹配前綴包含 tag 字串的其他模型
+            # (例如 tag="net" 會錯誤匹配 "et.resnet50")，導致錯誤的 world size 計算
+            if tag and m.group("prefix") != f"et.{tag}":
                 continue
             files[int(m.group("rank"))] = p
     return dict(sorted(files.items()))
@@ -626,18 +629,26 @@ def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[
             if KINETO_STEP_PAT.match(name):
                 step_durations.append(d_ms)
 
-            # 邏輯：(名稱或分類包含通訊關鍵字) AND (不是 Kernel)
-            # KINETO_COMM_HINTS 包含了 'nccl', 'rccl', 'bytes', 'allreduce' 等
-            is_comm_candidate = any(h in lname for h in KINETO_COMM_HINTS) or any(h in lcat for h in KINETO_COMM_HINTS)
-            is_not_kernel = ('kernel' not in lname) and ('kernel' not in lcat)
+            # 邏輯：區分三類事件
+            # (a) NCCL/RCCL 通訊 kernel（如 ncclDevKernel_Generic_4）→ net_comm
+            # (b) 一般 GPU compute kernel（非 NCCL）→ kernel
+            # (c) CPU 端通訊 API 標記（如 nccl:all_reduce）→ net_comm
+            # 注意：AMD RCCL 的 ncclDevKernel cat=kernel，但它是通訊操作，不是計算
+            is_nccl_kernel = ('nccldevkernel' in lname or 'ncclkernel' in lname or 'rcclkernel' in lname)
 
-            if is_comm_candidate and is_not_kernel:
+            if is_nccl_kernel:
+                # (a) RCCL/NCCL 通訊 kernel → 計入 net_comm
                 net_ms_total += d_ms
-
-            # 3. 抓取 Kernel 時間 (計算)
-            # 包含 kernel category 或名字裡有 kenerl/nccldevkernel
-            if 'kernel' in lcat or 'nccldevkernel' in lname or 'devkernel' in lname:
+            elif 'kernel' in lcat:
+                # (b) 一般 GPU compute kernel → 計入 kernel
                 kernel_ms_total += d_ms
+            else:
+                # (c) 非 kernel 的通訊事件（如 nccl:all_reduce, user_annotation）
+                # 排除 CPU 端 DDP reducer 操作（reducer::mul_out 等含 'reduce' 但非通訊）
+                is_comm_candidate = any(h in lname for h in KINETO_COMM_HINTS) or any(h in lcat for h in KINETO_COMM_HINTS)
+                is_reducer_op = 'reducer' in lname
+                if is_comm_candidate and not is_reducer_op:
+                    net_ms_total += d_ms
 
         if step_durations:
             per_rank_step_medians.append(median(step_durations))
@@ -823,6 +834,23 @@ def export_metrics(out_dir: Path, row: dict) -> None:
         writer.writeheader()
         writer.writerow(row)
     print(f"[INFO] 指標輸出 → {csv_path}")
+
+
+def build_command_record(raw_argv: list[str], executed_cmd: list[str]) -> str:
+    """產生 command.txt 內容。
+
+    - original_command: 使用者實際輸入的 Python 指令（保留原始參數）
+    - executed_command: 程式內部展開後實際呼叫的 ns-3 指令
+
+    注意：shell 的換行反斜線無法從 Python 還原，因此 original_command
+    會以單行、shell-safe quoting 的形式保存。
+    """
+    original_cmd = " ".join(shlex.quote(arg) for arg in raw_argv)
+    executed_cmd_str = " ".join(shlex.quote(arg) for arg in executed_cmd)
+    return (
+        f"original_command: {original_cmd}\n"
+        f"executed_command: {executed_cmd_str}\n"
+    )
 
 # =============================================================================
 # [優化版] 模擬執行核心函式 (記憶體緩衝模式 - High Performance)
@@ -1147,7 +1175,11 @@ def main():
             raise SystemExit(f"[ERR] --comm-group 指定檔案不存在：{cg_path}")
         cmd.append(f"--comm-group-configuration={cg_path.as_posix()}")
 
-    (logroot / "command.txt").write_text(" ".join(cmd) + "\n", encoding="utf-8")
+    original_argv = [sys.executable or "python", *sys.argv]
+    (logroot / "command.txt").write_text(
+        build_command_record(original_argv, cmd),
+        encoding="utf-8"
+    )
     print("[CMD]", " ".join(cmd))
     if args.dry_run:
         print(f"[DRY] patched files at {tmp_dir}")
@@ -1242,6 +1274,16 @@ def main():
     if sim_cycles_gpu is not None and real_t_kernel_ms is not None:
         alpha_gpu_us = (real_t_kernel_ms * 1000.0) / max(1, sim_cycles_gpu)
 
+    # ---------- ns-3 直接通訊時間（不經過 alpha 轉換） ----------
+    # ASTRA-sim 的 CLOCK_PERIOD = 1ns，所以 sim_cycles_comm 的單位就是 nanoseconds
+    # 直接轉換成 ms，不需要任何 alpha 係數
+    ns3_comm_ms = None
+    ns3_rel_err_comm = None
+    if sim_cycles_comm is not None:
+        ns3_comm_ms = sim_cycles_comm / 1_000_000.0  # ns → ms
+        if real_t_comm_ms is not None and real_t_comm_ms > 0.01:
+            ns3_rel_err_comm = abs(ns3_comm_ms - real_t_comm_ms) / real_t_comm_ms
+
     # 使用通用 alpha 計算 sim_t_comm_ms
     sim_t_comm_ms = None
     if sim_cycles_comm is not None and alpha_us is not None:
@@ -1305,6 +1347,8 @@ def main():
         "sim_t_step_ms": f"{sim_t_step_ms:.6f}" if sim_t_step_ms is not None else "",
         "sim_t_comm_ms": f"{sim_t_comm_ms:.6f}" if sim_t_comm_ms is not None else "",
         "sim_t_comm_ms_comm": f"{sim_t_comm_ms_comm:.6f}" if sim_t_comm_ms_comm is not None else "",
+        "ns3_comm_ms": f"{ns3_comm_ms:.6f}" if ns3_comm_ms is not None else "",
+        "ns3_rel_err_comm": f"{ns3_rel_err_comm:.6f}" if ns3_rel_err_comm is not None else "",
         "real_t_step_ms": f"{real_t_step_ms:.6f}" if real_t_step_ms is not None else "",
         "real_t_comm_ms": f"{real_t_comm_ms:.6f}" if real_t_comm_ms is not None else "",
         "real_t_net_comm_ms": f"{real_t_net_comm_ms:.6f}" if real_t_net_comm_ms is not None else "",
@@ -1317,6 +1361,24 @@ def main():
         "rel_err_comm_comm": f"{rel_err_comm_comm:.6f}" if rel_err_comm_comm is not None else "",
         "flags": "|".join(flags) if flags else "",
     }
+
+    # ---------- 校準摘要（terminal 輸出，方便一眼判讀） ----------
+    if row["mode"] == "calibrate":
+        print("=" * 72)
+        print(f"  校準摘要 [{args.model_tag or 'unknown'}]")
+        print("-" * 72)
+        if real_t_step_ms is not None and alpha_us is not None:
+            print(f"  Wall-clock:  real = {real_t_step_ms:.2f} ms | α_step = {alpha_us:.6f} μs/cycle")
+        if ns3_comm_ms is not None and real_t_comm_ms is not None:
+            direction = "overestimate" if ns3_comm_ms > real_t_comm_ms else "underestimate"
+            err_pct = ns3_rel_err_comm * 100 if ns3_rel_err_comm is not None else float('nan')
+            print(f"  ns-3 通訊:   ns3 = {ns3_comm_ms:.2f} ms | real = {real_t_comm_ms:.2f} ms | "
+                  f"差距 = {err_pct:.1f}% ({direction})")
+            print(f"               (ns3 cycles = {sim_cycles_comm:,} ns，直接轉 ms，不經 α_step)")
+        if sim_t_comm_ms is not None and real_t_comm_ms is not None:
+            print(f"  [診斷] α_step 轉換通訊 = {sim_t_comm_ms:.2f} ms（← 用錯時鐘，僅供參考）")
+        print("=" * 72)
+
     export_metrics(out_dir, row)
 
     # 若是 2-GPU 且有實測，就把校準資訊追加到共用的 runs/calibration_all.csv（去重）

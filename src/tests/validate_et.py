@@ -428,7 +428,12 @@ def main():
 
             if detailed_info['comm_sizes']:
                 avg_comm = sum(detailed_info['comm_sizes']) / len(detailed_info['comm_sizes'])
-                print(f"      平均通訊大小: {avg_comm:,.0f} bytes ({avg_comm/1024/1024:.1f} MB)")
+                min_comm = min(detailed_info['comm_sizes'])
+                max_comm = max(detailed_info['comm_sizes'])
+                print(f"      平均通訊大小: {avg_comm:,.0f} bytes ({avg_comm/1024/1024:.2f} MiB)")
+                print(f"      最小通訊大小: {min_comm:,.0f} bytes ({min_comm/1024/1024:.2f} MiB)")
+                print(f"      最大通訊大小: {max_comm:,.0f} bytes ({max_comm/1024/1024:.2f} MiB)")
+                print(f"      各 bucket 大小: {', '.join(f'{s/1024/1024:.2f} MiB' for s in detailed_info['comm_sizes'])}")
 
             if detailed_info['timing_info']:
                 total_time = sum(t['duration'] for t in detailed_info['timing_info'])

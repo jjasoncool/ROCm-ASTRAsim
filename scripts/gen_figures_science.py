@@ -116,6 +116,13 @@ WALL_A2A_100MB = {
     'Twisted Torus':  274_982_000,
 }
 
+# All-to-All 512MB
+WALL_A2A_512MB = {
+    'Fat-Tree':       879_553_198,
+    'Std. Torus':     1_523_300_236,
+    'Twisted Torus':  1_288_871_156,
+}
+
 # All-to-All 1GB
 WALL_A2A_1GB = {
     'Fat-Tree':       1_886_164_000,
@@ -288,52 +295,94 @@ def fig_5_2():
 # (was Fig 5.5; old Fig 5.3 3-panel bar chart deleted as redundant)
 # ============================================================
 def fig_5_3():
-    fig, ax = plt.subplots(figsize=(4.5, 3.0))
+    fig, ax1 = plt.subplots(figsize=(4.5, 3.2))
 
     # X-axis: comm_size labels (not linear scale — use categorical)
-    comm_sizes = ['AllReduce\n(~90 MiB)', '100 MB\nAll-to-All', '1 GB\nAll-to-All']
+    comm_sizes = ['AllReduce\n(~90 MiB)', '100 MB\nAll-to-All', '512 MB\nAll-to-All', '1 GB\nAll-to-All']
     x = np.arange(len(comm_sizes))
 
     topos = ['Fat-Tree', 'Std. Torus', 'Twisted Torus']
     data = {
         'Fat-Tree':       [WALL_ALLREDUCE['Fat-Tree'],
                            WALL_A2A_100MB['Fat-Tree'],
+                           WALL_A2A_512MB['Fat-Tree'],
                            WALL_A2A_1GB['Fat-Tree']],
         'Std. Torus':     [WALL_ALLREDUCE['Std. Torus'],
                            WALL_A2A_100MB['Std. Torus'],
+                           WALL_A2A_512MB['Std. Torus'],
                            WALL_A2A_1GB['Std. Torus']],
         'Twisted Torus':  [WALL_ALLREDUCE['Twisted Torus'],
                            WALL_A2A_100MB['Twisted Torus'],
+                           WALL_A2A_512MB['Twisted Torus'],
                            WALL_A2A_1GB['Twisted Torus']],
     }
 
+    # --- Wall time lines (left Y-axis) ---
     markers = ['s', '^', 'o']
     for i, topo in enumerate(topos):
         ms = [c * alpha_us / 1000 for c in data[topo]]
-        ax.plot(x, ms, color=TOPO_COLORS[i], marker=markers[i],
+        ax1.plot(x, ms, color=TOPO_COLORS[i], marker=markers[i],
                 label=TOPO_LABELS_SHORT[i], linewidth=1.2, markersize=5, zorder=3)
 
     # GPU compute baseline
     gpu_ms = GPU_CYCLES * alpha_us / 1000
-    ax.axhline(y=gpu_ms, color=C_GRAY, linestyle=':', linewidth=0.8, zorder=2)
-    ax.text(1.02, gpu_ms, f'GPU compute\n({gpu_ms:.0f} ms)',
+    ax1.axhline(y=gpu_ms, color=C_GRAY, linestyle=':', linewidth=0.8, zorder=2)
+    ax1.text(1.02, gpu_ms, f'GPU compute\n({gpu_ms:.0f} ms)',
             fontsize=6, color=C_GRAY, va='center',
-            transform=ax.get_yaxis_transform(), clip_on=False)
+            transform=ax1.get_yaxis_transform(), clip_on=False)
 
     # Tipping point annotation
     torus_100mb_ms = WALL_A2A_100MB['Std. Torus'] * alpha_us / 1000
-    ax.annotate('Torus exceeds\ncompute window',
-                xy=(1, torus_100mb_ms), xytext=(0.3, 1800),
+    ax1.annotate('Torus exceeds\ncompute window',
+                xy=(1, torus_100mb_ms), xytext=(-0.15, 1200),
                 fontsize=6, color=C_RED,
                 arrowprops=dict(arrowstyle='->', color=C_RED, lw=0.8))
 
-    ax.set_ylabel('Wall Time (ms)')
-    ax.set_xticks(x)
-    ax.set_xticklabels(comm_sizes, fontsize=7)
-    ax.set_xlim(-0.3, 2.7)
-    ax.set_ylim(0, 7500)
-    ax.legend(loc='upper left', fontsize=7, framealpha=0.9)
-    ax.set_title('Topology Divergence vs. Communication Volume\n(128 nodes)')
+    ax1.set_ylabel('Wall Time (ms)')
+    ax1.set_ylim(0, 7500)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(comm_sizes, fontsize=7)
+    ax1.set_xlim(-0.3, 3.5)
+    ax1.set_title('Topology Divergence vs. Communication Volume (128 nodes)')
+
+    # --- Improvement ratio (right Y-axis) ---
+    ax2 = ax1.twinx()
+    C_RATIO = '#7B68EE'  # Purple — distinct from topology colors
+
+    ratio = []
+    for j in range(len(comm_sizes)):
+        to_val = data['Std. Torus'][j]
+        tw_val = data['Twisted Torus'][j]
+        if tw_val > 0 and to_val != tw_val:
+            ratio.append(to_val / tw_val)
+        else:
+            ratio.append(1.0)
+
+    ax2.plot(x, ratio, color=C_RATIO, marker='D', linewidth=1.0,
+             markersize=4, linestyle='--', zorder=4, alpha=0.8,
+             label='Torus/Twisted ratio')
+    ax2.fill_between(x, 1.0, ratio, color=C_RATIO, alpha=0.12, zorder=1)
+    ax2.axhline(y=1.0, color=C_GRAY, linestyle='--', linewidth=0.4, zorder=1, alpha=0.3)
+
+    # Annotate non-1.0 ratio points (left of markers)
+    offsets = {1: (-0.3, 0.015), 2: (-0.35, 0.015), 3: (0, 0.015)}
+    for j in [1, 2, 3]:
+        if ratio[j] > 1.001:
+            dx, dy = offsets[j]
+            ax2.annotate(f'{ratio[j]:.2f}\\texttimes' if plt.rcParams.get('text.usetex', False) else f'{ratio[j]:.2f}x',
+                         xy=(x[j], ratio[j]),
+                         xytext=(x[j] + dx, ratio[j] + dy),
+                         fontsize=7, fontweight='bold', color=C_RATIO)
+
+    ax2.set_ylabel('Std. Torus / Twisted Torus', fontsize=8, color=C_RATIO)
+    ax2.set_ylim(1.0, 1.30)
+    ax2.tick_params(axis='y', labelcolor=C_RATIO, labelsize=7)
+
+    # Merge legends from both axes
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=6.5, framealpha=0.9)
+
     plt.tight_layout()
     plt.savefig(f'{outdir}/fig_5_3_sweep.pdf')
     plt.savefig(f'{outdir}/fig_5_3_sweep.png')

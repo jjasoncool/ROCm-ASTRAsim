@@ -256,22 +256,27 @@ def _explain_device_fail(cnt: Dict[str,int]) -> List[str]:
         msgs.append("看不到 kernel/運算類事件（裝置端事件可能缺失，請檢查 ROCm/PyTorch 環境）")
     return msgs
 
-def discover_ranks(traces_dir: Path, ranks_arg: str) -> List[int]:
+def discover_ranks(traces_dir: Path, ranks_arg: str, tag: str = None) -> List[int]:
     if ranks_arg != "auto":
         return [int(x) for x in ranks_arg.split(",") if x.strip() != ""]
     ranks = set()
-    for p in traces_dir.glob("host_*.json"):
-        m = re.search(r"host_(\d+)\.json$", p.name)
-        if m: ranks.add(int(m.group(1)))
-    for p in traces_dir.glob("device_*.json"):
-        m = re.search(r"device_(\d+)\.json$", p.name)
-        if m: ranks.add(int(m.group(1)))
+    # 支援帶 tag 的檔名：host_{rank}_{tag}.json 和不帶 tag 的：host_{rank}.json
+    suffix = f"_{tag}" if tag else ""
+    for p in traces_dir.glob(f"host_*{suffix}.json"):
+        parts = p.stem.split('_')
+        if len(parts) >= 2 and parts[1].isdigit():
+            ranks.add(int(parts[1]))
+    for p in traces_dir.glob(f"device_*{suffix}.json"):
+        parts = p.stem.split('_')
+        if len(parts) >= 2 and parts[1].isdigit():
+            ranks.add(int(parts[1]))
     return sorted(ranks)
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--traces-dir", type=str, default=str(Path(__file__).resolve().parents[2] / "data" / "chakra" / "pytorch_traces"))
     ap.add_argument("--ranks", type=str, default="auto", help="例如 '0,1' 或 'auto'")
+    ap.add_argument("--model-tag", type=str, default=None, help="模型標籤 (例如: qwen05b, resnet50, llama1b)")
     args = ap.parse_args()
 
     traces_dir = Path(args.traces_dir)
@@ -279,8 +284,11 @@ def main():
         print(f"[error] 找不到目錄：{traces_dir}")
         sys.exit(1)
 
-    ranks = discover_ranks(traces_dir, args.ranks)
+    tag = args.model_tag
+    ranks = discover_ranks(traces_dir, args.ranks, tag=tag)
     print(f"[info] 檢查目錄：{traces_dir}")
+    if tag:
+        print(f"[info] model-tag = {tag}")
     print(f"[info] ranks = {ranks if ranks else '[]'}\n")
     if not ranks:
         sys.exit(1)
@@ -298,8 +306,9 @@ def main():
 
     ok_all = True
     for r in ranks:
-        host = traces_dir / f"host_{r}.json"
-        dev  = traces_dir / f"device_{r}.json"
+        suffix = f"_{tag}" if tag else ""
+        host = traces_dir / f"host_{r}{suffix}.json"
+        dev  = traces_dir / f"device_{r}{suffix}.json"
         print(f"[Rank {r}]")
 
         # ---------- host ----------

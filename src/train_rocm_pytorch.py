@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CIFAR-10 Training Framework for ROCm (AMD GPU) with Distributed Profiling
+CIFAR-10 / LLM Training Framework for ROCm (AMD GPU) with Distributed Profiling
 (Chakra-compatible; aligned with standard practice)
 
 TRACE 檔案大小優化建議：
@@ -49,7 +49,19 @@ Usage Examples for Thesis Experiments:
      --trace-wait 32 --trace-steps 2 \
      --inject-sync-hack
 
-3. 【快速除錯模式】(Quick Check)
+3. 【論文實驗 C：LLM Trace Collection】(Qwen2.5-0.5B)
+   - 目的：收集現代 LLM 的 DDP 通訊 trace，量化 per-collective comm_size。
+   - 特性：500M 參數，FP32 gradient ≈ 2 GB，足以落在 topology full-divergence regime。
+   - 注意：batch-size=1, workers=0, seq-len 建議 256。
+
+   torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
+     --model qwen05b \
+     --epochs 3 --batch-size 4 --workers 0 \
+     --seq-len 256 \
+     --trace-wait 10 --trace-steps 2 \
+     --inject-sync-hack
+
+4. 【快速除錯模式】(Quick Check)
    - 目的：快速確認 Trace Linker 與 AMD Patch 是否正常運作，不產生龐大檔案。
 
    torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
@@ -74,6 +86,7 @@ Usage Examples for Thesis Experiments:
 """
 
 import os
+import sys
 import argparse
 import time
 import json
@@ -96,6 +109,31 @@ from torch.profiler import ExecutionTraceObserver
 from torch._C._profiler import _ExperimentalConfig
 
 from rocm_compat import ROCmCompat, GPUFrequencyInfo
+
+# --- LLM 支援 ---
+try:
+    from transformers import AutoModelForCausalLM, AutoConfig
+    HAS_TRANSFORMERS = True
+except ImportError:
+    HAS_TRANSFORMERS = False
+    print("[warn] transformers not installed. LLM models (qwen05b, llama1b) unavailable.")
+    print("[warn] Install with: pip install transformers accelerate sentencepiece --break-system-packages")
+
+# ---------- Log 輸出（同時導向終端與檔案） ----------
+class Logger(object):
+    """將輸出同時導向終端機與檔案的輔助類別 (Tee)，與 conver_to_chakra_et.py 共用設計。"""
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.log = open(filename, "w", encoding="utf-8")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
 
 # ---------- 檔案穩定 / host JSON 拼接修復 ----------
 def _wait_file_stable(p: Path, tries: int = 10, sleep_s: float = 0.05) -> None:
@@ -264,6 +302,25 @@ class ResNet50ForCIFAR(nn.Module):
     def forward(self, x):
         return self.resnet(x)
 
+class DummyLLMDataset(torch.utils.data.Dataset):
+    """
+    隨機 token dataset，用於 LLM trace collection。
+    不需要真實文本——我們只需要 forward/backward 的通訊 pattern。
+    gradient size 只取決於模型參數量和 dtype，跟輸入內容無關。
+    """
+    def __init__(self, vocab_size=32000, seq_len=256, num_samples=1000):
+        self.vocab_size = vocab_size
+        self.seq_len = seq_len
+        self.num_samples = num_samples
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        input_ids = torch.randint(0, self.vocab_size, (self.seq_len,))
+        # Causal LM: labels = input_ids（模型內部會自動 shift）
+        return input_ids, input_ids.clone()
+
 # ---------- DDP ----------
 def setup_ddp():
     world = int(os.environ.get("WORLD_SIZE", "1"))
@@ -303,6 +360,23 @@ def make_tagging_allreduce_hook():
                 return dh.allreduce_hook(state, bucket)  # 官方 hook，內部會做均值
     return hook
 
+# ---------- 訓練步（共用邏輯） ----------
+def train_step_forward_backward(model, x, y, loss_fn, scaler, optimiz, is_llm):
+    """抽取 forward/backward 邏輯，避免 profile / non-profile 迴圈重複程式碼。"""
+    x, y = x.to(next(model.parameters()).device, non_blocking=True), \
+           y.to(next(model.parameters()).device, non_blocking=True)
+    optimiz.zero_grad(set_to_none=True)
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        if is_llm:
+            outputs = model(input_ids=x, labels=y)
+            loss = outputs.loss
+        else:
+            logits = model(x)
+            loss = loss_fn(logits, y)
+    scaler.scale(loss).backward()
+    scaler.step(optimiz)
+    scaler.update()
+
 # ---------- 主程式 ----------
 def main():
     ap = argparse.ArgumentParser()
@@ -310,10 +384,14 @@ def main():
     ap.add_argument("--batch-size", type=int, default=128)
     ap.add_argument("--workers", type=int, default=0, help="DataLoader workers (0=主程序載入，減少追蹤噪音)")
     ap.add_argument("--omp-threads", type=int, default=2)
-    ap.add_argument("--model", choices=["cifar10", "resnet50"], default="cifar10", help="選擇模型：cifar10 或 resnet50")
+    ap.add_argument("--model", choices=["cifar10", "resnet50", "qwen05b", "llama1b"],
+                    default="cifar10",
+                    help="選擇模型：cifar10, resnet50, qwen05b (Qwen2.5-0.5B), llama1b (Llama-3.2-1B)")
+    ap.add_argument("--seq-len", type=int, default=256,
+                    help="LLM sequence length (僅 qwen05b/llama1b 使用，建議 128-512)")
     ap.add_argument("--debug-epoch-print", action="store_true")
 
-    # 視窗定位與大小 (優化預設值以減少檔案大小)
+    # 視窗定位與大小
     ap.add_argument("--profile-epoch", type=int, default=2, help="要擷取的 epoch（1-based）")
     ap.add_argument("--trace-wait", type=int, default=32, help="先略過前 N 步再開始 profile（避開 warm-up）")
     ap.add_argument("--trace-steps", type=int, default=4, help="視窗內擷取的步數 (建議: 1-4，避免 run_ns3.py 過載)")
@@ -326,12 +404,14 @@ def main():
     ap.add_argument("--gpu-sample-interval", type=float, default=0.01)
     ap.add_argument("--no-cleanup", action="store_true")
 
-    # 工程保險：人工注入 Record/Wait
+    # 工程保險
     ap.add_argument("--inject-sync-hack", action="store_true",
-                    help="在每步尾端注入一對 hipEventRecord/hipStreamWaitEvent（輔助 stream）以幫助 HTA 連結；升版穩定後可關閉。")
+                    help="在每步尾端注入一對 hipEventRecord/hipStreamWaitEvent 以幫助 HTA 連結")
 
     args = ap.parse_args()
     os.environ["OMP_NUM_THREADS"] = str(args.omp_threads)
+
+    is_llm = args.model in ("qwen05b", "llama1b")
 
     # 路徑
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -343,6 +423,16 @@ def main():
     metrics_dir.mkdir(parents=True, exist_ok=True)
     Path(data_dir).mkdir(parents=True, exist_ok=True)
 
+    # --- Log 設定 ---
+    log_dir = Path(base_dir) / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f"train_{args.model}_rank{local_rank}_{timestamp}.log"
+    sys.stdout = Logger(log_file)
+    sys.stderr = sys.stdout
+    print(f"[Log] Log 記錄已啟動: {log_file}")
+
     # DDP
     rank, world, ddp = setup_ddp()
     device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK',0))}" if ddp else "cuda")
@@ -352,39 +442,71 @@ def main():
 
     print(f"[Rank {rank}] World={world} | Device={device}")
     print(f"[Rank {rank}] Traces : {traces_dir}")
-    print(f"[Rank {rank}] Dataset: {data_dir}")
 
-    # 資料集
-    tfm = transforms.Compose([transforms.ToTensor(),
-                              transforms.Normalize((0.5,0.5,0.5),(0.5,0.5,0.5))])
-    trainset = torchvision.datasets.CIFAR10(root=data_dir, train=True, download=True, transform=tfm)
-    sampler = torch.utils.data.distributed.DistributedSampler(trainset, num_replicas=world, rank=rank) if ddp else None
-    loader  = DataLoader(trainset, batch_size=args.batch_size, shuffle=(sampler is None),
-                         sampler=sampler, num_workers=args.workers, pin_memory=True, drop_last=True)
-
-    # 模型/優化器
+    # ===== 模型載入 =====
     if args.model == "cifar10":
         model = CIFAR10_CNN().to(device)
     elif args.model == "resnet50":
         model = ResNet50ForCIFAR().to(device)
+    elif args.model == "qwen05b":
+        assert HAS_TRANSFORMERS, "請先安裝: pip install transformers accelerate sentencepiece --break-system-packages"
+        print(f"[Rank {rank}] Loading Qwen2.5-0.5B (FP32)...")
+        model = AutoModelForCausalLM.from_pretrained(
+            "Qwen/Qwen2.5-0.5B", torch_dtype=torch.float32,
+        ).to(device)
+    elif args.model == "llama1b":
+        assert HAS_TRANSFORMERS, "請先安裝: pip install transformers accelerate sentencepiece --break-system-packages"
+        print(f"[Rank {rank}] Loading Llama-3.2-1B (FP32)...")
+        print(f"[Rank {rank}] 注意: 需要先 huggingface-cli login 並接受 Meta license")
+        model = AutoModelForCausalLM.from_pretrained(
+            "meta-llama/Llama-3.2-1B", torch_dtype=torch.float32,
+        ).to(device)
+
+    # 印出參數量（方便確認 gradient size）
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    grad_size_mib = n_params * 4 / (1024**2)  # FP32 = 4 bytes
+    if is_main(rank):
+        print(f"[Model] {args.model}: {n_params:,} trainable params")
+        print(f"[Model] Expected gradient size (FP32 AllReduce): {grad_size_mib:.1f} MiB ({grad_size_mib/1024:.2f} GiB)")
+
     if ddp:
         model = DDP(model, device_ids=[device.index], output_device=device.index, broadcast_buffers=False)
     optimiz = optim.AdamW(model.parameters(), lr=1e-3)
     scaler  = torch.amp.GradScaler('cuda')
     loss_fn = nn.CrossEntropyLoss()
 
-    # [FIX] 監測初始化 - 傳入 metrics_dir 和 rank
+    # ===== 資料集 =====
+    if is_llm:
+        # LLM：隨機 token dataset（trace collection 不需要真實文本）
+        vocab_size = model.module.config.vocab_size if ddp else model.config.vocab_size
+        trainset = DummyLLMDataset(vocab_size=vocab_size, seq_len=args.seq_len, num_samples=2000)
+        sampler = torch.utils.data.distributed.DistributedSampler(trainset, num_replicas=world, rank=rank) if ddp else None
+        loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=(sampler is None),
+                            sampler=sampler, num_workers=0, pin_memory=True, drop_last=True)
+        if is_main(rank):
+            print(f"[Data] DummyLLMDataset: vocab={vocab_size}, seq_len={args.seq_len}, samples=2000")
+    else:
+        # CNN：原本的 CIFAR-10
+        print(f"[Rank {rank}] Dataset: {data_dir}")
+        tfm = transforms.Compose([transforms.ToTensor(),
+                                  transforms.Normalize((0.5,0.5,0.5),(0.5,0.5,0.5))])
+        trainset = torchvision.datasets.CIFAR10(root=data_dir, train=True, download=True, transform=tfm)
+        sampler = torch.utils.data.distributed.DistributedSampler(trainset, num_replicas=world, rank=rank) if ddp else None
+        loader  = DataLoader(trainset, batch_size=args.batch_size, shuffle=(sampler is None),
+                             sampler=sampler, num_workers=args.workers, pin_memory=True, drop_last=True)
+
+    # [FIX] 監測初始化
     gpu_mon = None
     if not args.disable_gpu_monitoring:
         dev_id = int(os.environ.get('LOCAL_RANK', 0)) if ddp else 0
         gpu_mon = GPUMonitor(dev_id, args.gpu_sample_interval, output_dir=metrics_dir, rank=rank, model_name=args.model)
 
-    # [修改] Trace 檔名 - 加入 args.model
+    # Trace 檔名
     # 例如: host_0_cifar10.json, device_0_resnet50.json
     host_path   = traces_dir / f"host_{rank}_{args.model}.json"
     device_path = traces_dir / f"device_{rank}_{args.model}.json"
 
-    # [修改] 清舊檔邏輯 (選擇性：只清當前模型的舊檔，或全部清)
+    # 清舊檔（只清當前模型）
     if is_main(rank) and not args.no_cleanup:
         # 這裡改為只刪除「當前模型」的舊檔，避免誤刪另一個模型的資料
         rm = 0
@@ -411,26 +533,23 @@ def main():
             # 不記錄 trace：正常訓練
             model.train()
             for x, y in loader:
-                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-                optimiz.zero_grad(set_to_none=True)
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    logits = model(x); loss = loss_fn(logits, y)
-                scaler.scale(loss).backward(); scaler.step(optimiz); scaler.update()
+                train_step_forward_backward(model, x, y, loss_fn, scaler, optimiz, is_llm)
             continue
 
-        # ---- 單一 iterator：先略過 wait_steps，再用同一 iterator 進入 profiler 視窗 ----
+        # ---- 單一 iterator：先略過 wait_steps，再進入 profiler 視窗 ----
         it = iter(loader)
         skipped = 0
         while skipped < wait_steps:
-            x, y = next(it)
-            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            optimiz.zero_grad(set_to_none=True)
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                logits = model(x); loss = loss_fn(logits, y)
-            scaler.scale(loss).backward(); scaler.step(optimiz); scaler.update()
+            try:
+                x, y = next(it)
+            except StopIteration:
+                # LLM dataset 可能比 CIFAR-10 小，提前 wrap
+                it = iter(loader)
+                x, y = next(it)
+            train_step_forward_backward(model, x, y, loss_fn, scaler, optimiz, is_llm)
             skipped += 1
 
-        # ===== 目標視窗：ETO start/stop + profiler schedule（用同一 iterator） =====
+        # ===== 目標視窗：ETO start/stop + profiler schedule =====
         et = ExecutionTraceObserver()
         host_tmp = Path(str(host_path) + ".tmp"); host_tmp.unlink(missing_ok=True)
         et.register_callback(str(host_tmp))
@@ -451,24 +570,25 @@ def main():
 
             for step_idx in range(1, active_steps + 1):
                 t0 = time.time()
-                x, y = next(it)
-                with record_function(f"ProfilerStep#{step_idx}"):
-                    x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-                    optimiz.zero_grad(set_to_none=True)
-                    with torch.autocast(device_type="cuda", dtype=torch.float16):
-                        logits = model(x); loss = loss_fn(logits, y)
-                    scaler.scale(loss).backward(); scaler.step(optimiz); scaler.update()
+                try:
+                    x, y = next(it)
+                except StopIteration:
+                    it = iter(loader)
+                    x, y = next(it)
 
-                # 工程保險：注入一對 Record/Wait (修改版：使用單一 stream)
+                with record_function(f"ProfilerStep#{step_idx}"):
+                    train_step_forward_backward(model, x, y, loss_fn, scaler, optimiz, is_llm)
+
+                # 工程保險：注入一對 Record/Wait
                 if args.inject_sync_hack and torch.cuda.is_available():
                     with record_function("manual_sync_event_hack"):
                         s0 = torch.cuda.current_stream()
-                        evt = torch.cuda.Event(enable_timing=False)  # HIP 等效事件
+                        evt = torch.cuda.Event(enable_timing=False)
                         with torch.cuda.stream(s0):
-                            evt.record()  # hipEventRecord
+                            evt.record()
                         with torch.cuda.stream(aux_stream):
-                            aux_stream.wait_event(evt)  # hipStreamWaitEvent
-                            _ = torch.empty(1, device='cuda').add_(1)  # 小 kernel 確保記錄
+                            aux_stream.wait_event(evt)
+                            _ = torch.empty(1, device='cuda').add_(1)
 
                 if step_idx == active_steps:
                     with record_function("manual_blocking_sync"):
@@ -486,7 +606,7 @@ def main():
             print(f"[Rank {rank}] export device trace failed: {e}")
             if 'tmp_dev' in locals() and tmp_dev.exists(): tmp_dev.unlink(missing_ok=True)
 
-        # host：stop / unregister / 等待 flush / 修復拼接 / 原子改名
+        # host：stop / unregister / flush / 修復 / 改名
         try:
             et.stop()
             try:
@@ -507,6 +627,7 @@ def main():
         if gpu_mon: gpu_mon.stop()
         break  # 只擷取一個 epoch
 
+    print(f"[Log] 完整記錄已儲存至: {log_file}")
     cleanup_ddp(ddp)
 
 if __name__ == "__main__":

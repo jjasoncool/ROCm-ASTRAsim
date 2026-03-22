@@ -91,7 +91,10 @@ RUN git clone https://github.com/facebookresearch/HolisticTraceAnalysis.git && \
     pip install -r requirements.txt && \
     pip install -e .
 
-RUN pip install hiredis --no-cache-dir
+RUN pip install --no-cache-dir hiredis
+
+# LLM trace collection 支援 (Qwen2.5-0.5B, Llama-3.2-1B)
+RUN pip install --no-cache-dir transformers accelerate sentencepiece
 
 # 設置工作目錄
 WORKDIR /workspace

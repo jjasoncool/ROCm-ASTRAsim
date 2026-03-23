@@ -4,12 +4,32 @@
 
 ```bash
 python scripts/run_ns3.py \
- --workload data/chakra/workload_et
- --model-tag cifar10
- --topo auto:1d
- --phys-topo configs/astra-sim/topos/2_nodes_1_switch_topology.txt
- --coll-opt localBWAware
- --lmbw 540
+    --workload data/chakra/workload_et \
+    --model-tag cifar10 \
+    --topo auto:1d \
+    --phys-topo configs/astra-sim/topos/2_nodes_1_switch_topology.txt \
+    --coll-opt localBWAware \
+    --lmbw 540
+```
+
+```bash
+python scripts/run_ns3.py \
+    --workload data/chakra/workload_et \
+    --model-tag resnet50 \
+    --topo auto:1d \
+    --phys-topo configs/astra-sim/topos/2_nodes_1_switch_topology.txt \
+    --coll-opt localBWAware \
+    --lmbw 540
+```
+
+```bash
+python scripts/run_ns3.py \
+    --workload data/chakra/workload_et \
+    --model-tag qwen05b \
+    --topo auto:1d \
+    --phys-topo configs/astra-sim/topos/2_nodes_1_switch_topology.txt \
+    --coll-opt localBWAware \
+    --lmbw 540
 ```
 
 ## 產生 Torus topology

@@ -62,7 +62,9 @@ except Exception:
 # ---------- 基本正則與常數 ----------
 ET_PAT = re.compile(r"^(?P<prefix>.*)\.(?P<rank>\d+)\.et$")
 KINETO_STEP_PAT = re.compile(r"^ProfilerStep#\d+$")  # Pytorch Profiler 的 step 名稱
-# 嘗試辨識 NCCL/collective 名稱（不同版本/後端字串會不同，留多一點關鍵字）
+# CPU 端通訊事件識別關鍵字（如 nccl:all_reduce, bytes= 標記等）。
+# 目前 extract_real_metrics 只取 GPU-side ncclDevKernel 以避免雙重計算，
+# 此常數保留供未來 launch overhead 或 software stack 分析使用。
 KINETO_COMM_HINTS = ("nccl", "rccl", "all_reduce", "allreduce", "allgather", "all_gather", "reduce_scatter", "alltoall", "broadcast", "bytes")
 
 # Calibration CSV 欄位定義
@@ -494,90 +496,19 @@ def _dur_units_to_ms(ev_obj: dict, dur_val: float) -> float:
     """
     將 Trace 中的持續時間數值 (dur) 統一轉換為毫秒 (ms)。
 
-    [修訂歷史 - Critical Fix]
-    原本邏輯會讀取 ev_obj["displayTimeUnit"]。
-    但實測發現：AMD/PyTorch Profiler 雖然標註 "ms"，但內部數值 (如 87) 其實是微秒 (us)。
-    - 若信賴 "ms" 標籤 -> 87ms -> 總時間膨脹 1000 倍 -> ResNet Alpha 暴增至 2.25。
-    - 若視為 "us" (物理事實) -> 87us -> 總時間正常 -> ResNet Alpha 回歸 0.002。
-
-    因此，這裡採取「強制轉型」策略，無視 JSON 標頭的單位宣告。
+    [修訂歷史]
+    v1: 讀取 ev_obj["displayTimeUnit"] → 不可靠（AMD 標 "ms" 實為 us）。
+    v2: ProfilerStep 特殊判定 ns vs us → 當 step > 1 秒時誤判（Qwen 3.4s 被當 ns）。
+    v3 (current): 依據 Chrome Trace Event Format 規範，dur 一律為微秒 (us)。
+        移除 ProfilerStep 特殊判定。僅保留極端值防呆（> 10^9 = 1000 秒，視為 ns）。
     """
-
-    # [物理定義]
-    # Google Chrome Trace Event Format 規範定義 dur 單位為 微秒 (microseconds)。
-    # 我們需要回傳 毫秒 (milliseconds) 給 ASTRA-sim 進行後續計算。
-    # 公式： ms = us / 1000.0
-    name = str(ev_obj.get("name", ""))
     val = float(dur_val)
 
-    # 1. 絕對特徵判定：如果是 ProfilerStep，必定是 CPU 端時間 (ns)
-    if "ProfilerStep" in name:
-        # 如果視為 ns (除以 100萬) 結果 < 1.0 ms，這不合理，代表它其實是 us
-        if (val / 1_000_000.0) < 1.0:
-            return val / 1_000.0     # 視為 us
-        return val / 1_000_000.0     # 視為 ns
-
-    # 2. 絕對特徵判定：如果是通訊 (nccl) 或計算 (Kernel)，通常是 us
-    # 加強防呆：若沒有名字特徵，才退回到數值門檻法
-
-    # 數值門檻法 (作為最後一道防線)
-    # 邏輯：Kernel 不太可能跑超過 10秒 (10^7 us)，Step 不太可能短於 0.01ms (10^4 ns)
-    # 但為了包含極短 Step，我們依賴上面的 Name Check。
-    # 這裡保留門檻是為了處理那些沒有名字特徵的雜項事件。
-    if val > 10_000_000:
-        return val / 1_000_000.0 # 視為 ns
-    else:
-        return val / 1_000.0     # 視為 us
-
-def _extract_step_and_comm_ms(trace_path: Path) -> tuple[list[float], float | None]:
-    """
-    從單支 PyTorch Kineto trace（Chrome trace JSON）抓出：
-      1) 每個 ProfilerStep 的持續時間（ms）
-      2) 每步平均的通訊時間（ms/step；若抓不到通訊事件則回傳 None）
-
-    注意：
-    - Kineto 事件時間單位可能是 us 或 ms；用 _dur_units_to_ms() 做一致化（轉成毫秒）。
-    - 通訊事件靠 name/cat 中是否含 NCCL/RCCL/collective 關鍵字來辨識（KINETO_COMM_HINTS）。
-    - 這裡「每步平均通訊」是把檔內通訊事件總時長除以步數，與 ASTRA‑sim 的 per‑step exposed comm 對齊。
-    """
-    obj = _load_json(trace_path)
-    if not obj:
-        return [], None
-
-    steps_ms: list[float] = []     # 每一步（ProfilerStep#N）的時長（ms）
-    comm_sum_ms: float = 0.0       # 檔內所有可辨識的通訊事件時長總和（ms）
-    any_comm: bool = False         # 是否有抓到任何通訊事件
-
-    for ev in obj.get("traceEvents", []):
-        # 只看具有持續時間的 complete events（"ph" == "X"）
-        if ev.get("ph") != "X":
-            continue
-
-        name = str(ev.get("name", "")).lower()
-        cat  = str(ev.get("cat", "")).lower()
-        # 將 dur 統一換算成毫秒（Kineto 可能為 us；若 displayTimeUnit=="ms" 則維持 ms）
-        d_ms = _dur_units_to_ms(ev, ev.get("dur", 0.0))
-
-        # 判定一步的界線：PyTorch Profiler 會發出 "ProfilerStep#<n>"
-        if KINETO_STEP_PAT.match(str(ev.get("name", ""))):
-            steps_ms.append(d_ms)
-
-        # 條件 A: 名稱或分類包含通訊關鍵字 (nccl, allreduce, bytes...)
-        is_comm_candidate = any(h in name for h in KINETO_COMM_HINTS) or any(h in cat for h in KINETO_COMM_HINTS)
-
-        # 條件 B: 必須「不是」Kernel 實作 (避免重複計算 GPU 執行時間)
-        # ROCm Trace 常有 "ncclKernel" 或 "RingKernel"，這些屬於 Compute/Kernel 類別，不應計入 Network Comm
-        is_not_kernel = ('kernel' not in name) and ('kernel' not in cat)
-
-        if is_comm_candidate and is_not_kernel:
-            comm_sum_ms += d_ms
-            any_comm = True
-
-    # ★關鍵修正：回傳「每步通訊」（ms/step）而不是「整個檔案總和」
-    # 這樣 extract_real_metrics_from_traces() 取得的 real_t_comm_ms 就是 per-step 的量，
-    # 才能與 ASTRA‑sim 的 sim_t_comm_ms（per-step 的 exposed communication）一致比較。
-    comm_ms_per_step = (comm_sum_ms / max(1, len(steps_ms))) if (any_comm and steps_ms) else None
-    return steps_ms, comm_ms_per_step
+    # Chrome Trace Event Format 規範：dur 單位為微秒 (microseconds)。
+    # 極端防呆：若 val > 10^9（= 1000 秒 in μs），幾乎確定是 nanoseconds
+    if val > 1_000_000_000:
+        return val / 1_000_000.0  # ns → ms
+    return val / 1_000.0          # us → ms
 
 def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[float | None, float | None, float | None, int | None]:
     """
@@ -607,8 +538,19 @@ def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[
         if not obj:
             continue
 
-        # steps list and count
-        steps = [ev for ev in obj.get('traceEvents', []) if KINETO_STEP_PAT.match(str(ev.get('name', '')))]
+        # steps list and count — deduplicate by step number
+        # Qwen traces may produce duplicate ProfilerStep events with different categories
+        # (e.g., user_annotation + gpu_user_annotation). Keep only the user_annotation
+        # version (CPU-side, authoritative) per step number.
+        step_map = {}  # step_number -> event
+        for ev in obj.get('traceEvents', []):
+            name = str(ev.get('name', ''))
+            if KINETO_STEP_PAT.match(name):
+                step_num = name  # e.g., "ProfilerStep#1"
+                cat = str(ev.get('cat', ''))
+                if step_num not in step_map or cat == 'user_annotation':
+                    step_map[step_num] = ev
+        steps = list(step_map.values())
         steps_n = len(steps)
 
         # compute total network-only and kernel-only durations in ms
@@ -625,15 +567,21 @@ def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[
             lname = name.lower()
             lcat = cat.lower()
 
-            # step durations collected for step median
-            if KINETO_STEP_PAT.match(name):
+            # step durations collected for step median (use deduplicated step_map)
+            if KINETO_STEP_PAT.match(name) and name in step_map and ev is step_map[name]:
                 step_durations.append(d_ms)
 
             # 邏輯：區分三類事件
             # (a) NCCL/RCCL 通訊 kernel（如 ncclDevKernel_Generic_4）→ net_comm
             # (b) 一般 GPU compute kernel（非 NCCL）→ kernel
-            # (c) CPU 端通訊 API 標記（如 nccl:all_reduce）→ net_comm
+            # (c) CPU 端通訊 API 標記（如 nccl:all_reduce）→ 跳過（避免雙重計算）
             # 注意：AMD RCCL 的 ncclDevKernel cat=kernel，但它是通訊操作，不是計算
+            #
+            # [Critical Fix] 每個 AllReduce 會產生 GPU 端 ncclDevKernel（實際傳輸）
+            # 和 CPU 端 nccl:all_reduce annotation（launch wrapper）兩種事件。
+            # CPU wrapper 的 duration 包含了 GPU kernel 的執行時間，
+            # 兩者都計入會導致 net_ms_total 膨脹約 2 倍。
+            # 只取 GPU 端 kernel timing（直接測量，更準確）。
             is_nccl_kernel = ('nccldevkernel' in lname or 'ncclkernel' in lname or 'rcclkernel' in lname)
 
             if is_nccl_kernel:
@@ -642,13 +590,7 @@ def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[
             elif 'kernel' in lcat:
                 # (b) 一般 GPU compute kernel → 計入 kernel
                 kernel_ms_total += d_ms
-            else:
-                # (c) 非 kernel 的通訊事件（如 nccl:all_reduce, user_annotation）
-                # 排除 CPU 端 DDP reducer 操作（reducer::mul_out 等含 'reduce' 但非通訊）
-                is_comm_candidate = any(h in lname for h in KINETO_COMM_HINTS) or any(h in lcat for h in KINETO_COMM_HINTS)
-                is_reducer_op = 'reducer' in lname
-                if is_comm_candidate and not is_reducer_op:
-                    net_ms_total += d_ms
+            # (c) CPU 端 nccl:all_reduce 等 annotation → 不計入（已由 GPU kernel 覆蓋）
 
         if step_durations:
             per_rank_step_medians.append(median(step_durations))

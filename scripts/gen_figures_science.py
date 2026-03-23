@@ -16,7 +16,7 @@ sudo apt install texlive-latex-base texlive-fonts-recommended texlive-fonts-extr
 ========================
 
 All data from confirmed experimental results.
-α = 0.002254 μs/cycle for time conversion.
+α = 0.002411 μs/cycle for time conversion.
 """
 
 import matplotlib
@@ -76,7 +76,7 @@ TOPO_COLORS = [C_BLUE, C_ORANGE, C_GREEN]
 TOPO_LABELS = ['Fat-Tree\n(L16\_S8)', 'Standard\nTorus (4×4×8)', 'Twisted\nTorus (4×4×8)']
 TOPO_LABELS_SHORT = ['Fat-Tree', 'Std. Torus', 'Twisted Torus']
 
-alpha_us = 0.002254  # μs/cycle
+alpha_us = 0.002411  # μs/cycle (updated: bug B1/B2/B3 fix in run_ns3.py)
 
 outdir = './thesis_figures'
 os.makedirs(outdir, exist_ok=True)
@@ -140,13 +140,13 @@ GPU_CYCLES = 274_982_000
 def fig_4_4():
     fig, ax = plt.subplots(figsize=(5.0, 2.2))
 
-    # Percentages of step time
-    # ResNet-50: total=619.85, gpu=94.46(15.2%), comm=10.02(1.6%), overhead=515.37(83.2%)
-    # CIFAR-10:  total=129.31, gpu=16.65(12.9%), comm=51.80(40.1%), overhead=60.86(47.0%)
+    # Percentages of step time (updated after B1/B2/B3 fix)
+    # ResNet-50: total=662.92, gpu=141.70(21.4%), comm=7.54(1.1%), overhead=513.68(77.5%)
+    # CIFAR-10:  total=224.32, gpu=39.96(17.8%), comm=61.98(27.6%), overhead=122.38(54.6%)
     workloads = ['CIFAR-10 CNN\n(Latency-bound)', 'ResNet-50\n(Bandwidth-bound)']
-    gpu_pct   = [12.9, 15.2]
-    comm_pct  = [40.1,  1.6]
-    over_pct  = [47.0, 83.2]
+    gpu_pct   = [17.8, 21.4]
+    comm_pct  = [27.6,  1.1]
+    over_pct  = [54.6, 77.5]
 
     y = np.arange(2)
     h = 0.5
@@ -188,8 +188,8 @@ def fig_4_4():
                 ha='center', va='center', fontsize=7, fontweight='bold', color='#555555')
 
     # Absolute times as annotation
-    ax.text(101, y[1], '619.85 ms', va='center', fontsize=7, color=C_GRAY)
-    ax.text(101, y[0], '129.31 ms', va='center', fontsize=7, color=C_GRAY)
+    ax.text(101, y[1], '662.92 ms', va='center', fontsize=7, color=C_GRAY)
+    ax.text(101, y[0], '224.32 ms', va='center', fontsize=7, color=C_GRAY)
 
     ax.set_xlim(0, 115)
     ax.set_yticks(y)
@@ -224,7 +224,7 @@ def fig_5_1():
     ax.set_ylabel('Wall Time (ms)')
     ax.set_xticks(x)
     ax.set_xticklabels(TOPO_LABELS_SHORT, fontsize=8)
-    ax.set_ylim(0, 800)
+    ax.set_ylim(0, 1000)
 
     for i, bar in enumerate(bars):
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 15,
@@ -339,7 +339,7 @@ def fig_5_3():
                 arrowprops=dict(arrowstyle='->', color=C_RED, lw=0.8))
 
     ax1.set_ylabel('Wall Time (ms)')
-    ax1.set_ylim(0, 7500)
+    ax1.set_ylim(0, 8000)
     ax1.set_xticks(x)
     ax1.set_xticklabels(comm_sizes, fontsize=7)
     ax1.set_xlim(-0.3, 3.5)

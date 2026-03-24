@@ -53,6 +53,8 @@ $$T_{link} = \frac{T_{RCCL} - T_{overhead}}{N_{hops}}$$
 
 **Measure** (`rccl-tests`, small message): $T_{RCCL} \approx 25\ \mu s$
 
+As a concrete reference point, small-message `all_reduce_perf` runs on this platform (8–1024 B, FP16, 2 GPUs) show end-to-end latency in the **~25.8–33.8 µs** range, corresponding to **12.9–16.9 µs per link** on the 2-hop calibration path. We adopt **14 µs** as a representative effective per-link latency near the center of this measured range.
+
 **Analyze**: path is GPU → Switch → GPU, so $N_{hops} = 2$
 
 **Initial calculation**:
@@ -61,9 +63,9 @@ $$T_{link,init} = \frac{25\ \mu s}{2} = 12.5\ \mu s$$
 
 > Writing 25 µs directly would cause the simulator to compute $25 \times 2 = 50\ \mu s$, doubling the latency.
 
-**Optional fine-tuning**:
+**Interpretation**:
 
-The calculated 12.5 µs is a reasonable starting value. If you want to minimize error further, compare simulation output against real PyTorch execution logs and adjust the per-link latency until the error is smallest. In our setup, **14 µs** produced the best match and is the value used in all simulation configs in this repository.
+The simple 25 µs ÷ 2 = 12.5 µs calculation is only an initial approximation. In the thesis, the adopted **14 µs** is treated as an **effective latency parameter** for relative topology comparison, derived from the measured rccl-tests range rather than claimed as an exact physical per-hop delay.
 
 **Local memory bandwidth** (`rocm-bandwidth-test`):
 
@@ -120,9 +122,10 @@ torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
 **Step 2: Convert trace (system-aware calibration)**
 
 ```bash
-python src/conver_to_chakra_et.py  --model-tag cifar10
+python src/conver_to_chakra_et.py --model-tag cifar10
 ```
-> `--force-avg-kernel-ns 609000` (609 µs) redistributes real GPU wall time back into compute nodes.
+
+> For latency-dominated diagnostics, `--force-avg-kernel-ns` may still be used to redistribute wall-clock time back into compute nodes, but CIFAR-10 is currently excluded from large-scale topology evaluation.
 
 **Step 3: Run simulation and auto-calibrate**
 
@@ -171,7 +174,7 @@ python scripts/run_ns3.py \
   --lmbw 540
 ```
 
-> Check `runs/calibration_all.csv`. For ResNet-50, α_step calibration (wall-clock level) should succeed; `α_comm` is logged as a diagnostic metric only.
+> Check `runs/calibration_all.csv`. In the thesis, ResNet-50 is the primary calibration benchmark; `α_step` is the main wall-clock conversion factor, while `α_comm` is diagnostic only.
 
 ---
 
@@ -227,7 +230,7 @@ When `run_ns3.py` runs at `world=2` (without `--no-autocalib`):
 
    $$\alpha_{us} = \frac{real\_t\_step\_ms \times 1000}{sim\_cycles\_step}$$
 
-   $\alpha_{us}$ (also written as `α_step`) represents how many real-world microseconds correspond to one simulation cycle. This is the **primary calibration factor** used for all 128-node topology comparisons.
+   $\alpha_{us}$ (also written as `α_step`) represents how many real-world microseconds correspond to one simulation cycle. In the thesis, this is the **primary calibration factor** used for all 128-node topology comparisons.
 
    The script also computes `α_comm` as a diagnostic metric, but it is **not used for calibration** due to semantic differences between ASTRA-sim's Comm time (scheduling latency) and PyTorch Profiler's RCCL kernel duration (cumulative sum).
 
@@ -238,11 +241,11 @@ When `run_ns3.py` runs at `world=2` (without `--no-autocalib`):
 | Metric | ResNet-50 | CIFAR-10 |
 |---|---|---|
 | `ns3_comm_ms` (ns-3 simulation) | **15.06 ms** | **41.07 ms** |
-| `real_t_comm_ms` (hardware) | **10.02 ms** | **51.80 ms** |
-| ns-3 vs real | **+50%** | **−21%** |
+| `real_t_comm_ms` (hardware) | **7.54 ms** | **61.98 ms** |
+| ns-3 vs real | **+100%** | **−34%** |
 | Status | primary baseline | excluded (scope boundary) |
 
-> A parameter sweep across bandwidth and latency values validates ns-3 communication accuracy for ResNet-50. CIFAR-10 is excluded from large-scale inference (ns-3 underestimates due to unmodeled software-stack overhead dominating communication time).
+> A systematic parameter sensitivity analysis over bandwidth, latency, packet payload, and congestion-control settings shows that, for ResNet-50, ns-3 communication remains stable at about 14.0–15.1 ms across all tested configurations. This supports the interpretation that the discrepancy is structural (most plausibly Ethernet RDMA vs. PCIe DMA path mismatch) rather than parameter-sensitive.
 
 ---
 
@@ -253,8 +256,8 @@ Scale a calibrated 2-GPU model up to a 128-GPU virtual simulation.
 ### Step 1: Verify baseline accuracy
 
 - Check `runs/calibration_all.csv`
-- ResNet-50: α_step calibration succeeds (wall-clock level); `α_comm` is a diagnostic metric only and is not used for go/no-go decisions
-- CIFAR-10: error > 50% indicates a poor System Overhead model — large-scale predictions will be unreliable
+- ResNet-50: use `α_step` for wall-clock conversion and treat communication time primarily as a **relative topology metric**
+- CIFAR-10: excluded from large-scale topology evaluation because unmodeled software overhead dominates step time
 
 ### Step 2: Run virtual expansion
 

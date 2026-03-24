@@ -53,6 +53,8 @@ $$T_{link} = \frac{T_{RCCL} - T_{overhead}}{N_{hops}}$$
 
 **測量**（`rccl-tests` 小封包）：$T_{RCCL} \approx 25\ \mu s$
 
+作為具體參考，本平台上的小訊息 `all_reduce_perf` 測試（8–1024 B、FP16、2 GPUs）量測到的端對端延遲約落在 **~25.8–33.8 µs**，對應到 2-hop 校準路徑上的 **12.9–16.9 µs per-link**。文件採用 **14 µs** 作為此量測範圍中央附近的代表性有效延遲。
+
 **分析**：路徑為 GPU → Switch → GPU，$N_{hops} = 2$
 
 **初始計算**：
@@ -61,9 +63,9 @@ $$T_{link,init} = \frac{25\ \mu s}{2} = 12.5\ \mu s$$
 
 > 若直接填入 25 µs，模擬器會計算 $25 \times 2 = 50\ \mu s$，導致結果嚴重偏差。
 
-**選擇性微調**：
+**解讀方式**：
 
-計算出的 12.5 µs 是合理的起始值，可直接使用。若想進一步縮小誤差，可將模擬輸出與真實 PyTorch 執行 Log 比對，調整每條鏈路延遲直到誤差最小。在本設定環境下，**14 µs** 達到最佳吻合，因此本 Repository 的所有模擬設定均採用此數值。
+用 25 µs ÷ 2 = 12.5 µs 的做法，只能視為初始近似。此處採用的 **14 µs**，應理解為用於**相對拓撲比較**的有效延遲參數，而不是精確的物理 per-hop delay。
 
 **本地記憶體頻寬測量**（`rocm-bandwidth-test`）：
 
@@ -122,7 +124,7 @@ torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
 ```bash
 python src/conver_to_chakra_et.py --model-tag cifar10
 ```
-> `--force-avg-kernel-ns 609000`（609 µs）將真實 GPU 時間攤提回計算節點。
+> 若進行 latency-dominated 診斷，可再搭配 `--force-avg-kernel-ns` 將 wall-clock 時間攤提回計算節點；但目前已將 CIFAR-10 排除於大規模拓撲評估之外。
 
 **步驟 3：執行模擬與自動校準**
 
@@ -171,7 +173,7 @@ python scripts/run_ns3.py \
   --lmbw 540
 ```
 
-> 檢查 `runs/calibration_all.csv`，ResNet-50 的 α_step（wall-clock 層級）校準應成功收斂；`α_comm` 作為診斷指標記錄，不作為校準判斷依據。
+> 檢查 `runs/calibration_all.csv`。ResNet-50 是主要校準基準；`α_step` 是主要 wall-clock 轉換係數，`α_comm` 僅作診斷用途。
 
 ---
 
@@ -238,11 +240,11 @@ python scripts/run_ns3.py \
 | 指標 | ResNet-50 | CIFAR-10 |
 |---|---|---|
 | `ns3_comm_ms`（ns-3 模擬值） | **15.06 ms** | **41.07 ms** |
-| `real_t_comm_ms`（硬體實測值） | **10.02 ms** | **51.80 ms** |
-| ns-3 vs real | **+50%** | **−21%** |
+| `real_t_comm_ms`（硬體實測值） | **7.54 ms** | **61.98 ms** |
+| ns-3 vs real | **+100%** | **−34%** |
 | 校準狀態 | 主基準 | 排除（scope boundary） |
 
-> 針對 ResNet-50 透過頻寬與延遲的 parameter sweep 驗證 ns-3 通訊精度。CIFAR-10 因軟體堆疊開銷（ASTRA-sim 不建模）主導通訊時間（ns-3 低估），排除於大規模推論之外。
+> 透過對頻寬、延遲、封包 payload 與擁塞控制設定的系統性掃描可知：對 ResNet-50 而言，ns-3 通訊時間在所有測試設定下都穩定落在約 14.0–15.1 ms，支持這個差異主要屬於結構性偏差（最合理解釋為 Ethernet RDMA 與 PCIe DMA 路徑不匹配），而非參數敏感度問題。
 
 ---
 
@@ -253,8 +255,8 @@ python scripts/run_ns3.py \
 ### 步驟 1：確認校準基線
 
 - 檢查 `runs/calibration_all.csv`
-- ResNet-50：α_step 校準成功（wall-clock 層級）；`α_comm` 僅作診斷指標，不作為擴展決策依據
-- CIFAR-10：誤差過大（> 50%）代表 System Overhead 模型失準，不建議進行大規模擴展預測
+- ResNet-50：使用 `α_step` 作為 wall-clock 轉換係數，通訊時間則主要拿來做**相對拓撲比較**
+- CIFAR-10：因未建模軟體堆疊開銷主導 step time，排除於大規模拓撲評估之外
 
 ### 步驟 2：執行虛擬擴展
 

@@ -5,7 +5,7 @@
 > **Thesis:** *"Cost-Effective Twisted Torus for AI Training: An ASTRA-sim Evaluation Using Traces from Consumer-Grade AMD GPUs with ROCm"*
 > National Cheng Kung University (NCKU), Graduate Institute of Computer Science and Information Engineering, 2026
 
-This repository implements a three-stage trace-driven simulation pipeline that — to the best of our knowledge — is one of the first publicly documented pipelines for collecting real training traces from **AMD ROCm/RCCL hardware** and feeding them into **ASTRA-sim** for cluster-scale AI network simulation.
+This repository implements a three-stage trace-driven simulation pipeline for collecting real training traces from **AMD ROCm/RCCL hardware** and feeding them into **ASTRA-sim** for cluster-scale AI network simulation. It is positioned for the setting where prior published ASTRA-sim studies predominantly assume **NVIDIA CUDA/NCCL**.
 
 ---
 
@@ -108,7 +108,7 @@ Converts Kineto JSON to Chakra ET (`.et`) format, applying **two AMD-specific pa
 python ./src/conver_to_chakra_et.py --model-tag resnet50
 
 # CIFAR-10 — system-aware calibration mode
-# --force-avg-kernel-ns redistributes real step time back into compute nodes
+# for latency-dominated diagnostics, optional system-aware forcing may still be used if needed
 python ./src/conver_to_chakra_et.py --model-tag cifar10
 ```
 
@@ -157,21 +157,21 @@ See [scripts/commands.md](scripts/commands.md) for the complete command referenc
 
 ## Calibration
 
-Calibration runs at 2-GPU scale and produces a factor α (µs/cycle) that maps simulation cycles to wall-clock time. Run it before any large-scale simulation to validate your specific hardware setup.
+Calibration runs at 2-GPU scale and produces a factor α (µs/cycle) that maps simulation cycles to wall-clock time. In the thesis, calibration is used primarily to validate the **relative-comparison regime** through systematic parameter sensitivity analysis, rather than to claim exact absolute communication-time prediction.
 
-- **ResNet-50 (bandwidth-bound):** Calibrated at the wall-clock level against real hardware (α_step = 0.002254 µs/cycle). Topology comparisons use consistent simulation assumptions across all configurations.
-- **CIFAR-10 (latency-bound):** Large step-time error — software-stack overhead (RCCL handshake, kernel launch latency) dominates communication time and is not modeled by ASTRA-sim. **Do not use this pipeline for latency-dominated workloads.**
+- **ResNet-50 (bandwidth-bound):** Primary calibration benchmark. Wall-clock calibration yields **α_step = 0.002411 µs/cycle**. ns-3 communication time is stable across parameter sweeps but shows an approximately **+100% overestimate** relative to measured RCCL GPU kernel duration, most plausibly due to the transport-path mismatch between ns-3's Ethernet RDMA model and the physical PCIe DMA path.
+- **CIFAR-10 (latency-bound):** Excluded from large-scale evaluation. Software-stack overhead dominates step time, so ASTRA-sim is not suitable for absolute prediction in this regime.
 
 **Measured calibration results (2-GPU, per training step):**
 
 | Metric | ResNet-50 | CIFAR-10 |
 |---|---|---|
 | `ns3_comm_ms` (ns-3 simulation) | **15.06 ms** | **41.07 ms** |
-| `real_t_comm_ms` (hardware measurement) | **10.02 ms** | **51.80 ms** |
-| ns-3 vs real | **+50%** (overestimate) | **−21%** (underestimate) |
+| `real_t_comm_ms` (hardware measurement) | **7.54 ms** | **61.98 ms** |
+| ns-3 vs real | **+100%** (overestimate) | **−34%** (underestimate) |
 | Calibration status | primary baseline | excluded (scope boundary) |
 
-> A parameter sweep across bandwidth and latency values was used to validate ns-3 communication accuracy for ResNet-50. CIFAR-10 is excluded from large-scale inference because software-stack overhead (not modeled by ASTRA-sim) dominates its communication time.
+> For ResNet-50, a parameter sweep across bandwidth, latency, packet payload, and congestion-control settings shows that ns-3 communication time remains in the 14.0–15.1 ms range, supporting the interpretation that the discrepancy is structural rather than parameter-sensitive. For topology studies, this systematic bias is expected to affect all topologies similarly, preserving relative comparisons.
 
 The α value and per-run calibration results are logged to `runs/calibration_all.csv`. See [scripts/README.md](scripts/README.md) for the full calibration methodology.
 
@@ -199,7 +199,7 @@ Three pre-configured topologies are provided for 128-node evaluation:
 
 ## All-to-All Stress Test (Workload Augmentation)
 
-When running AllReduce with the original trace, communication is typically hidden by GPU computation and no topology difference is observable. To stress the network and expose topological differences, use `src/scale_et_comm_workload.py` to scale up communication volume.
+When running AllReduce with the original corrected ResNet-50 trace, communication is typically hidden by GPU computation and no topology difference is observable. The thesis identifies roughly **89.7 MiB** of total AllReduce traffic per step across 5 DDP gradient buckets. To stress the network and expose topological differences, use `src/scale_et_comm_workload.py` to scale up communication volume.
 
 ### What it does
 
@@ -247,7 +247,7 @@ python scripts/run_ns3.py \
   --virtual-world 128 --payload 12000 --lmbw 540 --no-autocalib
 ```
 
-> **Note:** The 1 GB All-to-All is a simulation-only stress test. It is not executable on physical hardware (a 128-node All-to-All at 1 GB per peer would require buffers far exceeding 16 GB VRAM). The tool is designed to saturate network links and expose topology differences in simulation.
+> **Note:** The thesis shows a three-phase observability pattern: the original ~89.7 MiB trace is fully hidden, 100 MB causes selective Torus exposure, and 512 MB–1 GB produces full topology divergence. The 1 GB All-to-All case is therefore a simulation-only upper-bound stress test, not a production trace.
 
 ---
 
@@ -303,8 +303,11 @@ A: The ET file has a DAG integrity issue (self-dependency or cycle). Run `conver
 **Q: `chakra_trace_link` fails on ROCm with misaligned timestamps?**
 A: Add `--inject-sync-hack` to `train_rocm_pytorch.py`. This injects synchronization events to align CPU (ms) and GPU (µs) timestamps before trace linking.
 
-**Q: Why does CIFAR-10 show large calibration error while ResNet-50 achieves good wall-clock calibration?**
-A: CIFAR-10's shallow architecture completes computation so quickly that fixed software-stack overhead (kernel launch, RCCL handshake, ~25 µs) dominates communication time. ASTRA-sim models only network transfer time, not host-side OS overhead. ResNet-50's deep architecture produces enough compute time to render this overhead negligible, and wall-clock calibration (α_step) succeeds. See thesis Section 4.3 for detailed analysis.
+**Q: Why does ns-3 overestimate ResNet-50 communication time by about 2×?**
+A: The thesis finds this discrepancy to be structurally insensitive to all tested tuning parameters. The most plausible explanation is a transport-path mismatch: ns-3 models Ethernet RDMA transport, while the physical 2-GPU platform communicates over a PCIe DMA path. Because the same ns-3 transport model is applied to all evaluated topologies, this bias is expected to cancel in relative comparisons.
+
+**Q: Why is CIFAR-10 excluded from large-scale evaluation?**
+A: CIFAR-10's shallow architecture leaves more than half of the step time in unmodeled software overhead. This causes wall-clock and communication calibration factors to diverge, making ASTRA-sim unsuitable for absolute prediction in this latency-dominated regime. See thesis Section 4.3 for details.
 
 ---
 

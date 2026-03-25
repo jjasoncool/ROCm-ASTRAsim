@@ -91,7 +91,7 @@ torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
 
 **Key flags:**
 - `--inject-sync-hack` — Inject extra sync events to stabilize `chakra_trace_link` on ROCm (recommended)
-- `--trace-steps 1–4` — Keep traces small; large traces (>5000 nodes) may cause ns-3 simulation hangs
+- `--trace-steps 1–4` — Keep traces small; oversized traces may significantly increase ns-3 runtime or cause instability
 
 ### Stage 2 — Trace Conversion (`src/conver_to_chakra_et.py`)
 
@@ -175,11 +175,50 @@ Calibration runs at 2-GPU scale and produces a factor α (µs/cycle) that maps s
 
 The α value and per-run calibration results are logged to `runs/calibration_all.csv`. See [scripts/README.md](scripts/README.md) for the full calibration methodology.
 
+### Additional workload validation: Qwen2.5-0.5B
+
+The pipeline has also been validated on a **Qwen2.5-0.5B** DDP trace collected on the same 2-GPU AMD platform. This LLM workload contains **494M parameters**, producing **37 AllReduce communication nodes** and about **1.84 GiB** of total communication volume per training step. This confirms that the trace collection and conversion pipeline is not specific to ResNet-50. Full 128-node topology evaluation of the Qwen workload is left as future work.
+
 ---
 
 ## Topology Configurations
 
 Three pre-configured topologies are provided for 128-node evaluation:
+
+If you need to customize or regenerate topology/configuration files, you can also use `src/topology_generator.py` to produce them directly from the command line. This generator can automatically emit:
+
+- physical topology files (`configs/astra-sim/topos/*.txt`)
+- logical topology files (`configs/astra-sim/topos/logical_*.json`)
+- system configuration files (`configs/astra-sim/system/system_*.json`)
+
+It supports **Torus**, **Twisted Torus**, and **Fat-Tree** generation. For example:
+
+```bash
+# Generate a 128-node 4×4×8 Torus
+python3 src/topology_generator.py \
+  --type torus \
+  --nodes 128 \
+  --dims 4 4 8 \
+  --bw-intra 65Gbps --lat-intra 0.014ms \
+  --bw-inter 25Gbps --lat-inter 0.005ms
+
+# Generate a 128-node 4×4×8 Twisted Torus
+python3 src/topology_generator.py \
+  --type twisted_torus \
+  --nodes 128 \
+  --dims 4 4 8 \
+  --bw-intra 65Gbps --lat-intra 0.014ms \
+  --bw-inter 25Gbps --lat-inter 0.005ms
+
+# Generate a 128-node Fat-Tree
+python3 src/topology_generator.py \
+  --type fattree \
+  --nodes 128 \
+  --bw-intra 65Gbps --lat-intra 0.014ms \
+  --bw-inter 65Gbps --lat-inter 0.005ms
+```
+
+If you simply want to reproduce the topologies used in this work, you can directly use the files already provided under `configs/astra-sim/topos/` and `configs/astra-sim/system/`. If you want to change dimensions, bandwidth, latency, or topology type, use the generator to emit a matching set of files.
 
 | Parameter | Fat-Tree (L16_S8) | Torus (4×4×8) | Twisted Torus (4×4×8) |
 |---|---|---|---|
@@ -294,8 +333,18 @@ Open in any browser to explore the 4×4×8 Twisted Torus wiring pattern.
 
 ## FAQ
 
-**Q: ns-3 simulation hangs indefinitely without any output?**
-A: This is caused by oversized ET files. Keep `--trace-steps` at 1–4 when generating traces. Files with >5000 nodes may exhaust ASTRA-sim's ETFeeder resources.
+**Q: The ns-3 simulation seems to run forever. Is it actually hung?**
+A: Not necessarily. With real topologies and larger ET files, simulation can take a very long time. In our 128-node experiments, a **single run typically took about 5 days** to finish, so it should not be judged by a "10-minute expectation."
+
+A practical way to check progress is to inspect whether `fct.txt` is still being updated, for example:
+
+```text
+runs/20260324-013221+0800_ns3_128gpu_qwen05b_file_logical_128nodes_FatTree_L16_S8/out/fct.txt
+```
+
+If `fct.txt` continues to receive new values, the simulation is usually still progressing normally rather than being stuck.
+
+Oversized ET files can still cause real problems, so it is recommended to keep `--trace-steps` at 1–4 when generating traces. Very large ET files may exhaust ASTRA-sim's ETFeeder resources or substantially slow the simulation. Since individual experiments may take days, it is also practical to run multiple experiments in parallel across different shell sessions.
 
 **Q: `"Node X in ctrl_dep graph, but not found in index"` error from ASTRA-sim?**
 A: The ET file has a DAG integrity issue (self-dependency or cycle). Run `conver_to_chakra_et.py` again — the built-in DAG repair pass (`fix_et_dag_inplace`) should resolve this automatically.

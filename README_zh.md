@@ -91,7 +91,7 @@ torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
 
 **重要參數：**
 - `--inject-sync-hack` — 注入額外同步事件，穩定 ROCm 上的 `chakra_trace_link`（建議開啟）
-- `--trace-steps 1–4` — 控制追蹤規模；節點數超過 5000 的大型追蹤可能導致 ns-3 模擬卡死
+- `--trace-steps 1–4` — 控制追蹤規模；過大的追蹤檔可能顯著拉長 ns-3 執行時間或造成不穩定
 
 ### 階段 2 — 追蹤轉換（`src/conver_to_chakra_et.py`）
 
@@ -175,11 +175,50 @@ python scripts/run_ns3.py \
 
 α 值與每次執行的校準結果記錄於 `runs/calibration_all.csv`。完整校準方法論請見 [scripts/README.md](scripts/README.md)。
 
+### 額外工作負載驗證：Qwen2.5-0.5B
+
+此 Pipeline 也已在相同 2-GPU AMD 平台上，以 **Qwen2.5-0.5B** 的 DDP trace 進行驗證。這個 LLM workload 具有 **494M 參數**，每個 training step 產生 **37 個 AllReduce 通訊節點**，總通訊量約 **1.84 GiB**。這說明 trace 蒐集與轉換流程並不限於 ResNet-50；至於 Qwen workload 的 128 節點拓撲評估，則保留為後續工作。
+
 ---
 
 ## 拓撲設定
 
 已針對 128 節點評估預先設定三種拓撲：
+
+此外，若需要自訂或重新產生 topology 與對應設定檔，也可以直接使用 `src/topology_generator.py` 透過指令自動產生。此工具可一鍵輸出：
+
+- 物理拓撲檔（`configs/astra-sim/topos/*.txt`）
+- 邏輯拓撲檔（`configs/astra-sim/topos/logical_*.json`）
+- 系統設定檔（`configs/astra-sim/system/system_*.json`）
+
+支援 **Torus**、**Twisted Torus** 與 **Fat-Tree**。例如：
+
+```bash
+# 產生 128 節點 4×4×8 Torus
+python3 src/topology_generator.py \
+  --type torus \
+  --nodes 128 \
+  --dims 4 4 8 \
+  --bw-intra 65Gbps --lat-intra 0.014ms \
+  --bw-inter 25Gbps --lat-inter 0.005ms
+
+# 產生 128 節點 4×4×8 Twisted Torus
+python3 src/topology_generator.py \
+  --type twisted_torus \
+  --nodes 128 \
+  --dims 4 4 8 \
+  --bw-intra 65Gbps --lat-intra 0.014ms \
+  --bw-inter 25Gbps --lat-inter 0.005ms
+
+# 產生 128 節點 Fat-Tree
+python3 src/topology_generator.py \
+  --type fattree \
+  --nodes 128 \
+  --bw-intra 65Gbps --lat-intra 0.014ms \
+  --bw-inter 65Gbps --lat-inter 0.005ms
+```
+
+若只想快速重現本研究所使用的 topology，直接使用 `configs/astra-sim/topos/` 與 `configs/astra-sim/system/` 內既有檔案即可；若要修改維度、頻寬、延遲或拓撲型別，則可使用這個產生器重新輸出對應檔案。
 
 | 參數 | Fat-Tree（L16_S8） | Torus（4×4×8） | Twisted Torus（4×4×8） |
 |---|---|---|---|
@@ -294,8 +333,18 @@ viz/twisted_torus_3d.html
 
 ## 常見問題
 
-**Q：ns-3 模擬無限期卡死，沒有任何輸出？**
-A：ET 檔案過大導致。生成追蹤時將 `--trace-steps` 控制在 1–4。節點數超過 5000 的檔案可能耗盡 ASTRA-sim ETFeeder 的資源。
+**Q：ns-3 模擬看起來很久沒有結束，是不是卡死了？**
+A：不一定。對真實拓樸與較大的 ET 檔案而言，模擬時間可能非常長；以本研究的 128-node 實驗為例，**單一實驗平均約需 5 天** 才會產出完整結果。因此不能用「跑了 10 分鐘還沒結束」來判斷卡死。
+
+建議先檢查輸出目錄中的 `fct.txt` 是否仍持續產生內容，例如：
+
+```text
+runs/20260324-013221+0800_ns3_128gpu_qwen05b_file_logical_128nodes_FatTree_L16_S8/out/fct.txt
+```
+
+如果 `fct.txt` 持續有新數值寫入，通常代表模擬仍在正常進行，而不是卡死。
+
+真正可能導致異常的情況仍包括 ET 檔案過大；生成追蹤時建議將 `--trace-steps` 控制在 1–4，因為非常大的 ET 檔可能耗盡 ASTRA-sim ETFeeder 的資源，或顯著拖慢模擬速度。另外，由於每個實驗可能執行數天，你也可以使用**多個 shell 同時跑多個實驗**，提高整體實驗效率。
 
 **Q：ASTRA-sim 出現 `"Node X in ctrl_dep graph, but not found in index"` 錯誤？**
 A：ET 檔案的 DAG 完整性異常（自依賴或循環依賴）。重新執行 `conver_to_chakra_et.py`，內建的 DAG 修復 Pass（`fix_et_dag_inplace`）應可自動解決。

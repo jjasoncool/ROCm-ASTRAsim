@@ -100,6 +100,8 @@ Key features:
 - **Virtual scale-up** (stage 3): scales a small (2-GPU) trace to a large (e.g., 128-GPU) simulation
 - **Auto-calibration** (stage 3): computes `alpha_us` and appends results to `runs/calibration_all.csv`
 
+**Additional validation note.** Beyond the ResNet-50 and CIFAR-10 examples below, the thesis also validates the pipeline on a **Qwen2.5-0.5B** DDP trace. The resulting ET contains **37 AllReduce COMM nodes** and about **1.84 GiB** of communication volume per step, confirming that the pipeline generalizes to an LLM-scale workload on AMD ROCm.
+
 ---
 
 ## 3. Quick Start
@@ -174,7 +176,7 @@ python scripts/run_ns3.py \
   --lmbw 540
 ```
 
-> Check `runs/calibration_all.csv`. In the thesis, ResNet-50 is the primary calibration benchmark; `α_step` is the main wall-clock conversion factor, while `α_comm` is diagnostic only.
+> Check `runs/calibration_all.csv`. In the thesis, ResNet-50 is the primary calibration benchmark; $\alpha_{step}$ is the main wall-clock conversion factor, while $\alpha_{comm}$ is diagnostic only.
 
 ---
 
@@ -185,7 +187,7 @@ python scripts/run_ns3.py \
 | Parameter | Description | Default | Example |
 |---|---|---|---|
 | `--workload` | Directory containing `.et` workload files | required | `data/chakra/workload_et` |
-| `--model-tag` | Tag to filter workload and trace files | optional | `cifar10`, `resnet50` |
+| `--model-tag` | Tag to filter workload and trace files | optional | `cifar10`, `resnet50`, `qwen05b` |
 | `--virtual-world N` | Virtually scale workload to N nodes | optional | `128` |
 | `--topo` | Logical topology (ASTRA-sim) | `auto:1d` | `auto:2d`, `dims:4x4`, `file:topo.json` |
 | `--phys-topo` | Physical topology (ns-3) | inferred from world size | `configs/astra-sim/topos/128_nodes_*.txt` |
@@ -228,11 +230,11 @@ When `run_ns3.py` runs at `world=2` (without `--no-autocalib`):
 2. **Find real trace**: locate the Kineto trace matching `--model-tag` in `--trace-dir`; extract `real_t_step_ms`
 3. **Compute alpha**:
 
-   $$\alpha_{us} = \frac{real\_t\_step\_ms \times 1000}{sim\_cycles\_step}$$
+   $$\alpha_{\mathrm{us}} = \frac{\mathrm{real\_t\_step\_ms} \times 1000}{\mathrm{sim\_cycles\_step}}$$
 
-   $\alpha_{us}$ (also written as `α_step`) represents how many real-world microseconds correspond to one simulation cycle. In the thesis, this is the **primary calibration factor** used for all 128-node topology comparisons.
+   $\alpha_{\mathrm{us}}$ (also written as $\alpha_{step}$) represents how many real-world microseconds correspond to one simulation cycle. In the thesis, this is the **primary calibration factor** used for all 128-node topology comparisons.
 
-   The script also computes `α_comm` as a diagnostic metric, but it is **not used for calibration** due to semantic differences between ASTRA-sim's Comm time (scheduling latency) and PyTorch Profiler's RCCL kernel duration (cumulative sum).
+   The script also computes $\alpha_{comm}$ as a diagnostic metric, but it is **not used for calibration** due to semantic differences between ASTRA-sim's Comm time (scheduling latency) and PyTorch Profiler's RCCL kernel duration (cumulative sum).
 
 4. **Save results**: write to `out/metrics.csv` and append to `runs/calibration_all.csv`
 
@@ -256,7 +258,7 @@ Scale a calibrated 2-GPU model up to a 128-GPU virtual simulation.
 ### Step 1: Verify baseline accuracy
 
 - Check `runs/calibration_all.csv`
-- ResNet-50: use `α_step` for wall-clock conversion and treat communication time primarily as a **relative topology metric**
+- ResNet-50: use $\alpha_{step}$ for wall-clock conversion and treat communication time primarily as a **relative topology metric**
 - CIFAR-10: excluded from large-scale topology evaluation because unmodeled software overhead dominates step time
 
 ### Step 2: Run virtual expansion
@@ -272,10 +274,23 @@ python scripts/run_ns3.py \
   --lmbw 540
 ```
 
-### Step 3: Analyze speedup
+### Step 3: Inspect output metrics
 
-Read `sim_t_step_ms` from `out/metrics.csv` and compute communication efficiency:
+Inspect `out/metrics.csv`, `stdout.log`, and related output files to review results such as:
 
-$$\text{Efficiency} = \frac{T_{ideal}}{T_{sim}} \times 100\%$$
+- `sim_t_step_ms`
+- communication / wall time
+- per-rank statistics
 
-where $T_{ideal} = T_{compute\_2gpu} \div (128/2)$ (assuming perfect linear scaling).
+The following metrics are especially useful and should be interpreted together:
+
+- **`sim_t_step_ms`**: end-to-end step time, used to compare final execution time across topologies.
+- **communication / wall time ratio**: indicates how communication-dominated the workload is; a higher ratio suggests a more communication-bound regime.
+- **per-rank statistics**: useful for checking whether a subset of ranks is lagging behind, which may indicate imbalance or localized congestion.
+- **`fct.txt` and related output statistics**: useful for confirming that the simulation is still making progress and for inspecting flow-completion behavior.
+
+For topology comparison, these metrics can be read together as follows:
+
+- If different topologies have nearly identical **`sim_t_step_ms`**, communication is likely still hidden by computation and topology effects are not yet exposed.
+- If the **communication / wall time ratio increases** and `sim_t_step_ms` begins to diverge across topologies, the workload is entering a topology-sensitive regime.
+- If one topology achieves a lower **`sim_t_step_ms`** under a similar communication ratio, it suggests better communication efficiency or load balancing for that workload.

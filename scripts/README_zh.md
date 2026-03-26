@@ -126,6 +126,7 @@ torchrun --standalone --nproc_per_node=2 ./src/train_rocm_pytorch.py \
 ```bash
 python src/conver_to_chakra_et.py --model-tag cifar10
 ```
+
 > 若進行 latency-dominated 診斷，可再搭配 `--force-avg-kernel-ns` 將 wall-clock 時間攤提回計算節點；但目前已將 CIFAR-10 排除於大規模拓撲評估之外。
 
 **步驟 3：執行模擬與自動校準**
@@ -229,7 +230,9 @@ python scripts/run_ns3.py \
 2. **查找真實 Trace**：根據 `--model-tag` 在 `--trace-dir` 中找到對應的 Kineto trace，提取 `real_t_step_ms`
 3. **計算 Alpha**：
 
-   $$\alpha_{\mathrm{us}} = \frac{\mathrm{real\_t\_step\_ms} \times 1000}{\mathrm{sim\_cycles\_step}}$$
+   $$
+   \alpha_{\mathrm{us}} = \frac{\mathrm{real\_t\_step\_ms} \times 1000}{\mathrm{sim\_cycles\_step}}
+   $$
 
    $\alpha_{\mathrm{us}}$（即 $\alpha_{step}$）代表每個模擬 cycle 對應多少真實世界的微秒（µs），為所有 128 節點拓撲比較的**主要校準係數**。
 

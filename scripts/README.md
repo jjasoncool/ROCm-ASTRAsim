@@ -230,7 +230,9 @@ When `run_ns3.py` runs at `world=2` (without `--no-autocalib`):
 2. **Find real trace**: locate the Kineto trace matching `--model-tag` in `--trace-dir`; extract `real_t_step_ms`
 3. **Compute alpha**:
 
-   $$\alpha_{\mathrm{us}} = \frac{\mathrm{real\_t\_step\_ms} \times 1000}{\mathrm{sim\_cycles\_step}}$$
+   $$
+   \alpha_{\mathrm{us}} = \frac{\mathrm{real\_t\_step\_ms} \times 1000}{\mathrm{sim\_cycles\_step}}
+   $$
 
    $\alpha_{\mathrm{us}}$ (also written as $\alpha_{step}$) represents how many real-world microseconds correspond to one simulation cycle. In the thesis, this is the **primary calibration factor** used for all 128-node topology comparisons.
 

@@ -51,7 +51,7 @@ $$T_{link} = \frac{T_{RCCL} - T_{overhead}}{N_{hops}}$$
 
 ### Example: Two-Node Single-Switch Setup
 
-**Measure** (`rccl-tests`, small message): $T_{RCCL} \approx 25\ \mu s$
+**Measure** (`rccl-tests`, small message): $T_{\mathrm{RCCL}} \approx 25\,\mu\mathrm{s}$
 
 As a concrete reference point, small-message `all_reduce_perf` runs on this platform (8–1024 B, FP16, 2 GPUs) show end-to-end latency in the **~25.8–33.8 µs** range, corresponding to **12.9–16.9 µs per link** on the 2-hop calibration path. We adopt **14 µs** as a representative effective per-link latency near the center of this measured range.
 

@@ -51,7 +51,7 @@ $$T_{link} = \frac{T_{RCCL} - T_{overhead}}{N_{hops}}$$
 
 ### 範例：雙節點單 Switch 架構
 
-**測量**（`rccl-tests` 小封包）：$T_{RCCL} \approx 25\ \mu s$
+**測量**（`rccl-tests` 小封包）：$T_{\mathrm{RCCL}} \approx 25\,\mu\mathrm{s}$
 
 作為具體參考，本平台上的小訊息 `all_reduce_perf` 測試（8–1024 B、FP16、2 GPUs）量測到的端對端延遲約落在 **~25.8–33.8 µs**，對應到 2-hop 校準路徑上的 **12.9–16.9 µs per-link**。文件採用 **14 µs** 作為此量測範圍中央附近的代表性有效延遲。
 

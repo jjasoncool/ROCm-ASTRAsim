@@ -99,6 +99,42 @@ python scripts/run_ns3.py \
  --no-autocalib
 ```
 
+# 128 nodes Torus (8TP+16DDP)
+```bash
+python scripts/run_ns3.py \
+  --workload data/chakra/workload_et \
+  --model-tag qwen15b_tp8ddp \
+  --topo file:configs/astra-sim/topos/logical_128nodes_TP8_DDP16.json \
+  --phys-topo configs/astra-sim/topos/128nodes_Torus_4x4x8.txt \
+  --system configs/astra-sim/system/system_128nodes_Torus_TP8DDP.json \
+  --virtual-world 128 --lmbw 540 --no-autocalib \
+  --comm-scale 1.984
+```
+
+# 128 nodes Twisted Torus (8TP+16DDP)
+```bash
+python scripts/run_ns3.py \
+  --workload data/chakra/workload_et \
+  --model-tag qwen15b_tp8ddp \
+  --topo file:configs/astra-sim/topos/logical_128nodes_TP8_DDP16.json \
+  --phys-topo configs/astra-sim/topos/128nodes_TwistedTorus_4x4x8.txt \
+  --system configs/astra-sim/system/system_128nodes_TwistedTorus_TP8DDP.json \
+  --virtual-world 128 --lmbw 540 --no-autocalib \
+  --comm-scale 1.984
+```
+
+# 128 nodes Fat-Tree (8TP+16DDP)
+```bash
+python scripts/run_ns3.py \
+  --workload data/chakra/workload_et \
+  --model-tag qwen15b_tp8ddp \
+  --topo file:configs/astra-sim/topos/logical_128nodes_TP8_DDP16.json \
+  --phys-topo configs/astra-sim/topos/128nodes_FatTree_L16_S8.txt \
+  --system configs/astra-sim/system/system_128nodes_FatTree_TP8DDP.json \
+  --virtual-world 128 --lmbw 540 --no-autocalib \
+  --comm-scale 1.984
+```
+
 ## 128 nodes Torus all-to-all
 
 ```bash
@@ -149,7 +185,7 @@ python scripts/run_ns3.py \
  --model-tag resnet50_all2all \
  --topo file:configs/astra-sim/topos/logical_128nodes_Torus_4x4x8.json \
  --phys-topo configs/astra-sim/topos/128nodes_Torus_4x4x8.txt \
- --system configs/astra-sim/system/system_128nodes_Torus_4x4x8_direct.json \
+ --system configs/astra-sim/system/system_128nodes_Torus_4x4x8.json \
  --virtual-world 128 \
  --lmbw 540 \
  --no-autocalib
@@ -163,7 +199,7 @@ python scripts/run_ns3.py \
  --model-tag resnet50_all2all \
  --topo file:configs/astra-sim/topos/logical_128nodes_TwistedTorus_4x4x8.json \
  --phys-topo configs/astra-sim/topos/128nodes_TwistedTorus_4x4x8.txt \
- --system configs/astra-sim/system/system_128nodes_TwistedTorus_4x4x8_direct.json \
+ --system configs/astra-sim/system/system_128nodes_TwistedTorus_4x4x8.json \
  --virtual-world 128 \
  --lmbw 540 \
  --no-autocalib
@@ -177,7 +213,7 @@ python scripts/run_ns3.py \
  --model-tag resnet50_all2all \
  --topo file:configs/astra-sim/topos/logical_128nodes_FatTree_L16_S8.json \
  --phys-topo configs/astra-sim/topos/128nodes_FatTree_L16_S8.txt \
- --system configs/astra-sim/system/system_128nodes_FatTree_L16_S8_direct.json \
+ --system configs/astra-sim/system/system_128nodes_FatTree_L16_S8.json \
  --virtual-world 128 \
  --lmbw 540 \
  --no-autocalib
@@ -199,7 +235,7 @@ python scripts/run_ns3.py \
   --model-tag resnet50_all2all_1GB \
   --topo file:configs/astra-sim/topos/logical_128nodes_Torus_4x4x8.json \
   --phys-topo configs/astra-sim/topos/128nodes_Torus_4x4x8.txt \
-  --system configs/astra-sim/system/system_128nodes_Torus_4x4x8_direct.json \
+  --system configs/astra-sim/system/system_128nodes_Torus_4x4x8.json \
   --virtual-world 128 \
   --payload 12000 \
   --lmbw 540 \
@@ -214,7 +250,7 @@ python scripts/run_ns3.py \
   --model-tag resnet50_all2all_1GB \
   --topo file:configs/astra-sim/topos/logical_128nodes_TwistedTorus_4x4x8.json \
   --phys-topo configs/astra-sim/topos/128nodes_TwistedTorus_4x4x8.txt \
-  --system configs/astra-sim/system/system_128nodes_TwistedTorus_4x4x8_direct.json \
+  --system configs/astra-sim/system/system_128nodes_TwistedTorus_4x4x8.json \
   --virtual-world 128 \
   --payload 12000 \
   --lmbw 540 \
@@ -229,7 +265,7 @@ python scripts/run_ns3.py \
   --model-tag resnet50_all2all_1GB \
   --topo file:configs/astra-sim/topos/logical_128nodes_FatTree_L16_S8.json \
   --phys-topo configs/astra-sim/topos/128nodes_FatTree_L16_S8.txt \
-  --system configs/astra-sim/system/system_128nodes_FatTree_L16_S8_direct.json \
+  --system configs/astra-sim/system/system_128nodes_FatTree_L16_S8.json \
   --virtual-world 128 \
   --payload 12000 \
   --lmbw 540 \
@@ -245,7 +281,7 @@ python scripts/run_ns3.py \
   --model-tag resnet50_all2all_100MB \
   --topo file:configs/astra-sim/topos/logical_128nodes_Torus_4x4x8.json \
   --phys-topo configs/astra-sim/topos/128nodes_Torus_4x4x8.txt \
-  --system configs/astra-sim/system/system_128nodes_Torus_4x4x8_direct.json \
+  --system configs/astra-sim/system/system_128nodes_Torus_4x4x8.json \
   --virtual-world 128 \
   --payload 12000 \
   --lmbw 540 \
@@ -260,7 +296,7 @@ python scripts/run_ns3.py \
   --model-tag resnet50_all2all_100MB \
   --topo file:configs/astra-sim/topos/logical_128nodes_TwistedTorus_4x4x8.json \
   --phys-topo configs/astra-sim/topos/128nodes_TwistedTorus_4x4x8.txt \
-  --system configs/astra-sim/system/system_128nodes_TwistedTorus_4x4x8_direct.json \
+  --system configs/astra-sim/system/system_128nodes_TwistedTorus_4x4x8.json \
   --virtual-world 128 \
   --payload 12000 \
   --lmbw 540 \
@@ -275,7 +311,7 @@ python scripts/run_ns3.py \
   --model-tag resnet50_all2all_100MB \
   --topo file:configs/astra-sim/topos/logical_128nodes_FatTree_L16_S8.json \
   --phys-topo configs/astra-sim/topos/128nodes_FatTree_L16_S8.txt \
-  --system configs/astra-sim/system/system_128nodes_FatTree_L16_S8_direct.json \
+  --system configs/astra-sim/system/system_128nodes_FatTree_L16_S8.json \
   --virtual-world 128 \
   --payload 12000 \
   --lmbw 540 \
@@ -290,7 +326,7 @@ python scripts/run_ns3.py \
   --model-tag resnet50_all2all_512MB \
   --topo file:configs/astra-sim/topos/logical_128nodes_Torus_4x4x8.json \
   --phys-topo configs/astra-sim/topos/128nodes_Torus_4x4x8.txt \
-  --system configs/astra-sim/system/system_128nodes_Torus_4x4x8_direct.json \
+  --system configs/astra-sim/system/system_128nodes_Torus_4x4x8.json \
   --virtual-world 128 \
   --payload 12000 \
   --lmbw 540 \
@@ -305,7 +341,7 @@ python scripts/run_ns3.py \
   --model-tag resnet50_all2all_512MB \
   --topo file:configs/astra-sim/topos/logical_128nodes_TwistedTorus_4x4x8.json \
   --phys-topo configs/astra-sim/topos/128nodes_TwistedTorus_4x4x8.txt \
-  --system configs/astra-sim/system/system_128nodes_TwistedTorus_4x4x8_direct.json \
+  --system configs/astra-sim/system/system_128nodes_TwistedTorus_4x4x8.json \
   --virtual-world 128 \
   --payload 12000 \
   --lmbw 540 \
@@ -320,7 +356,7 @@ python scripts/run_ns3.py \
   --model-tag resnet50_all2all_512MB \
   --topo file:configs/astra-sim/topos/logical_128nodes_FatTree_L16_S8.json \
   --phys-topo configs/astra-sim/topos/128nodes_FatTree_L16_S8.txt \
-  --system configs/astra-sim/system/system_128nodes_FatTree_L16_S8_direct.json \
+  --system configs/astra-sim/system/system_128nodes_FatTree_L16_S8.json \
   --virtual-world 128 \
   --payload 12000 \
   --lmbw 540 \

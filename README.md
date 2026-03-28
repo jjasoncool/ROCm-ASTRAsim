@@ -282,7 +282,7 @@ python scripts/run_ns3.py \
   --model-tag resnet50_all2all_1GB \
   --topo file:configs/astra-sim/topos/logical_128nodes_TwistedTorus_4x4x8.json \
   --phys-topo configs/astra-sim/topos/128nodes_TwistedTorus_4x4x8.txt \
-  --system configs/astra-sim/system/system_128nodes_TwistedTorus_4x4x8_direct.json \
+  --system configs/astra-sim/system/system_128nodes_TwistedTorus_4x4x8.json \
   --virtual-world 128 --payload 12000 --lmbw 540 --no-autocalib
 ```
 

@@ -42,6 +42,9 @@ ET 檔案驗證工具 - 增強版
   完整分析：
     python src/tests/validate_et.py --validate --check-dag
 
+  DDP 驗證（比較原始 TP ET 和加了 DDP 的 ET）：
+    python src/tests/validate_et.py --compare-ddp --model-tag qwen15b_tp --target-tp 8
+
 支援的檔案格式：
   - allreduce.0.et, allreduce.1.et, ...
   - et.0.et, et.1.et, ...
@@ -73,7 +76,8 @@ from typing import Dict, Any, List, Tuple, Optional, Set
 from chakra.src.third_party.utils.protolib import decodeMessage as decode_message
 # et_def_pb2：Chakra 的 protobuf schema（Node / GlobalMetadata / 常數）
 from chakra.schema.protobuf.et_def_pb2 import (
-    GlobalMetadata, Node, ALL_REDUCE, ALL_GATHER, REDUCE_SCATTER, ALL_TO_ALL
+    GlobalMetadata, Node, ALL_REDUCE, ALL_GATHER, REDUCE_SCATTER, ALL_TO_ALL,
+    COMP_NODE, COMM_COLL_NODE,
 )
 
 COMM_NAMES = {
@@ -325,6 +329,169 @@ def fix_et_files(output_dir: str) -> bool:
         return False
 
 
+def compare_ddp(trace_dir: Path, model_tag: str, target_tp: int = 8):
+    """
+    比較原始 TP ET 和 TP+DDP ET，驗證 add_ddp_to_et.py 的正確性。
+
+    檢查項目：
+    1. COMP 數量不變
+    2. COMM 數量 = 原始 TP COMM + DDP buckets
+    3. COMP cycles 正確縮放（÷ target_tp/trace_tp）
+    4. DDP bucket 大小 ~25 MiB
+    5. TP COMM 大小不變
+    """
+    # Find files
+    base_tag = model_tag.removesuffix('_tp') if model_tag.endswith('_tp') else model_tag
+    ddp_tag = f"{base_tag}_tp{target_tp}ddp"
+
+    orig_pat = re.compile(rf'^et\.{re.escape(model_tag)}\.(\d+)\.et$')
+    ddp_pat = re.compile(rf'^et\.{re.escape(ddp_tag)}\.(\d+)\.et$')
+
+    orig_files = {int(m.group(1)): p
+                  for p in trace_dir.glob("*.et")
+                  if (m := orig_pat.match(p.name))}
+    ddp_files = {int(m.group(1)): p
+                 for p in trace_dir.glob("*.et")
+                 if (m := ddp_pat.match(p.name))}
+
+    if not orig_files:
+        print(f"❌ 找不到原始 ET: et.{model_tag}.*.et")
+        return False
+    if not ddp_files:
+        print(f"❌ 找不到 DDP ET: et.{ddp_tag}.*.et")
+        return False
+
+    print(f"🔍 比較 DDP 驗證: {model_tag} vs {ddp_tag}")
+    print(f"   原始: {len(orig_files)} files, DDP: {len(ddp_files)} files")
+    print()
+
+    all_pass = True
+
+    for rank in sorted(orig_files.keys()):
+        if rank not in ddp_files:
+            print(f"❌ Rank {rank}: DDP 版本不存在")
+            all_pass = False
+            continue
+
+        # Read both files (full nodes)
+        _, orig_nodes, _, _, _ = read_one_et(orig_files[rank], return_nodes=True)
+        _, ddp_nodes, _, _, _ = read_one_et(ddp_files[rank], return_nodes=True)
+
+        # Classify nodes
+        orig_comp = [n for n in orig_nodes if n.type == COMP_NODE]
+        orig_comm = [n for n in orig_nodes if n.type == COMM_COLL_NODE]
+        ddp_comp = [n for n in ddp_nodes if n.type == COMP_NODE]
+        ddp_comm = [n for n in ddp_nodes if n.type == COMM_COLL_NODE]
+
+        n_ddp_added = len(ddp_comm) - len(orig_comm)
+
+        print(f"📁 Rank {rank}: {orig_files[rank].name} vs {ddp_files[rank].name}")
+
+        # Check 1: COMP count unchanged
+        if len(orig_comp) == len(ddp_comp):
+            print(f"   ✅ COMP 數量不變: {len(orig_comp)}")
+        else:
+            print(f"   ❌ COMP 數量改變: {len(orig_comp)} → {len(ddp_comp)}")
+            all_pass = False
+
+        # Check 2: COMM count = orig + DDP
+        print(f"   {'✅' if n_ddp_added > 0 else '❌'} COMM 數量: {len(orig_comm)} → {len(ddp_comm)} (TP={len(orig_comm)}, DDP=+{n_ddp_added})")
+
+        # Check 3: COMP cycles scaled
+        def _get_cycles(node):
+            for a in node.attr:
+                if a.name == 'compute_cycles':
+                    return a.int64_val
+            return 0
+
+        if orig_comp and ddp_comp:
+            orig_c = _get_cycles(orig_comp[0])
+            ddp_c = _get_cycles(ddp_comp[0])
+            if orig_c > 0 and ddp_c > 0:
+                ratio = ddp_c / orig_c
+                expected = 2 / target_tp  # trace_tp=2, target_tp=8 → 0.25
+                ok = abs(ratio - expected) < 0.01
+                print(f"   {'✅' if ok else '❌'} COMP cycles 縮放: {orig_c:,} → {ddp_c:,} (×{ratio:.4f}, 預期 ×{expected})")
+                if not ok:
+                    all_pass = False
+
+        # Check 4: DDP bucket sizes
+        def _get_comm_size(node):
+            for a in node.attr:
+                if a.name == 'comm_size':
+                    return a.int64_val
+            return 0
+
+        if n_ddp_added > 0:
+            ddp_only = ddp_comm[len(orig_comm):]  # DDP nodes are appended at end
+            ddp_sizes = [_get_comm_size(n) for n in ddp_only]
+            if ddp_sizes:
+                avg_mib = sum(ddp_sizes) / len(ddp_sizes) / 1024 / 1024
+                ok = 20 < avg_mib < 30  # ~25 MiB PyTorch default
+                print(f"   {'✅' if ok else '⚠️'} DDP bucket 平均: {avg_mib:.1f} MiB × {len(ddp_sizes)} buckets")
+
+        # Check 5: TP COMM sizes unchanged
+        if orig_comm and ddp_comm:
+            orig_tp_sizes = [_get_comm_size(n) for n in orig_comm[:3]]
+            ddp_tp_sizes = [_get_comm_size(n) for n in ddp_comm[:3]]
+            ok = orig_tp_sizes == ddp_tp_sizes
+            print(f"   {'✅' if ok else '❌'} TP COMM 大小不變: 前 3 個 = {[f'{s/1024:.0f} KiB' for s in orig_tp_sizes]}")
+            if not ok:
+                all_pass = False
+
+        # Check 6: involved_dim correctness
+        def _get_involved_dim(node):
+            for a in node.attr:
+                if a.name == "involved_dim":
+                    if a.HasField('bool_list'):
+                        return list(a.bool_list.values)
+            return None
+
+        # TP nodes should have [true, false, false]
+        if ddp_comm:
+            tp_nodes_in_ddp = ddp_comm[:len(orig_comm)]  # first N are TP
+            ddp_only_nodes = ddp_comm[len(orig_comm):]    # rest are DDP
+
+            # Check TP involved_dim
+            tp_sample = _get_involved_dim(tp_nodes_in_ddp[0]) if tp_nodes_in_ddp else None
+            if tp_sample is None:
+                print(f"   ❌ TP COMM 缺少 involved_dim（ASTRA-sim 會走全部維度 → 錯誤）")
+                all_pass = False
+            elif tp_sample == [True, False, False]:
+                # Verify all TP nodes have same value
+                tp_all_ok = all(_get_involved_dim(n) == [True, False, False] for n in tp_nodes_in_ddp)
+                print(f"   {'✅' if tp_all_ok else '❌'} TP involved_dim = [true, false, false] (Dim 0 only) — {len(tp_nodes_in_ddp)} nodes")
+                if not tp_all_ok:
+                    all_pass = False
+            else:
+                print(f"   ❌ TP involved_dim 不正確: {tp_sample}（預期 [true, false, false]）")
+                all_pass = False
+
+            # Check DDP involved_dim
+            ddp_sample = _get_involved_dim(ddp_only_nodes[0]) if ddp_only_nodes else None
+            if ddp_sample is None:
+                print(f"   ❌ DDP COMM 缺少 involved_dim（ASTRA-sim 會走全部維度 → 錯誤）")
+                all_pass = False
+            elif ddp_sample == [False, True, True]:
+                ddp_all_ok = all(_get_involved_dim(n) == [False, True, True] for n in ddp_only_nodes)
+                print(f"   {'✅' if ddp_all_ok else '❌'} DDP involved_dim = [false, true, true] (Dim 1+2 only) — {len(ddp_only_nodes)} nodes")
+                if not ddp_all_ok:
+                    all_pass = False
+            else:
+                print(f"   ❌ DDP involved_dim 不正確: {ddp_sample}（預期 [false, true, true]）")
+                all_pass = False
+
+        print()
+
+    if all_pass:
+        print(f"✅ 所有檢查通過！ET 可以跑 ASTRA-sim。")
+        print(f"   使用: python src/run_ns3.py --model-tag {ddp_tag} ...")
+    else:
+        print(f"❌ 部分檢查失敗，請檢查 add_ddp_to_et.py 的輸出。")
+
+    return all_pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -351,11 +518,30 @@ def main():
         "--prefix", type=str, default=None,
         help="指定要檢查的檔案前綴 (例如: resnet50_all2all_1GB)"
     )
+    ap.add_argument(
+        "--compare-ddp", action="store_true",
+        help="比較原始 TP ET 和 TP+DDP ET 的正確性"
+    )
+    ap.add_argument(
+        "--model-tag", type=str, default="qwen15b_tp",
+        help="模型標籤，用於 --compare-ddp (預設: qwen15b_tp)"
+    )
+    ap.add_argument(
+        "--target-tp", type=int, default=8,
+        help="目標 TP degree，用於 --compare-ddp (預設: 8)"
+    )
     args = ap.parse_args()
 
     # 如果是修復模式，直接執行修復
     if args.fix:
         success = fix_et_files(args.output)
+        sys.exit(0 if success else 1)
+
+    # 如果是 DDP 比較模式
+    if args.compare_ddp:
+        script_dir = Path(__file__).resolve().parent
+        trace_dir = (script_dir / "../../data/chakra/workload_et").resolve()
+        success = compare_ddp(trace_dir, args.model_tag, args.target_tp)
         sys.exit(0 if success else 1)
 
     # 詳細分析預設開啟

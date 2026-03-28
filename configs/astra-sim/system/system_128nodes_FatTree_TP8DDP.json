@@ -5,21 +5,23 @@
   "preferred-dataset-splits": 4,
   "all-reduce-implementation": [
     "ring",
-    "ring",
-    "ring"
+    "halvingDoubling",
+    "halvingDoubling"
   ],
   "all-gather-implementation": [
     "ring",
-    "ring",
-    "ring"
+    "halvingDoubling",
+    "halvingDoubling"
   ],
   "reduce-scatter-implementation": [
     "ring",
-    "ring",
-    "ring"
+    "halvingDoubling",
+    "halvingDoubling"
   ],
   "all-to-all-implementation": [
-    "direct"
+    "ring",
+    "ring",
+    "ring"
   ],
   "collective-optimization": "localBWAware",
   "local-mem-bw": 540,

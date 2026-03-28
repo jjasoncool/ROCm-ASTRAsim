@@ -416,12 +416,14 @@ def main():
     # 路徑
     script_dir = os.path.dirname(os.path.abspath(__file__))
     base_dir   = os.path.abspath(os.path.join(script_dir, "../data/chakra"))
+    models_dir = os.path.abspath(os.path.join(script_dir, "../data/models"))
     traces_dir = Path(base_dir) / "pytorch_traces"
     metrics_dir= Path(base_dir) / "gpu_metrics"
     data_dir   = os.path.abspath(os.path.join(script_dir, "../data/cifar10"))
     traces_dir.mkdir(parents=True, exist_ok=True)
     metrics_dir.mkdir(parents=True, exist_ok=True)
     Path(data_dir).mkdir(parents=True, exist_ok=True)
+    Path(models_dir).mkdir(parents=True, exist_ok=True)
 
     # --- Log 設定 ---
     log_dir = Path(base_dir) / "log"
@@ -450,16 +452,18 @@ def main():
         model = ResNet50ForCIFAR().to(device)
     elif args.model == "qwen05b":
         assert HAS_TRANSFORMERS, "請先安裝: pip install transformers accelerate sentencepiece --break-system-packages"
-        print(f"[Rank {rank}] Loading Qwen2.5-0.5B (FP32)...")
+        print(f"[Rank {rank}] Loading Qwen2.5-0.5B (FP32) → {models_dir}")
         model = AutoModelForCausalLM.from_pretrained(
-            "Qwen/Qwen2.5-0.5B", torch_dtype=torch.float32,
+            "Qwen/Qwen2.5-0.5B", dtype=torch.float32,
+            cache_dir=models_dir,
         ).to(device)
     elif args.model == "llama1b":
         assert HAS_TRANSFORMERS, "請先安裝: pip install transformers accelerate sentencepiece --break-system-packages"
-        print(f"[Rank {rank}] Loading Llama-3.2-1B (FP32)...")
+        print(f"[Rank {rank}] Loading Llama-3.2-1B (FP32) → {models_dir}")
         print(f"[Rank {rank}] 注意: 需要先 huggingface-cli login 並接受 Meta license")
         model = AutoModelForCausalLM.from_pretrained(
-            "meta-llama/Llama-3.2-1B", torch_dtype=torch.float32,
+            "meta-llama/Llama-3.2-1B", dtype=torch.float32,
+            cache_dir=models_dir,
         ).to(device)
 
     # 印出參數量（方便確認 gradient size）

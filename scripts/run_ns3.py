@@ -289,7 +289,7 @@ def _write_et(meta: GlobalMetadata, nodes: list[Node], out_path: Path) -> None:
         for n in nodes:
             encode_message(f, n)
 
-def expand_workload_virtual_if_needed(workload_src: Path, tmp_dir: Path, virtual_world: int | None, tag: str = None) -> tuple[Path, int]:
+def expand_workload_virtual_if_needed(workload_src: Path, tmp_dir: Path, virtual_world: int | None, tag: str = None, comm_scale: float | None = None) -> tuple[Path, int]:
     # 傳入 tag 以確保讀取正確的來源檔案
     et_map = list_et_rank_files(workload_src, tag)
     M = len(et_map)
@@ -311,16 +311,24 @@ def expand_workload_virtual_if_needed(workload_src: Path, tmp_dir: Path, virtual
     m = ET_PAT.match(any_path.name)
     prefix = m.group("prefix") if m else "et"
 
-    scale = (M * (N - 1)) / (N * (M - 1))
-    print(f"[INFO] 以來源 M={M} ({prefix}) 擴張到 N={N}；通訊 bytes 縮放係數 scale={scale:.6f}")
+    # comm_size 縮放：
+    #   預設不縮放（scale=1.0），ASTRA-sim 內部會自行根據 ring size 分割 comm_size
+    #   若指定 --comm-scale，則手動乘上該倍率
+    if comm_scale is not None:
+        scale = comm_scale
+        print(f"[INFO] 以來源 M={M} ({prefix}) 擴張到 N={N}；手動 comm_size 縮放係數 scale={scale:.6f}")
+    else:
+        scale = 1.0
+        print(f"[INFO] 以來源 M={M} ({prefix}) 擴張到 N={N}；comm_size 不縮放 (scale=1.0)")
 
     out_dir = tmp_dir / f"workload_{N}"
     for r in range(N):
         src_rank = r % M
         src_path = et_map[src_rank]
         meta, nodes = _read_all_nodes(src_path)
-        for node in nodes:
-            _scale_comm_size_inplace(node, scale)
+        if scale != 1.0:
+            for node in nodes:
+                _scale_comm_size_inplace(node, scale)
 
         # 保持與來源相同的 prefix (包含 tag)，僅變更 rank
         dst_path = out_dir / f"{prefix}.{r}.et"
@@ -968,6 +976,9 @@ def main():
                     help="邏輯拓樸：auto:1d|auto:2d|auto:3d|dims:2x4|dims:2x2x2|file:/path/to.json")
     ap.add_argument("--virtual-world", type=int, default=None,
                     help="以『實測 .et』當模板，臨時擴張到 N（僅支援 .et）")
+    ap.add_argument("--comm-scale", type=float, default=None,
+                    help="手動指定 comm_size 縮放倍率（預設不縮放）。"
+                         "例如 --comm-scale 1.984 可與先前 DDP 實驗保持可比性")
     # 系統層/網路層覆蓋
     ap.add_argument("--coll-opt", default=None, help='覆蓋 system.json "collective-optimization"（例 localBWAware / none）')
     ap.add_argument("--lmbw", type=int, default=None, help="覆蓋 system.json local-mem-bw（例 1600）")
@@ -1035,7 +1046,7 @@ def main():
 
     # 虛擬擴張（如有）
     # [修改] 傳入 tag
-    workload_dir2, actual_world = expand_workload_virtual_if_needed(workload_dir, tmp_dir, args.virtual_world, args.model_tag)
+    workload_dir2, actual_world = expand_workload_virtual_if_needed(workload_dir, tmp_dir, args.virtual_world, args.model_tag, args.comm_scale)
     print(f"[INFO] workload={workload_dir2}  world_size={actual_world}  tag={args.model_tag}")
 
     # 邏輯拓樸檔

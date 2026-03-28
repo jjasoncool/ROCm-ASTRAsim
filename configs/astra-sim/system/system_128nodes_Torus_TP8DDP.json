@@ -19,7 +19,9 @@
     "ring"
   ],
   "all-to-all-implementation": [
-    "direct"
+    "ring",
+    "ring",
+    "ring"
   ],
   "collective-optimization": "localBWAware",
   "local-mem-bw": 540,

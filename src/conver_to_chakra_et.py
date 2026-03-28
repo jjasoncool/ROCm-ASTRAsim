@@ -47,11 +47,18 @@ PyTorch Trace 轉 Chakra ET 轉換工具 (AMD ROCm 增強版)
      將原本的 AllReduce 替換為 All-to-All，用於測試 Twisted Torus 拓撲。
      $ python src/conver_to_chakra_et.py --model-tag resnet50 --replace-comm all_to_all
 
+  5. 【TP+DDP 模式】轉換 TP trace 並加入 DDP AllReduce + TP=8 COMP 縮放
+     自動從 data/models/ 偵測模型參數量，計算 DDP gradient size。
+     $ python src/conver_to_chakra_et.py --model-tag qwen15b_tp --default-gpu-freq 3200 --add-ddp --target-tp 8
+
 參數說明：
   --model-tag STR          : 指定模型標籤 (用於檔名過濾與輸出命名)
   --force-avg-kernel-ns INT: [校準用] 強制指定平均 Kernel 時間 (奈秒)，若設定則忽略 Trace 真實平均值
   --default-gpu-freq FLOAT : 預設 GPU 頻率 (MHz)，當找不到 metrics 檔案時使用
   --replace-comm STR       : [壓力測試] 強制替換通訊模式 (目前支援: 'all_to_all')
+  --add-ddp                : [TP+DDP] 在 TP ET 中加入 DDP AllReduce 節點
+  --target-tp INT          : [TP+DDP] 目標 TP degree (e.g. 2, 4, 8)，會縮放 COMP 時間
+  --models-dir PATH        : [TP+DDP] HuggingFace 模型快取目錄 (預設: ./data/models)
   --no-clean               : 保留舊的輸出檔案
 """
 from __future__ import annotations
@@ -1265,6 +1272,13 @@ def main():
     ap.add_argument("--model-tag", type=str, default=None, help="指定模型標籤 (e.g., cifar10, resnet50) 用於過濾檔案與命名輸出")
     # [新增] 壓力測試參數
     ap.add_argument("--replace-comm", type=str, default=None, help="[壓力測試] 強制替換通訊模式 (例如: all_to_all)")
+    # [新增] TP+DDP 後處理
+    ap.add_argument("--add-ddp", action="store_true",
+                    help="[TP+DDP] 在 TP ET 中加入 DDP AllReduce 節點")
+    ap.add_argument("--target-tp", type=int, default=None,
+                    help="[TP+DDP] 目標 TP degree (e.g. 2, 4, 8)，會縮放 COMP 時間")
+    ap.add_argument("--models-dir", type=str, default="./data/models",
+                    help="[TP+DDP] HuggingFace 模型快取目錄，用於自動偵測參數量")
 
     args = ap.parse_args()
 
@@ -1389,6 +1403,20 @@ def main():
                     override_comm_type_inplace(et, args.replace_comm)
                 except Exception as e:
                     print(f"[override] 通訊模式替換失敗: {e}")
+
+            # [新增] TP+DDP: 加入 DDP AllReduce 並縮放 COMP
+            if args.add_ddp and args.target_tp:
+                try:
+                    from add_ddp_to_et import add_ddp_to_tp_et
+                    add_ddp_to_tp_et(
+                        et_file=et,
+                        target_tp=args.target_tp,
+                        model_tag=args.model_tag,
+                        models_dir=Path(args.models_dir) if args.models_dir else None,
+                    )
+                except Exception as e:
+                    print(f"[add-ddp] TP+DDP 後處理失敗: {e}")
+                    import traceback; traceback.print_exc()
 
     print("\n[done] 轉換完成。請到以下資料夾查看輸出：", et_dir)
     print(f"[Log] 完整記錄已儲存至: {log_file}")

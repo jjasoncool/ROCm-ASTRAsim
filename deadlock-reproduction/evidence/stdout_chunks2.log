@@ -1,0 +1,60 @@
+# active-chunks-per-dimension=2
+# Full log: 7384 flows completed, then deadlock
+
+[   0.0s] ASTRA-sim + NS3
+[   0.0s] There are 128 npus: 4,4,8,
+[   0.0s] [2026-04-03 06:15:10.504] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 4 index in ring: 0 offset: 1 total nodes in ring: 4
+[   0.0s] [2026-04-03 06:15:10.504] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 4 index in ring: 0 offset: 4 total nodes in ring: 4
+[   0.0s] [2026-04-03 06:15:10.504] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 8 index in ring: 0 offset: 16 total nodes in ring: 8
+[   0.0s] [2026-04-03 06:15:10.504] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 4 index in ring: 0 offset: 1 total nodes in ring: 4
+[   0.0s] [2026-04-03 06:15:10.504] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 4 index in ring: 0 offset: 4 total nodes in ring: 4
+[   0.0s] [2026-04-03 06:15:10.504] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 8 index in ring: 0 offset: 16 total nodes in ring: 8
+[   0.0s] [2026-04-03 06:15:10.504] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 4 index in ring: 0 offset: 1 total nodes in ring: 4
+[   0.0s] [2026-04-03 06:15:10.504] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 4 index in ring: 0 offset: 4 total nodes in ring: 4
+[   0.0s] [2026-04-03 06:15:10.504] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 8 index in ring: 0 offset: 16 total nodes in ring: 8
+[   0.0s] [2026-04-03 06:15:10.504] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 4 index in ring: 0 offset: 1 total nodes in ring: 4
+[  17.5s] QP is enabled
+[  17.9s] maxRtt=199698 maxBdp=1370996
+[  50.5s] [DIAG] send_flow #1 src=0 dst=1 size=1089760 tag=500000000
+[  50.5s] [DIAG] send_flow #2 src=0 dst=1 size=1089760 tag=500000001
+[  50.5s] [DIAG] send_flow #3 src=1 dst=2 size=1089760 tag=500000000
+[  50.5s] [DIAG] send_flow #4 src=1 dst=2 size=1089760 tag=500000001
+[  50.5s] [DIAG] send_flow #5 src=2 dst=3 size=1089760 tag=500000000
+[  50.5s] [DIAG] send_flow #6 src=2 dst=3 size=1089760 tag=500000001
+[  50.5s] [DIAG] send_flow #7 src=3 dst=0 size=1089760 tag=500000000
+[  50.5s] [DIAG] send_flow #8 src=3 dst=0 size=1089760 tag=500000001
+[  50.5s] [DIAG] send_flow #9 src=4 dst=5 size=1089760 tag=500000000
+[  50.5s] [DIAG] send_flow #10 src=4 dst=5 size=1089760 tag=500000001
+[  50.5s] [DIAG] send_flow #11 src=5 dst=6 size=1089760 tag=500000000
+[  50.5s] [DIAG] send_flow #12 src=5 dst=6 size=1089760 tag=500000001
+[  50.5s] [DIAG] send_flow #13 src=6 dst=7 size=1089760 tag=500000000
+[  50.5s] [DIAG] send_flow #14 src=6 dst=7 size=1089760 tag=500000001
+[  50.5s] [DIAG] send_flow #15 src=7 dst=4 size=1089760 tag=500000000
+[  50.5s] [DIAG] send_flow #16 src=7 dst=4 size=1089760 tag=500000001
+
+... (intermediate flows omitted) ...
+
+[8140.3s] [DIAG] qp_finish #5335 src=12 dst=28 size=34055 tag=10023 sport=100
+[8140.3s] [DIAG] qp_finish #5336 src=84 dst=85 size=1089760 tag=10010 sport=100
+[8140.3s] [DIAG] qp_finish #5337 src=73 dst=89 size=34055 tag=10021 sport=100
+[8151.8s] [DIAG] qp_finish #5338 src=65 dst=66 size=1089760 tag=10008 sport=100
+[8151.8s] [DIAG] qp_finish #5339 src=1 dst=17 size=34055 tag=10020 sport=100
+[8151.8s] [DIAG] qp_finish #5340 src=101 dst=97 size=272440 tag=10000 sport=100
+[8151.8s] [DIAG] qp_finish #5341 src=89 dst=105 size=34055 tag=10015 sport=100
+[8151.9s] [DIAG] qp_finish #5342 src=37 dst=53 size=34055 tag=10023 sport=100
+[8151.9s] [DIAG] qp_finish #5343 src=37 dst=53 size=34055 tag=10024 sport=100
+[8151.9s] [DIAG] qp_finish #5344 src=13 dst=29 size=34055 tag=10019 sport=100
+[8151.9s] [DIAG] qp_finish #5345 src=105 dst=121 size=34055 tag=10016 sport=100
+[8151.9s] [DIAG] qp_finish #5346 src=14 dst=30 size=34055 tag=10018 sport=100
+[8151.9s] [DIAG] qp_finish #5347 src=61 dst=77 size=34055 tag=10012 sport=100
+[8151.9s] [DIAG] qp_finish #5348 src=89 dst=105 size=34055 tag=10016 sport=100
+[8151.9s] [DIAG] qp_finish #5349 src=16 dst=20 size=272440 tag=10009 sport=100
+[8151.9s] [DIAG] qp_finish #5350 src=5 dst=21 size=34055 tag=10021 sport=100
+[8531.1s] [DIAG] send_flow #6000 src=9 dst=25 size=34055 tag=500000000
+[8727.3s] [DIAG] qp_finish #6000 src=9 dst=25 size=34055 tag=10026 sport=100
+[10145.6s] [DIAG] send_flow #7000 src=48 dst=51 size=1089760 tag=500000000
+[10705.4s] [DIAG] qp_finish #7000 src=105 dst=121 size=34055 tag=10030 sport=100
+
+# Simulation hangs here. No further output.
+# 7384 flows completed vs 5337 for chunks=1
+# Same deadlock pattern, just delayed.

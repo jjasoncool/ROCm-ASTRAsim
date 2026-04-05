@@ -1,0 +1,58 @@
+# active-chunks-per-dimension=1, FIFO (proves scheduling policy irrelevant)
+# Full log: 5337 flows completed, identical to LIFO run
+
+[   0.0s] ASTRA-sim + NS3
+[   0.0s] There are 128 npus: 4,4,8,
+[   0.0s] [2026-04-02 19:40:41.137] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 4 index in ring: 0 offset: 1 total nodes in ring: 4
+[   0.0s] [2026-04-02 19:40:41.137] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 4 index in ring: 0 offset: 4 total nodes in ring: 4
+[   0.0s] [2026-04-02 19:40:41.137] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 8 index in ring: 0 offset: 16 total nodes in ring: 8
+[   0.0s] [2026-04-02 19:40:41.137] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 4 index in ring: 0 offset: 1 total nodes in ring: 4
+[   0.0s] [2026-04-02 19:40:41.137] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 4 index in ring: 0 offset: 4 total nodes in ring: 4
+[   0.0s] [2026-04-02 19:40:41.137] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 8 index in ring: 0 offset: 16 total nodes in ring: 8
+[   0.0s] [2026-04-02 19:40:41.137] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 4 index in ring: 0 offset: 1 total nodes in ring: 4
+[   0.0s] [2026-04-02 19:40:41.137] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 4 index in ring: 0 offset: 4 total nodes in ring: 4
+[   0.0s] [2026-04-02 19:40:41.138] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 8 index in ring: 0 offset: 16 total nodes in ring: 8
+[   0.0s] [2026-04-02 19:40:41.138] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 4 index in ring: 0 offset: 1 total nodes in ring: 4
+[  17.8s] QP is enabled
+[  18.1s] maxRtt=199698 maxBdp=1370996
+[  52.6s] [DIAG] send_flow #1 src=0 dst=1 size=1089760 tag=500000000
+[  52.6s] [DIAG] send_flow #2 src=1 dst=2 size=1089760 tag=500000000
+[  52.6s] [DIAG] send_flow #3 src=2 dst=3 size=1089760 tag=500000000
+[  52.6s] [DIAG] send_flow #4 src=3 dst=0 size=1089760 tag=500000000
+[  52.6s] [DIAG] send_flow #5 src=4 dst=5 size=1089760 tag=500000000
+[  52.6s] [DIAG] send_flow #6 src=5 dst=6 size=1089760 tag=500000000
+[  52.6s] [DIAG] send_flow #7 src=6 dst=7 size=1089760 tag=500000000
+[  52.6s] [DIAG] send_flow #8 src=7 dst=4 size=1089760 tag=500000000
+[  52.6s] [DIAG] send_flow #9 src=8 dst=9 size=1089760 tag=500000000
+[  52.6s] [DIAG] send_flow #10 src=9 dst=10 size=1089760 tag=500000000
+[  52.6s] [DIAG] send_flow #11 src=10 dst=11 size=1089760 tag=500000000
+[  52.6s] [DIAG] send_flow #12 src=11 dst=8 size=1089760 tag=500000000
+[  52.6s] [DIAG] send_flow #13 src=12 dst=13 size=1089760 tag=500000000
+[  52.6s] [DIAG] send_flow #14 src=13 dst=14 size=1089760 tag=500000000
+[  52.6s] [DIAG] send_flow #15 src=14 dst=15 size=1089760 tag=500000000
+[  52.6s] [DIAG] send_flow #16 src=15 dst=12 size=1089760 tag=500000000
+
+... (intermediate flows omitted) ...
+
+[7550.5s] [DIAG] send_flow #4000 src=108 dst=124 size=34055 tag=500000001
+[7825.9s] [DIAG] qp_finish #4000 src=54 dst=70 size=34055 tag=10017 sport=100
+[11352.7s] [DIAG] send_flow #5000 src=23 dst=27 size=272440 tag=500000003
+[11662.5s] [DIAG] qp_finish #5000 src=23 dst=27 size=272440 tag=10011 sport=100
+[13546.7s] [DIAG] send_flow #5330 src=67 dst=71 size=272440 tag=500000003
+[13678.7s] [DIAG] send_flow #5331 src=103 dst=107 size=272440 tag=500000003
+[13678.7s] [DIAG] send_flow #5332 src=103 dst=107 size=272440 tag=500000003
+[13858.4s] [DIAG] send_flow #5333 src=28 dst=31 size=1089760 tag=500000000
+[14145.3s] [DIAG] send_flow #5334 src=107 dst=111 size=272440 tag=500000003
+[14193.0s] [DIAG] send_flow #5335 src=66 dst=70 size=272440 tag=500000003
+[14193.0s] [DIAG] send_flow #5336 src=66 dst=70 size=272440 tag=500000003
+[14457.0s] [DIAG] send_flow #5337 src=70 dst=74 size=272440 tag=500000003
+[14468.9s] [DIAG] qp_finish #5330 src=66 dst=70 size=272440 tag=10011 sport=100
+[14552.8s] [DIAG] qp_finish #5331 src=28 dst=31 size=1089760 tag=10002 sport=100
+[14720.8s] [DIAG] qp_finish #5332 src=70 dst=74 size=272440 tag=10011 sport=100
+[14876.3s] [DIAG] qp_finish #5333 src=78 dst=77 size=1089760 tag=10000 sport=100
+[14888.3s] [DIAG] qp_finish #5334 src=78 dst=77 size=1089760 tag=10001 sport=100
+[14983.7s] [DIAG] qp_finish #5335 src=99 dst=98 size=1089760 tag=10000 sport=100
+[14983.7s] [DIAG] qp_finish #5336 src=99 dst=98 size=1089760 tag=10001 sport=100
+[15007.5s] [DIAG] qp_finish #5337 src=99 dst=98 size=1089760 tag=10002 sport=100
+
+# Identical result: 5337 flows, same 575 unique (src,dst) pairs.

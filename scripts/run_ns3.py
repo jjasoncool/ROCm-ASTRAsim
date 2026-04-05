@@ -169,7 +169,8 @@ def patch_network_cfg(src: Path, out: Path, *,
                       qcn: int | None = None,
                       pfc_dyn: int | None = None,
                       buffer_size: int | None = None,
-                      payload: int | None = None) -> Path:
+                      payload: int | None = None,
+                      no_qlen: bool = False) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True, mode=0o777)
     out_dir.chmod(0o777)
     lines = src.read_text(encoding="utf-8").splitlines()
@@ -231,7 +232,7 @@ def patch_network_cfg(src: Path, out: Path, *,
         "TRACE_OUTPUT_FILE": out_dir / "mix.tr",
         "FCT_OUTPUT_FILE":   out_dir / "fct.txt",
         "PFC_OUTPUT_FILE":   out_dir / "pfc.txt",
-        "QLEN_MON_FILE":     out_dir / "qlen.txt",
+        "QLEN_MON_FILE":     Path("/dev/null") if no_qlen else out_dir / "qlen.txt",
     }
     for k, v in out_targets.items():
         v.parent.mkdir(parents=True, exist_ok=True, mode=0o777)
@@ -998,6 +999,7 @@ def main():
     ap.add_argument("--model-tag", type=str, default=None, help="模型標籤 (e.g., cifar10, resnet50)，用於選擇對應的 .et 與 trace")
     # [新增這行] 除錯開關
     ap.add_argument("--debug-ns3", action="store_true", help="啟用 NS-3 底層詳細 Log (用於偵測卡死)")
+    ap.add_argument("--no-qlen", action="store_true", help="關閉 qlen.txt 輸出（指向 /dev/null），避免 128-node 模擬產生數百 GB 檔案")
 
     args = ap.parse_args()
 
@@ -1090,7 +1092,8 @@ def main():
     patch_network_cfg(net_cfg, net_patched,
                       topo_file=phys_topo, out_dir=out_dir,
                       qcn=args.qcn, pfc_dyn=args.pfc_dyn,
-                      buffer_size=args.buffer, payload=args.payload)
+                      buffer_size=args.buffer, payload=args.payload,
+                      no_qlen=args.no_qlen)
 
     # Workload prefix 參數
     # [修改] 傳入 tag

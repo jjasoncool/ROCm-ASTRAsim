@@ -447,7 +447,7 @@ def compare_ddp(trace_dir: Path, model_tag: str, target_tp: int = 8):
                         return list(a.bool_list.values)
             return None
 
-        # TP nodes should have [true, false, false]
+        # TP nodes should have [false, false, true] (Dim 2 = Z-axis, 65G)
         if ddp_comm:
             tp_nodes_in_ddp = ddp_comm[:len(orig_comm)]  # first N are TP
             ddp_only_nodes = ddp_comm[len(orig_comm):]    # rest are DDP
@@ -457,14 +457,14 @@ def compare_ddp(trace_dir: Path, model_tag: str, target_tp: int = 8):
             if tp_sample is None:
                 print(f"   ❌ TP COMM 缺少 involved_dim（ASTRA-sim 會走全部維度 → 錯誤）")
                 all_pass = False
-            elif tp_sample == [True, False, False]:
+            elif tp_sample == [False, False, True]:
                 # Verify all TP nodes have same value
-                tp_all_ok = all(_get_involved_dim(n) == [True, False, False] for n in tp_nodes_in_ddp)
-                print(f"   {'✅' if tp_all_ok else '❌'} TP involved_dim = [true, false, false] (Dim 0 only) — {len(tp_nodes_in_ddp)} nodes")
+                tp_all_ok = all(_get_involved_dim(n) == [False, False, True] for n in tp_nodes_in_ddp)
+                print(f"   {'✅' if tp_all_ok else '❌'} TP involved_dim = [false, false, true] (Dim 2 only, Z-axis 65G) — {len(tp_nodes_in_ddp)} nodes")
                 if not tp_all_ok:
                     all_pass = False
             else:
-                print(f"   ❌ TP involved_dim 不正確: {tp_sample}（預期 [true, false, false]）")
+                print(f"   ❌ TP involved_dim 不正確: {tp_sample}（預期 [false, false, true]）")
                 all_pass = False
 
             # Check DDP involved_dim
@@ -472,13 +472,13 @@ def compare_ddp(trace_dir: Path, model_tag: str, target_tp: int = 8):
             if ddp_sample is None:
                 print(f"   ❌ DDP COMM 缺少 involved_dim（ASTRA-sim 會走全部維度 → 錯誤）")
                 all_pass = False
-            elif ddp_sample == [False, True, True]:
-                ddp_all_ok = all(_get_involved_dim(n) == [False, True, True] for n in ddp_only_nodes)
-                print(f"   {'✅' if ddp_all_ok else '❌'} DDP involved_dim = [false, true, true] (Dim 1+2 only) — {len(ddp_only_nodes)} nodes")
+            elif ddp_sample == [True, True, False]:
+                ddp_all_ok = all(_get_involved_dim(n) == [True, True, False] for n in ddp_only_nodes)
+                print(f"   {'✅' if ddp_all_ok else '❌'} DDP involved_dim = [true, true, false] (Dim 0+1, X/Y 25G) — {len(ddp_only_nodes)} nodes")
                 if not ddp_all_ok:
                     all_pass = False
             else:
-                print(f"   ❌ DDP involved_dim 不正確: {ddp_sample}（預期 [false, true, true]）")
+                print(f"   ❌ DDP involved_dim 不正確: {ddp_sample}（預期 [true, true, false]）")
                 all_pass = False
 
         print()

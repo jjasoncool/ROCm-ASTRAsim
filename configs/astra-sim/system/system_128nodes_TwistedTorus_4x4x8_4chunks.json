@@ -4,8 +4,8 @@
   "active-chunks-per-dimension": 4,
   "preferred-dataset-splits": 4,
   "all-reduce-implementation": [
-    "ring",
-    "ring",
+    "halvingDoubling",
+    "halvingDoubling",
     "ring"
   ],
   "all-gather-implementation": [

@@ -6,8 +6,13 @@ add_ddp_to_et.py — 為 TP Execution Trace 加入 DDP AllReduce 通訊節點
 === 目的 ===
 TP trace 只記錄 intra-server 的 TP AllReduce（每層做 partial sum 合併）。
 但 128 GPU 的真實部署是 TP + DDP：
-  - TP（intra-server）：每層 AllReduce，走 PCIe
-  - DDP（inter-server）：gradient sync AllReduce，走 Ethernet
+  - TP（intra-server）：每層 AllReduce，走 PCIe（Z-axis, 65G, Dim 2）
+  - DDP（inter-server）：gradient sync AllReduce，走 Ethernet（X/Y-axes, 25G, Dim 0+1）
+
+Logical topology: [4, 4, 8]
+  - Dim 0 (size 4, offset 1):  X-axis, 25 Gbps → DDP
+  - Dim 1 (size 4, offset 4):  Y-axis, 25 Gbps → DDP
+  - Dim 2 (size 8, offset 16): Z-axis, 65 Gbps → TP
 
 TP trace 裡沒有 DDP 通訊，因為只有 1 台 server。
 這個腳本把 DDP AllReduce 節點加入 ET，讓 ASTRA-sim 能模擬完整的 TP+DDP。
@@ -220,7 +225,7 @@ def _detect_model_info(et_file: Path, model_tag: Optional[str] = None,
 
 def _create_ddp_allreduce_node(node_id: int, bucket_idx: int,
                                 comm_size: int, dep_id: int) -> Node:
-    """Create a DDP AllReduce COMM node with involved_dim=[false,true] (Dim 1 only)."""
+    """Create a DDP AllReduce COMM node with involved_dim=[true,true,false] (Dim 0+1 only)."""
     n = Node()
     n.id = node_id
     n.name = f"DDP_AllReduce_bucket_{bucket_idx}"
@@ -232,12 +237,12 @@ def _create_ddp_allreduce_node(node_id: int, bucket_idx: int,
     n.attr.append(AttributeProto(name="comm_size", int64_val=comm_size))
     n.attr.append(AttributeProto(name="group_id", int64_val=1))  # group 1 = DDP
 
-    # involved_dim: DDP runs on Dim 1 + Dim 2 (inter-server)
-    # Dim 0 = TP (intra-server), Dim 1 = DDP-Y, Dim 2 = DDP-X
+    # involved_dim: DDP runs on Dim 0 + Dim 1 (inter-server, X/Y axes, 25G)
+    # Logical [4,4,8]: Dim 0 = X (DDP), Dim 1 = Y (DDP), Dim 2 = Z (TP, 65G)
     involved_attr = AttributeProto(name="involved_dim")
-    involved_attr.bool_list.values.append(False)  # Dim 0: skip (TP only)
-    involved_attr.bool_list.values.append(True)   # Dim 1: run DDP
-    involved_attr.bool_list.values.append(True)   # Dim 2: run DDP
+    involved_attr.bool_list.values.append(True)   # Dim 0 (X): run DDP
+    involved_attr.bool_list.values.append(True)   # Dim 1 (Y): run DDP
+    involved_attr.bool_list.values.append(False)  # Dim 2 (Z): skip (TP only)
     n.attr.append(involved_attr)
 
     # Dependency: chain buckets sequentially, first bucket depends on last COMP
@@ -344,8 +349,8 @@ def add_ddp_to_tp_et(
                         break
     print(f"[add-ddp] COMP nodes scaled: {comp_scaled} (× {comp_scale})")
 
-    # ---- Tag TP COMM nodes with involved_dim=[true,false] ----
-    # TP AllReduce only runs on Dim 0 (intra-server, 8 GPUs)
+    # ---- Tag TP COMM nodes with involved_dim=[false,false,true] ----
+    # Logical [4,4,8]: TP AllReduce only runs on Dim 2 (Z-axis, intra-server, 65G)
     tp_tagged = 0
     for n in nodes:
         if n.type == COMM_COLL_NODE:
@@ -353,12 +358,12 @@ def add_ddp_to_tp_et(
             has_involved = any(a.name == "involved_dim" for a in n.attr)
             if not has_involved:
                 involved_attr = AttributeProto(name="involved_dim")
-                involved_attr.bool_list.values.append(True)   # Dim 0: run TP AllReduce here
-                involved_attr.bool_list.values.append(False)  # Dim 1: skip (DDP only)
-                involved_attr.bool_list.values.append(False)  # Dim 2: skip (DDP only)
+                involved_attr.bool_list.values.append(False)  # Dim 0 (X): skip (DDP only)
+                involved_attr.bool_list.values.append(False)  # Dim 1 (Y): skip (DDP only)
+                involved_attr.bool_list.values.append(True)   # Dim 2 (Z): run TP AllReduce here
                 n.attr.append(involved_attr)
                 tp_tagged += 1
-    print(f"[add-ddp] TP COMM nodes tagged with involved_dim=[true,false]: {tp_tagged}")
+    print(f"[add-ddp] TP COMM nodes tagged with involved_dim=[false,false,true]: {tp_tagged}")
 
     # ---- Find insertion point: last node ID ----
     max_id = max(n.id for n in nodes)

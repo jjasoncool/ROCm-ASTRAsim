@@ -40,7 +40,7 @@ ASTRA-sim NS-3 網路模擬器執行腳本
 5. 校準管理：自動校準和資料庫維護
 """
 
-import argparse, json, math, os, re, subprocess, sys, time, shutil, csv, hashlib, shlex
+import argparse, json, math, os, re, subprocess, sys, time, shutil, csv, hashlib, shlex, threading, signal
 from pathlib import Path
 from statistics import median
 
@@ -828,9 +828,63 @@ def run_simulation(cmd: list, stdout_path: Path, logroot: Path) -> int:
     full_log_buffer = []
 
     start_time = time.time()
-    last_output_time = start_time
-    qp_enabled_seen = False
-    simulation_started = False
+
+    # ── 背景進度監控 ──
+    # ns-3 在模擬期間不輸出任何文字，可能跑數天完全靜默。
+    # 此 thread 每 30 秒檢查 fct.txt 的修改時間，偵測卡死並自動終止。
+    # 規則：fct.txt 已有內容（>0 bytes）後，若 3 分鐘無更新 → 確認卡死 → 自動 kill。
+    out_dir_mon = stdout_path.parent / "out"
+    _monitor_stop = threading.Event()
+    _process_ref = [None]  # mutable container，讓 monitor thread 能存取 process
+    DEADLOCK_WARN_SEC = 180    # 3 分鐘：開始警告
+    DEADLOCK_KILL_SEC = 10800  # 3 小時：自動 kill
+
+    def _progress_monitor():
+        fct_path = out_dir_mon / "fct.txt"
+        prev_size = 0
+        stale_since = None  # fct.txt 停止增長的時間點
+
+        while not _monitor_stop.wait(30):
+            elapsed = time.time() - start_time
+            hrs = elapsed / 3600
+            try:
+                st = fct_path.stat() if fct_path.exists() else None
+                cur_size = st.st_size if st else 0
+            except OSError:
+                continue
+
+            delta = cur_size - prev_size
+            now = time.time()
+
+            if delta > 0:
+                # 有增長 → 正常
+                stale_since = None
+                print(f"[MONITOR] {hrs:5.1f}h | fct.txt: {cur_size/1e6:.1f} MB (+{delta/1e6:.1f} MB) | 模擬進行中")
+            elif cur_size > 0:
+                # 有內容但沒增長 → 開始計時
+                if stale_since is None:
+                    stale_since = now
+                stale_sec = now - stale_since
+                if stale_sec >= DEADLOCK_KILL_SEC:
+                    print(f"[MONITOR] {hrs:5.1f}h | fct.txt: {cur_size/1e6:.1f} MB | ❌ 已 {stale_sec/3600:.1f}h 無更新，確認卡死，自動終止 process")
+                    proc = _process_ref[0]
+                    if proc is not None:
+                        try:
+                            proc.kill()
+                        except Exception as e:
+                            print(f"[MONITOR] 自動終止失敗: {e}，請手動 kill")
+                    return
+                elif stale_sec >= DEADLOCK_WARN_SEC:
+                    print(f"[MONITOR] {hrs:5.1f}h | fct.txt: {cur_size/1e6:.1f} MB (無增長 {stale_sec:.0f}s) | ⚠️ 疑似卡死，{(DEADLOCK_KILL_SEC-stale_sec)/3600:.1f}h 後自動終止")
+            else:
+                # 尚未產生
+                stale_since = None
+                print(f"[MONITOR] {hrs:5.1f}h | fct.txt: 尚未產生 | ns-3 初始化中...")
+
+            prev_size = cur_size
+
+    monitor_thread = threading.Thread(target=_progress_monitor, daemon=True)
+    monitor_thread.start()
 
     try:
         # 使用 Popen 啟動子程序
@@ -842,7 +896,7 @@ def run_simulation(cmd: list, stdout_path: Path, logroot: Path) -> int:
             universal_newlines=True,
             bufsize=1
         )
-
+        _process_ref[0] = process  # 讓 monitor thread 能存取 process
         # 逐行讀取輸出 (即時監控迴圈)
         for line in process.stdout:
             current_time = time.time()
@@ -856,39 +910,16 @@ def run_simulation(cmd: list, stdout_path: Path, logroot: Path) -> int:
             # 2. 螢幕顯示
             print(formatted_line.rstrip())
 
-            # 3. 靜默/卡死偵測邏輯 (完全保留)
+            # 3. 狀態追蹤（供 log 參考）
             line_lower = line.lower()
-
-            # 狀態更新
             if "qp is enabled" in line_lower:
-                qp_enabled_seen = True
                 print(f"[INFO] NS3 網路模擬開始執行...")
-            elif qp_enabled_seen and ("maxrtt" in line_lower or "finished" in line_lower):
-                simulation_started = True
-
-            # 計算靜默時間
-            silence_duration = current_time - last_output_time
-
-            # 根據階段決定警告門檻
-            if qp_enabled_seen and not simulation_started:
-                # NS3 計算密集階段：容忍 120 秒
-                warning_threshold = 120
-                if silence_duration > warning_threshold:
-                    print(f"[WARN] NS3 模擬已靜默 {silence_duration:.1f} 秒（正常現象，網路模擬進行中）")
-                    print(f"[INFO] 如確實卡死可按 Ctrl+C 中斷")
-                    last_output_time = current_time # 重置以免洗版
-            else:
-                # 一般階段：容忍 30 秒
-                warning_threshold = 30
-                if silence_duration > warning_threshold:
-                    print(f"[WARN] 已 {silence_duration:.1f} 秒無新輸出，可能卡死...")
-                    print(f"[INFO] 如需中斷請按 Ctrl+C")
-                    last_output_time = current_time
-
-            last_output_time = current_time
+            elif "finished" in line_lower:
+                print(f"[INFO] 偵測到模擬完成訊號")
 
         # 等待程序完全結束
         process.wait()
+        _monitor_stop.set()
 
         # 模擬結束後，一次性將記憶體內容寫入硬碟
         try:
@@ -902,6 +933,7 @@ def run_simulation(cmd: list, stdout_path: Path, logroot: Path) -> int:
             raise subprocess.CalledProcessError(process.returncode, cmd)
 
     except subprocess.CalledProcessError as e:
+        _monitor_stop.set()
         print("-" * 80)
         print(f"[ERR] NS3 執行失敗，退出碼: {e.returncode}")
 
@@ -935,9 +967,19 @@ def run_simulation(cmd: list, stdout_path: Path, logroot: Path) -> int:
             except Exception as cleanup_err:
                 print(f"[WARN] 清理失敗輸出時發生錯誤: {cleanup_err}")
 
+        # 確保資料夾權限為 777
+        try:
+            logroot.chmod(0o777)
+            for item in logroot.rglob("*"):
+                item.chmod(0o777)
+        except: pass
+
         return e.returncode # 回傳非 0
 
     except KeyboardInterrupt:
+        # 防止用戶連按 Ctrl+C 打斷 cleanup
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        _monitor_stop.set()
         print("\n[INFO] 用戶中斷執行")
         if 'process' in locals():
             process.terminate()
@@ -952,6 +994,13 @@ def run_simulation(cmd: list, stdout_path: Path, logroot: Path) -> int:
                 with stdout_path.open("w", encoding="utf-8") as lf:
                     lf.writelines(full_log_buffer)
              except: pass
+
+        # 確保資料夾權限為 777
+        try:
+            logroot.chmod(0o777)
+            for item in logroot.rglob("*"):
+                item.chmod(0o777)
+        except: pass
 
         return 130 # 標準的中斷退出碼
 
@@ -1037,9 +1086,10 @@ def main():
         logical_dims = load_logical_dims(topo_json_path)
 
     topo_desc = extract_topo_description(topo_arg, logical_dims)
-    # [修改] 在 log 目錄名加入 tag
+    # [修改] 在 log 目錄名加入 tag 和物理拓撲名稱
     tag_str = f"_{args.model_tag}" if args.model_tag else ""
-    logroot = Path(args.log_dir).resolve() / f"{stamp}_ns3_{world_for_name}gpu{tag_str}_{topo_desc}"
+    phys_str = f"_{Path(args.phys_topo).stem}" if args.phys_topo else f"_{topo_desc}"
+    logroot = Path(args.log_dir).resolve() / f"{stamp}_ns3_{world_for_name}gpu{tag_str}{phys_str}"
     tmp_dir = logroot / "tmp"
     out_dir = logroot / "out"
     tmp_dir.mkdir(parents=True, exist_ok=True, mode=0o777)

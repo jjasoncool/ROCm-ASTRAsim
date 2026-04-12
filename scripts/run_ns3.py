@@ -290,13 +290,54 @@ def _write_et(meta: GlobalMetadata, nodes: list[Node], out_path: Path) -> None:
         for n in nodes:
             encode_message(f, n)
 
-def expand_workload_virtual_if_needed(workload_src: Path, tmp_dir: Path, virtual_world: int | None, tag: str = None, comm_scale: float | None = None) -> tuple[Path, int]:
+def _write_expansion_map(
+    out_dir: Path,
+    workload_src: Path,
+    prefix: str,
+    source_world: int,
+    virtual_world: int,
+    tag: str | None,
+    comm_scale: float,
+    rank_mapping: list[dict],
+    source_rank_groups: dict[str, list[int]],
+) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True, mode=0o777)
+    out_dir.chmod(0o777)
+    out_path = out_dir / "expansion_map.json"
+    payload = {
+        "source_workload_dir": str(workload_src.resolve()),
+        "expanded_workload_dir": str(out_dir.resolve()),
+        "source_world": source_world,
+        "virtual_world": virtual_world,
+        "tag": tag or "",
+        "prefix": prefix,
+        "comm_scale": comm_scale,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S%z"),
+        "rank_mapping": rank_mapping,
+        "source_rank_groups": source_rank_groups,
+    }
+    out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return out_path
+
+def cleanup_expanded_workload(expanded_dir: Path) -> int:
+    if not expanded_dir.exists():
+        return 0
+    removed = 0
+    for p in expanded_dir.glob("*.et"):
+        try:
+            p.unlink()
+            removed += 1
+        except Exception as e:
+            print(f"[WARN] 無法刪除 expanded ET {p}: {e}")
+    return removed
+
+def expand_workload_virtual_if_needed(workload_src: Path, tmp_dir: Path, virtual_world: int | None, tag: str = None, comm_scale: float | None = None) -> tuple[Path, int, dict | None]:
     # 傳入 tag 以確保讀取正確的來源檔案
     et_map = list_et_rank_files(workload_src, tag)
     M = len(et_map)
 
     if virtual_world is None:
-        return workload_src, M
+        return workload_src, M, None
 
     if virtual_world < 2:
         raise SystemExit("[ERR] --virtual-world 至少需要 2。")
@@ -306,7 +347,7 @@ def expand_workload_virtual_if_needed(workload_src: Path, tmp_dir: Path, virtual
     N = int(virtual_world)
     if N == M:
         print(f"[INFO] virtual-world={N} 與來源相同；不做擴張。")
-        return workload_src, M
+        return workload_src, M, None
 
     any_path = next(iter(et_map.values()))
     m = ET_PAT.match(any_path.name)
@@ -323,9 +364,13 @@ def expand_workload_virtual_if_needed(workload_src: Path, tmp_dir: Path, virtual
         print(f"[INFO] 以來源 M={M} ({prefix}) 擴張到 N={N}；comm_size 不縮放 (scale=1.0)")
 
     out_dir = tmp_dir / f"workload_{N}"
+    rank_mapping: list[dict] = []
+    source_rank_groups: dict[str, list[int]] = {str(src_rank): [] for src_rank in et_map.keys()}
     for r in range(N):
         src_rank = r % M
         src_path = et_map[src_rank]
+        rank_mapping.append({"virtual_rank": r, "source_rank": src_rank})
+        source_rank_groups[str(src_rank)].append(r)
         meta, nodes = _read_all_nodes(src_path)
         if scale != 1.0:
             for node in nodes:
@@ -335,8 +380,27 @@ def expand_workload_virtual_if_needed(workload_src: Path, tmp_dir: Path, virtual
         dst_path = out_dir / f"{prefix}.{r}.et"
         _write_et(meta, nodes, dst_path)
 
+    map_path = _write_expansion_map(
+        out_dir=out_dir,
+        workload_src=workload_src,
+        prefix=prefix,
+        source_world=M,
+        virtual_world=N,
+        tag=tag,
+        comm_scale=scale,
+        rank_mapping=rank_mapping,
+        source_rank_groups=source_rank_groups,
+    )
+
     print(f"[INFO] 產生虛擬工作負載：{out_dir} （共 {N} 份 .et）")
-    return out_dir, N
+    print(f"[INFO] rank 對應資訊輸出：{map_path}")
+    return out_dir, N, {
+        "expanded": True,
+        "expanded_dir": out_dir,
+        "map_path": map_path,
+        "source_world": M,
+        "virtual_world": N,
+    }
 
 # -------------------- Topo helpers --------------------
 
@@ -1098,7 +1162,7 @@ def main():
 
     # 虛擬擴張（如有）
     # [修改] 傳入 tag
-    workload_dir2, actual_world = expand_workload_virtual_if_needed(workload_dir, tmp_dir, args.virtual_world, args.model_tag, args.comm_scale)
+    workload_dir2, actual_world, expansion_meta = expand_workload_virtual_if_needed(workload_dir, tmp_dir, args.virtual_world, args.model_tag, args.comm_scale)
     print(f"[INFO] workload={workload_dir2}  world_size={actual_world}  tag={args.model_tag}")
 
     # 邏輯拓樸檔
@@ -1209,6 +1273,12 @@ def main():
     # 檢查回傳碼，若失敗直接退出
     if ret_code != 0:
         raise SystemExit(f"[ERR] 模擬執行失敗 (Code {ret_code})")
+
+    # 虛擬擴張成功跑完後，清理重複的 expanded ET，只保留 expansion_map.json
+    if expansion_meta and expansion_meta.get("expanded"):
+        removed = cleanup_expanded_workload(expansion_meta["expanded_dir"])
+        print(f"[INFO] 虛擬擴張 workload cleanup 完成：刪除 {removed} 個重複 .et 檔案")
+        print(f"[INFO] 保留 rank 對應資訊：{expansion_meta.get('map_path')}")
 
     print(f"[INFO] 完成。stdout → {stdout_path}")
     print(f"[INFO] FCT/QLEN/PFC/TRACE 等輸出 → {out_dir}")

@@ -153,7 +153,7 @@ python scripts/run_ns3.py \
   --phys-topo configs/astra-sim/topos/128nodes_Torus_4x4x8.txt \
   --system configs/astra-sim/system/system_128nodes_Torus_TP8DDP.json \
   --virtual-world 128 --lmbw 540 --no-autocalib \
-  --comm-scale 1.984
+  --comm-scale 1.984 --no-qlen
 ```
 
 # 128 nodes Twisted Torus (8TP+16DDP)
@@ -165,7 +165,7 @@ python scripts/run_ns3.py \
   --phys-topo configs/astra-sim/topos/128nodes_TwistedTorus_4x4x8.txt \
   --system configs/astra-sim/system/system_128nodes_TwistedTorus_TP8DDP.json \
   --virtual-world 128 --lmbw 540 --no-autocalib \
-  --comm-scale 1.984
+  --comm-scale 1.984 --no-qlen
 ```
 
 # 128 nodes Fat-Tree (8TP+16DDP)
@@ -177,7 +177,7 @@ python scripts/run_ns3.py \
   --phys-topo configs/astra-sim/topos/128nodes_FatTree_L16_S8.txt \
   --system configs/astra-sim/system/system_128nodes_FatTree_TP8DDP.json \
   --virtual-world 128 --lmbw 540 --no-autocalib \
-  --comm-scale 1.984
+  --comm-scale 1.984 --no-qlen
 ```
 
 ## 128 nodes Torus all-to-all

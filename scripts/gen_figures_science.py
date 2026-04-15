@@ -132,6 +132,20 @@ WALL_A2A_1GB = {
 
 GPU_CYCLES = 274_982_000
 
+# Qwen 0.5B DDP AllReduce (128 nodes, cost-matched)
+QWEN_DDP = {
+    'Torus + ring':    5_418_000_000,
+    'Fat-Tree + HD':   5_963_000_000,
+    'TT + ring':       9_549_000_000,
+    'TT + HD':         4_302_000_000,
+}
+QWEN_PFC = {
+    'Torus + ring':    0,
+    'Fat-Tree + HD':   14_970,
+    'TT + ring':       27_554,
+    'TT + HD':         70,
+}
+
 
 # ============================================================
 # Fig 4.4: Scope Boundary — Step Time Composition
@@ -245,9 +259,68 @@ def fig_5_1():
 
 
 # ============================================================
-# Fig 5.2: All-to-All 1GB Stacked Bar (unchanged)
+# Fig 5.2: Qwen 0.5B DDP — Topology-Algorithm Co-Design
+# Bar chart: 4 configurations, TT+HD highlighted with hatching
 # ============================================================
 def fig_5_2():
+    fig, ax = plt.subplots(figsize=(4.0, 3.0))
+
+    labels = ['3D Torus\n(ring)', 'Fat-Tree\n(HD)', 'Twisted Torus\n(ring)', 'Twisted Torus\n(HD)']
+    values_cycles = [QWEN_DDP[k] for k in ['Torus + ring', 'Fat-Tree + HD', 'TT + ring', 'TT + HD']]
+    values_M = [v / 1e6 for v in values_cycles]
+    colors = [C_ORANGE, C_BLUE, C_RED, C_GREEN]
+
+    x = np.arange(4)
+    bars = ax.bar(x, values_M, 0.55, color=colors, edgecolor='black', linewidth=0.4, zorder=3)
+
+    # Hatching on TT+HD bar to distinguish co-design result
+    bars[3].set_hatch('///')
+    bars[3].set_edgecolor('black')
+
+    ax.set_ylabel('Wall Time (M cycles)')
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=7)
+
+    # Value labels on top of each bar
+    for i, bar in enumerate(bars):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 150,
+                f'{values_M[i]:,.0f}', ha='center', va='bottom', fontsize=7, fontweight='bold')
+
+    # Bracket annotation above TT+ring and TT+HD bars
+    # Start bracket ABOVE the value labels (which are at bar_top + 150)
+    bracket_base = values_M[2] + 900  # above the "9,549" label
+    bracket_top = bracket_base + 700
+    # Left vertical line (above TT+ring)
+    ax.plot([2, 2], [bracket_base, bracket_top], color=C_GREEN, lw=0.8)
+    # Horizontal line
+    ax.plot([2, 3], [bracket_top, bracket_top], color=C_GREEN, lw=0.8)
+    # Right vertical line with arrow (down to TT+HD)
+    ax.annotate('', xy=(3, values_M[3] + 550), xytext=(3, bracket_top),
+                arrowprops=dict(arrowstyle='->', color=C_GREEN, lw=1.0))
+    # Label above bracket (escape % for LaTeX)
+    ax.text(2.5, bracket_top + 200, r'$-55\%$ (software only)',
+            ha='center', va='bottom', fontsize=6.5, color=C_GREEN, fontweight='bold')
+
+    ax.set_ylim(0, 13000)  # expand to fit bracket + label
+
+    ax.set_title('Qwen 0.5B DDP AllReduce (128 nodes, cost-matched)')
+    ax.legend(
+        [plt.Rectangle((0,0),1,1, fc=c, ec='black', lw=0.4) for c in [C_ORANGE, C_BLUE, C_RED]] +
+        [plt.Rectangle((0,0),1,1, fc=C_GREEN, ec='black', lw=0.4, hatch='///')],
+        ['Torus (ring)', 'Fat-Tree (HD)', 'TT (ring)', 'TT (HD)'],
+        loc='upper left', framealpha=0.9, fontsize=6
+    )
+    plt.tight_layout()
+    plt.savefig(f'{outdir}/fig_5_2_qwen_ddp.pdf')
+    plt.savefig(f'{outdir}/fig_5_2_qwen_ddp.png')
+    plt.close()
+    print("  Fig 5.2 done")
+
+
+# ============================================================
+# Fig 5.3: All-to-All 1GB Stacked Bar (was Fig 5.2)
+# ============================================================
+def fig_5_3():
     fig, ax = plt.subplots(figsize=(3.5, 3.0))
 
     wall_ms = [
@@ -283,18 +356,18 @@ def fig_5_2():
 
     ax.set_title('All-to-All Stress Test (128 nodes, 1 GB)')
     plt.tight_layout()
-    plt.savefig(f'{outdir}/fig_5_2_all2all.pdf')
-    plt.savefig(f'{outdir}/fig_5_2_all2all.png')
+    plt.savefig(f'{outdir}/fig_5_3_all2all.pdf')
+    plt.savefig(f'{outdir}/fig_5_3_all2all.png')
     plt.close()
-    print("  Fig 5.2 done")
+    print("  Fig 5.3 done")
 
 
 # ============================================================
-# Fig 5.3: Communication Volume Sweep (line chart)
+# Fig 5.4: Communication Volume Sweep (was Fig 5.3) (line chart)
 # Shows wall time vs comm_size for all 3 topologies
 # (was Fig 5.5; old Fig 5.3 3-panel bar chart deleted as redundant)
 # ============================================================
-def fig_5_3():
+def fig_5_4():
     fig, ax1 = plt.subplots(figsize=(4.5, 3.2))
 
     # X-axis: comm_size labels (not linear scale — use categorical)
@@ -384,16 +457,16 @@ def fig_5_3():
     ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=6.5, framealpha=0.9)
 
     plt.tight_layout()
-    plt.savefig(f'{outdir}/fig_5_3_sweep.pdf')
-    plt.savefig(f'{outdir}/fig_5_3_sweep.png')
+    plt.savefig(f'{outdir}/fig_5_4_sweep.pdf')
+    plt.savefig(f'{outdir}/fig_5_4_sweep.png')
     plt.close()
-    print("  Fig 5.3 done")
+    print("  Fig 5.4 done")
 
 
 # ============================================================
-# Fig 5.4: Improvement Factor — This Study vs TPU v4
+# Fig 5.5: Improvement Factor (was Fig 5.4) — This Study vs TPU v4
 # ============================================================
-def fig_5_4():
+def fig_5_5():
     fig, ax = plt.subplots(figsize=(3.5, 2.8))
 
     studies = ['This Study\n(Consumer HW,\nstatic, asym. BW)',
@@ -420,10 +493,10 @@ def fig_5_4():
 
     ax.set_title('Twisted Torus Improvement Factor')
     plt.tight_layout()
-    plt.savefig(f'{outdir}/fig_5_4_improvement_factor.pdf')
-    plt.savefig(f'{outdir}/fig_5_4_improvement_factor.png')
+    plt.savefig(f'{outdir}/fig_5_5_improvement_factor.pdf')
+    plt.savefig(f'{outdir}/fig_5_5_improvement_factor.png')
     plt.close()
-    print("  Fig 5.4 done")
+    print("  Fig 5.5 done")
 
 
 # ============================================================
@@ -486,11 +559,10 @@ if __name__ == '__main__':
     print("Generating figures...")
     fig_4_4()
     fig_5_1()
-    fig_5_2()
-    fig_5_3()
-    fig_5_4()
+    fig_5_2()   # NEW: Qwen 0.5B DDP bar chart
+    fig_5_3()   # was fig_5_2: All-to-All 1GB stacked bar
+    fig_5_4()   # was fig_5_3: Communication volume sweep
+    fig_5_5()   # was fig_5_4: TPU v4 improvement factor
     fig_6_1()
-    print(f"\n=== All 6 figures generated in {outdir}/ ===")
-    print("Each figure has both .pdf (for LaTeX/Word) and .png (for preview)")
-
+    print(f"\n=== All 7 figures generated in {outdir}/ ===")
     print("Each figure has both .pdf (for LaTeX/Word) and .png (for preview)")

@@ -870,7 +870,7 @@ def build_command_record(raw_argv: list[str], executed_cmd: list[str]) -> str:
 # =============================================================================
 # [優化版] 模擬執行核心函式 (記憶體緩衝模式 - High Performance)
 # =============================================================================
-def run_simulation(cmd: list, stdout_path: Path, logroot: Path) -> int:
+def run_simulation(cmd: list, stdout_path: Path, logroot: Path, deadlock_kill_sec: int = 43200) -> int:
     """
     執行 NS3 模擬，採用全記憶體緩衝以最大化效能。
 
@@ -901,7 +901,7 @@ def run_simulation(cmd: list, stdout_path: Path, logroot: Path) -> int:
     _monitor_stop = threading.Event()
     _process_ref = [None]  # mutable container，讓 monitor thread 能存取 process
     DEADLOCK_WARN_SEC = 180    # 3 分鐘：開始警告
-    DEADLOCK_KILL_SEC = 10800  # 3 小時：自動 kill
+    DEADLOCK_KILL_SEC = deadlock_kill_sec  # 0 = 不自動 kill
 
     def _progress_monitor():
         fct_path = out_dir_mon / "fct.txt"
@@ -929,7 +929,7 @@ def run_simulation(cmd: list, stdout_path: Path, logroot: Path) -> int:
                 if stale_since is None:
                     stale_since = now
                 stale_sec = now - stale_since
-                if stale_sec >= DEADLOCK_KILL_SEC:
+                if DEADLOCK_KILL_SEC > 0 and stale_sec >= DEADLOCK_KILL_SEC:
                     print(f"[MONITOR] {hrs:5.1f}h | fct.txt: {cur_size/1e6:.1f} MB | ❌ 已 {stale_sec/3600:.1f}h 無更新，確認卡死，自動終止 process")
                     proc = _process_ref[0]
                     if proc is not None:
@@ -939,7 +939,10 @@ def run_simulation(cmd: list, stdout_path: Path, logroot: Path) -> int:
                             print(f"[MONITOR] 自動終止失敗: {e}，請手動 kill")
                     return
                 elif stale_sec >= DEADLOCK_WARN_SEC:
-                    print(f"[MONITOR] {hrs:5.1f}h | fct.txt: {cur_size/1e6:.1f} MB (無增長 {stale_sec:.0f}s) | ⚠️ 疑似卡死，{(DEADLOCK_KILL_SEC-stale_sec)/3600:.1f}h 後自動終止")
+                    if DEADLOCK_KILL_SEC > 0:
+                        print(f"[MONITOR] {hrs:5.1f}h | fct.txt: {cur_size/1e6:.1f} MB (無增長 {stale_sec:.0f}s) | ⚠️ 疑似卡死，{(DEADLOCK_KILL_SEC-stale_sec)/3600:.1f}h 後自動終止")
+                    else:
+                        print(f"[MONITOR] {hrs:5.1f}h | fct.txt: {cur_size/1e6:.1f} MB (無增長 {stale_sec:.0f}s) | ⚠️ 疑似卡死（auto-kill 已停用）")
             else:
                 # 尚未產生
                 stale_since = None
@@ -1113,6 +1116,8 @@ def main():
     # [新增這行] 除錯開關
     ap.add_argument("--debug-ns3", action="store_true", help="啟用 NS-3 底層詳細 Log (用於偵測卡死)")
     ap.add_argument("--no-qlen", action="store_true", help="關閉 qlen.txt 輸出（指向 /dev/null），避免 128-node 模擬產生數百 GB 檔案")
+    ap.add_argument("--deadlock-timeout", type=int, default=43200,
+                    help="fct.txt 無更新多少秒後自動 kill（預設 43200=12h；0=不自動 kill）")
 
     args = ap.parse_args()
 
@@ -1268,7 +1273,7 @@ def main():
     print("-" * 80)
 
     # 呼叫剛剛寫好的函式
-    ret_code = run_simulation(cmd, stdout_path, logroot)
+    ret_code = run_simulation(cmd, stdout_path, logroot, args.deadlock_timeout)
 
     # 檢查回傳碼，若失敗直接退出
     if ret_code != 0:

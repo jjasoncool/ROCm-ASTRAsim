@@ -90,17 +90,28 @@ $$T_{link,init} = \frac{25\ \mu s}{2} = 12.5\ \mu s$$
 
 | 階段 | 腳本 | 功能 |
 |---|---|---|
-| **1. Trace 生成** | `src/train_rocm_pytorch.py` | ROCm 環境下以 PyTorch DDP 訓練，產生 Kineto JSON trace |
-| **2. Trace 轉換** | `src/conver_to_chakra_et.py` | 將 Kineto trace 轉為 Chakra ET (`.et`) 格式 |
+| **1. Trace 生成（DDP）** | `src/train_rocm_pytorch.py` | ROCm 環境下以 PyTorch DDP 訓練，產生 Kineto JSON trace |
+| **1. Trace 生成（TP）**  | `src/train_rocm_tensor.py` | ROCm 環境下以 PyTorch TP=2 訓練，供 Qwen 1.5B TP+DDP 實驗使用 |
+| **2. Trace 轉換** | `src/conver_to_chakra_et.py` | 將 Kineto trace 轉為 Chakra ET (`.et`) 格式；TP+DDP 使用 `--add-ddp` |
 | **3. 網路模擬** | `scripts/run_ns3.py` | 以 `.et` workload 執行 ASTRA-sim ns-3 模擬，自動校準 |
 
 關鍵特性：
 - **AMD GPU 兼容性修補**（第 2 階段）：自動修復 AMD RCCL kernel 命名問題
 - **系統感知校準**（第 2 階段）：對 System-Bound 模型可使用 `--force-avg-kernel-ns` 攤提系統開銷
+- **TP+DDP 組合**（第 2 階段）：`--add-ddp --target-tp 8` 會把 DDP AllReduce 節點接到 TP trace 之後，並縮放計算時間
 - **虛擬擴展**（第 3 階段）：將小規模（2-GPU）trace 擴展至大規模（如 128-GPU）模擬
 - **自動校準**（第 3 階段）：自動計算 `alpha_us` 因子並儲存至 `runs/calibration_all.csv`
 
-**額外驗證說明。** 除了下方的 ResNet-50 與 CIFAR-10 範例外，文件對應的研究也另外以 **Qwen2.5-0.5B** 的 DDP trace 驗證過整體流程。產生的 ET 含有 **37 個 AllReduce COMM 節點**，每個 step 的總通訊量約 **1.84 GiB**，顯示這套流程也可延伸到 AMD ROCm 上的 LLM 級 workload。
+**論文涵蓋的工作負載。** 此 Pipeline 在四種通訊強度下被驗證：
+
+| 實驗 | 工作負載 | Trace 腳本 | 常用 tag | 備註 |
+|---|---|---|---|---|
+| 1. 計算主導 AllReduce | ResNet-50 DDP（~89.7 MiB） | `train_rocm_pytorch.py --model resnet50` | `resnet50` | 主要校準基準 |
+| 2. 通訊密集 AllReduce | Qwen 0.5B DDP（~1.84 GiB） | `train_rocm_pytorch.py --model qwen05b` | `qwen05b` | Twisted Torus 上必須 `active-chunks=4` |
+| 3. 階層式 TP+DDP | Qwen 1.5B，TP=8 × DDP=16 | `train_rocm_tensor.py` + `conver_to_chakra_et.py --add-ddp --target-tp 8` | `qwen15b_tp8ddp` | |
+| 4. All-to-All 頻寬飽和 | 合成 1 GB All-to-All | 對 `resnet50_all2all` 跑 `scale_et_comm_workload.py --bytes 1G` | `resnet50_all2all_1GB` | ns-3 端建議 `--payload 12000` |
+
+Qwen 0.5B 的 2-GPU 校準結果亦驗證 trace 形式正確：每 step 含 37 個 AllReduce COMM 節點、總通訊量約 1.84 GiB、comm/step ≈ 57.7%。
 
 ---
 
@@ -208,7 +219,16 @@ python scripts/run_ns3.py \
 | `--qcn` | 啟用/禁用 QCN（量化擁塞通知） | `0` 或 `1` |
 | `--pfc-dyn` | 啟用/禁用動態 PFC 門檻 | `0` 或 `1` |
 | `--buffer` | 交換器緩衝區大小（封包數） | `64` |
-| `--payload` | 封包 payload 大小（bytes） | `1500` |
+| `--payload` | 封包 payload 大小（bytes）；All-to-All 1 GB 壓力測試建議 `12000` | `1500` |
+
+### 工作負載擴展與長時間執行穩定性
+
+| 參數 | 描述 | 範例 |
+|---|---|---|
+| `--virtual-world N` | 將每 rank trace 複製擴展到 `N` 節點模擬 | `128` |
+| `--comm-scale F` | 將每個 `comm_size` 乘以 `F`；論文 Qwen 系列實驗使用 **`1.984`** 修正 M=2 → N=128 | `1.984` |
+| `--no-qlen` | 將 `qlen.txt` 導向 `/dev/null`，避免 128 節點時產生數百 GB 除錯輸出 | — |
+| `--deadlock-timeout S` | `fct.txt` 連續 `S` 秒未更新即自動 kill（預設 `43200` = 12 h，`0` 表示停用） | `43200` |
 
 ### 校準與輸出參數
 
@@ -219,6 +239,10 @@ python scripts/run_ns3.py \
 | `--calib-db` | 校準結果 CSV 路徑 | `runs/calibration_all.csv` |
 | `--log-dir` | 模擬輸出根目錄 | `runs` |
 | `--dry-run` | 僅產生設定檔與命令，不執行模擬 | — |
+
+### Twisted Torus + ring AllReduce 的排程死鎖
+
+預設的 `active-chunks-per-dimension=1` 在 Twisted Torus 上跑高通訊量多維 ring AllReduce（Qwen 0.5B）時，會觸發確定性的 ASTRA-sim 排程死鎖。Twisted Torus 的 X 軸非對稱繞回鏈路造成各節點階段進度不同步，在 ASTRA-sim chunk queue 中產生跨維度循環等待——`fct.txt` 通常會在 ~5,337 個 flow（預期 ~985,088 個）後停止更新。Twisted Torus AllReduce 實驗請改用 `*_4chunks*.json` 系列設定（`active-chunks-per-dimension: 4`）。若想取得 DDP 最佳效能，使用 `system_128nodes_TwistedTorus_4x4x8_4chunks_hd.json`：在 chunks=4 之上，把 X/Y 維的 ring 換成 halvingDoubling，從根本化解路徑不對稱問題。已回報為 [ASTRA-sim Issue #370](https://github.com/astra-sim/astra-sim/issues/370)。
 
 ---
 

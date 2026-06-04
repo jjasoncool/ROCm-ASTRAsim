@@ -90,17 +90,28 @@ The simulation pipeline has three independent stages:
 
 | Stage | Script | Function |
 |---|---|---|
-| **1. Trace collection** | `src/train_rocm_pytorch.py` | PyTorch DDP training on ROCm; produces Kineto JSON traces |
-| **2. Trace conversion** | `src/conver_to_chakra_et.py` | Converts Kineto traces to Chakra ET (`.et`) format |
+| **1. Trace collection (DDP)** | `src/train_rocm_pytorch.py` | PyTorch DDP training on ROCm; produces Kineto JSON traces |
+| **1. Trace collection (TP)**  | `src/train_rocm_tensor.py` | PyTorch TP=2 training on ROCm; used for the Qwen 1.5B TP+DDP experiment |
+| **2. Trace conversion** | `src/conver_to_chakra_et.py` | Converts Kineto traces to Chakra ET (`.et`) format; supports `--add-ddp` for TP+DDP |
 | **3. Network simulation** | `scripts/run_ns3.py` | Runs ASTRA-sim ns-3 with `.et` workloads; auto-calibrates |
 
 Key features:
 - **AMD GPU compatibility patch** (stage 2): automatically fixes AMD RCCL kernel naming issues
 - **System-aware calibration** (stage 2): `--force-avg-kernel-ns` redistributes real GPU time into compute nodes for System-Bound workloads
+- **TP+DDP composition** (stage 2): `--add-ddp --target-tp 8` appends DDP AllReduce nodes to a TP trace and rescales compute
 - **Virtual scale-up** (stage 3): scales a small (2-GPU) trace to a large (e.g., 128-GPU) simulation
 - **Auto-calibration** (stage 3): computes `alpha_us` and appends results to `runs/calibration_all.csv`
 
-**Additional validation note.** Beyond the ResNet-50 and CIFAR-10 examples below, the thesis also validates the pipeline on a **Qwen2.5-0.5B** DDP trace. The resulting ET contains **37 AllReduce COMM nodes** and about **1.84 GiB** of communication volume per step, confirming that the pipeline generalizes to an LLM-scale workload on AMD ROCm.
+**Workloads covered by the thesis.** The pipeline is exercised across four communication regimes:
+
+| Experiment | Workload | Trace script | Tag (typical) | Notes |
+|---|---|---|---|---|
+| 1. Compute-dominated AllReduce | ResNet-50 DDP (~89.7 MiB) | `train_rocm_pytorch.py --model resnet50` | `resnet50` | Primary calibration baseline |
+| 2. Communication-intensive AllReduce | Qwen 0.5B DDP (~1.84 GiB) | `train_rocm_pytorch.py --model qwen05b` | `qwen05b` | Requires `active-chunks=4` on Twisted Torus |
+| 3. Hierarchical TP+DDP | Qwen 1.5B TP=8 × DDP=16 | `train_rocm_tensor.py` + `conver_to_chakra_et.py --add-ddp --target-tp 8` | `qwen15b_tp8ddp` | |
+| 4. All-to-All bandwidth saturation | Synthetic 1 GB All-to-All | `scale_et_comm_workload.py --bytes 1G` on `resnet50_all2all` | `resnet50_all2all_1GB` | Use `--payload 12000` on ns-3 |
+
+The Qwen 0.5B 2-GPU calibration confirms the trace is well-formed: 37 AllReduce COMM nodes per step, ~1.84 GiB of communication volume, comm/step ≈ 57.7%.
 
 ---
 
@@ -208,7 +219,16 @@ python scripts/run_ns3.py \
 | `--qcn` | Enable/disable QCN (Quantized Congestion Notification) | `0` or `1` |
 | `--pfc-dyn` | Enable/disable dynamic PFC threshold | `0` or `1` |
 | `--buffer` | Switch buffer size (packets) | `64` |
-| `--payload` | Packet payload size (bytes) | `1500` |
+| `--payload` | Packet payload size (bytes); use `12000` for All-to-All 1 GB stress test | `1500` |
+
+### Workload Scaling and Long-Run Robustness
+
+| Parameter | Description | Example |
+|---|---|---|
+| `--virtual-world N` | Replicate per-rank trace to `N`-node simulation | `128` |
+| `--comm-scale F` | Multiply every `comm_size` by `F`; the thesis Qwen experiments use **`1.984`** to correct M=2 → N=128 | `1.984` |
+| `--no-qlen` | Redirect `qlen.txt` to `/dev/null` (avoid hundreds of GB of debug output at 128 nodes) | — |
+| `--deadlock-timeout S` | Kill the run if `fct.txt` stops updating for `S` seconds (default `43200` = 12 h, set `0` to disable) | `43200` |
 
 ### Calibration & Output Parameters
 
@@ -219,6 +239,10 @@ python scripts/run_ns3.py \
 | `--calib-db` | CSV database path for calibration results | `runs/calibration_all.csv` |
 | `--log-dir` | Root directory for simulation output | `runs` |
 | `--dry-run` | Generate configs and commands without running | — |
+
+### Scheduling deadlock on Twisted Torus + ring AllReduce
+
+The default `active-chunks-per-dimension=1` triggers a deterministic ASTRA-sim scheduling deadlock when running multi-dimensional ring AllReduce on the Twisted Torus under heavy load (Qwen 0.5B). The Twisted Torus's asymmetric X-axis wrap-around link causes phase desynchronization that produces a cross-dimensional circular wait in ASTRA-sim's chunk queues — `fct.txt` typically stops updating at ~5,337 of an expected ~985,088 flows. Use the `*_4chunks*.json` system configurations (`active-chunks-per-dimension: 4`) for Twisted Torus AllReduce runs. For best DDP performance, `system_128nodes_TwistedTorus_4x4x8_4chunks_hd.json` additionally swaps ring → halvingDoubling on the X/Y dimensions to address the underlying path-asymmetry root cause. Reported upstream as [ASTRA-sim Issue #370](https://github.com/astra-sim/astra-sim/issues/370).
 
 ---
 

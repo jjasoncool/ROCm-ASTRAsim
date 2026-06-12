@@ -117,6 +117,21 @@ python scripts/run_ns3.py \
  --no-autocalib --no-qlen
 ```
 
+## 128 nodes Torus 4chunks HD
+
+```bash
+python scripts/run_ns3.py \
+ --workload data/chakra/workload_et \
+ --model-tag qwen05b \
+ --topo file:configs/astra-sim/topos/logical_128nodes_Torus_4x4x8.json \
+ --phys-topo configs/astra-sim/topos/128nodes_Torus_4x4x8.txt \
+ --system configs/astra-sim/system/system_128nodes_TwistedTorus_4x4x8_4chunks_hd.json \
+ --virtual-world 128 \
+ --lmbw 540 \
+ --comm-scale 1.984375 \
+ --no-autocalib --no-qlen
+```
+
 ## 128 nodes Twisted Torus 4chunks
 
 ```bash

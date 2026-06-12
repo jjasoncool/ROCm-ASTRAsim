@@ -125,25 +125,30 @@ WALL_A2A_512MB = {
 
 # All-to-All 1GB
 WALL_A2A_1GB = {
-    'Fat-Tree':       1_886_164_000,
-    'Std. Torus':     3_049_068_000,
-    'Twisted Torus':  2_575_180_000,
+    # 正式值 (metrics CSV, run_dirs 20260302-052720/053303/053448);
+    # 舊值 1_886_164_000/3_049_068_000/2_575_180_000 為誤植,已棄用
+    'Fat-Tree':       1_886_210_767,
+    'Std. Torus':     3_051_005_526,
+    'Twisted Torus':  2_576_544_108,
 }
 
 GPU_CYCLES = 274_982_000
 
 # Qwen 0.5B DDP AllReduce (128 nodes, cost-matched)
+# Clean canonical data (verified 2026-06-09 from machine output, double-checked).
+# Supersedes the earlier contaminated values produced by two compounding bugs
+# (comm-scale 1.0 instead of 127/64, and rounding 1.984 breaking split divisibility).
 QWEN_DDP = {
-    'Torus + ring':    5_418_000_000,
-    'Fat-Tree + HD':   5_963_000_000,
-    'TT + ring':       9_549_000_000,
-    'TT + HD':         4_302_000_000,
+    'Torus + ring':    5_056_827_752,
+    'Fat-Tree + HD':   5_086_430_904,
+    'TT + ring':       8_997_989_486,
+    'TT + HD':         8_834_772_125,
 }
 QWEN_PFC = {
     'Torus + ring':    0,
-    'Fat-Tree + HD':   14_970,
-    'TT + ring':       27_554,
-    'TT + HD':         70,
+    'Fat-Tree + HD':   203_756,
+    'TT + ring':       24_348,
+    'TT + HD':         1_542,
 }
 
 
@@ -259,56 +264,69 @@ def fig_5_1():
 
 
 # ============================================================
-# Fig 5.2: Qwen 0.5B DDP — Topology-Algorithm Co-Design
-# Bar chart: 4 configurations, TT+HD highlighted with hatching
+# Fig 5.2: Qwen 0.5B DDP — Twist Imposes an Algorithm-Independent Penalty
+# Grouped bar chart. Two short bars (Std. Torus, Fat-Tree) vs two tall bars
+# (both Twisted Torus variants). Three messages encoded:
+#   (1) grouping:   Std. Torus ~= Fat-Tree   << both TT variants
+#   (2) reversal:   HD helps TT by only 1.8% (algorithm cannot rescue the twist)
+#   (3) PFC labels: congestion does NOT predict step time (FT highest PFC yet fast;
+#                   TT+HD lowest PFC yet slow) -> bottleneck is path length, not congestion
+# Both TT bars share one colour to visually convey "algorithm-independent".
 # ============================================================
 def fig_5_2():
-    fig, ax = plt.subplots(figsize=(4.0, 3.0))
+    fig, ax = plt.subplots(figsize=(4.8, 3.3))
 
+    order = ['Torus + ring', 'Fat-Tree + HD', 'TT + ring', 'TT + HD']
     labels = ['3D Torus\n(ring)', 'Fat-Tree\n(HD)', 'Twisted Torus\n(ring)', 'Twisted Torus\n(HD)']
-    values_cycles = [QWEN_DDP[k] for k in ['Torus + ring', 'Fat-Tree + HD', 'TT + ring', 'TT + HD']]
-    values_M = [v / 1e6 for v in values_cycles]
-    colors = [C_ORANGE, C_BLUE, C_RED, C_GREEN]
+    values_M = [QWEN_DDP[k] / 1e6 for k in order]
+    pfc      = [QWEN_PFC[k] for k in order]
+    # Std. Torus = orange, Fat-Tree = blue, both Twisted Torus = red (same colour on purpose)
+    colors = [C_ORANGE, C_BLUE, C_RED, C_RED]
 
     x = np.arange(4)
-    bars = ax.bar(x, values_M, 0.55, color=colors, edgecolor='black', linewidth=0.4, zorder=3)
-
-    # Hatching on TT+HD bar to distinguish co-design result
-    bars[3].set_hatch('///')
-    bars[3].set_edgecolor('black')
+    bars = ax.bar(x, values_M, 0.6, color=colors, edgecolor='black', linewidth=0.4, zorder=3)
 
     ax.set_ylabel('Wall Time (M cycles)')
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=7)
 
-    # Value labels on top of each bar
+    # Wall-time value (bold) + PFC count (italic grey) stacked above each bar
     for i, bar in enumerate(bars):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 150,
-                f'{values_M[i]:,.0f}', ha='center', va='bottom', fontsize=7, fontweight='bold')
+        cx = bar.get_x() + bar.get_width() / 2
+        ax.text(cx, bar.get_height() + 120, f'{values_M[i]:,.0f}',
+                ha='center', va='bottom', fontsize=7.5, fontweight='bold')
+        ax.text(cx, bar.get_height() + 120 + 580, f'PFC {pfc[i]:,}',
+                ha='center', va='bottom', fontsize=5.8, color=C_GRAY, fontstyle='italic')
 
-    # Bracket annotation above TT+ring and TT+HD bars
-    # Start bracket ABOVE the value labels (which are at bar_top + 150)
-    bracket_base = values_M[2] + 900  # above the "9,549" label
-    bracket_top = bracket_base + 700
-    # Left vertical line (above TT+ring)
-    ax.plot([2, 2], [bracket_base, bracket_top], color=C_GREEN, lw=0.8)
-    # Horizontal line
-    ax.plot([2, 3], [bracket_top, bracket_top], color=C_GREEN, lw=0.8)
-    # Right vertical line with arrow (down to TT+HD)
-    ax.annotate('', xy=(3, values_M[3] + 550), xytext=(3, bracket_top),
-                arrowprops=dict(arrowstyle='->', color=C_GREEN, lw=1.0))
-    # Label above bracket (escape % for LaTeX)
-    ax.text(2.5, bracket_top + 200, r'$-55\%$ (software only)',
-            ha='center', va='bottom', fontsize=6.5, color=C_GREEN, fontweight='bold')
+    ax.set_ylim(0, 13200)
 
-    ax.set_ylim(0, 13000)  # expand to fit bracket + label
+    # (1) Grouping bracket over the two short bars
+    gb = max(values_M[0], values_M[1]) + 1750
+    ax.plot([0, 0], [gb - 220, gb], color=C_GRAY, lw=0.7)
+    ax.plot([1, 1], [gb - 220, gb], color=C_GRAY, lw=0.7)
+    ax.plot([0, 1], [gb, gb], color=C_GRAY, lw=0.7)
+    ax.text(0.5, gb + 100, r'Std. Torus $\approx$ Fat-Tree (+0.6\%)',
+            ha='center', va='bottom', fontsize=6.0, color=C_GRAY)
 
-    ax.set_title('Qwen 0.5B DDP AllReduce (128 nodes, cost-matched)')
+    # (2) Reversal bracket over the two tall (Twisted Torus) bars
+    rb_top = max(values_M[2], values_M[3]) + 1750
+    ax.plot([2, 2], [values_M[2] + 1300, rb_top], color=C_RED, lw=0.7)
+    ax.plot([3, 3], [values_M[3] + 1300, rb_top], color=C_RED, lw=0.7)
+    ax.plot([2, 3], [rb_top, rb_top], color=C_RED, lw=0.7)
+    ax.text(2.5, rb_top + 100, r'HD only $-1.8\%$',
+            ha='center', va='bottom', fontsize=6.8, color=C_RED, fontweight='bold')
+
+    # (3) "+~75% structural penalty" arrow in the mid gap (does not overlap any bar)
+    ax.annotate('', xy=(1.9, 9300), xytext=(1.05, 6500),
+                arrowprops=dict(arrowstyle='->', color='black', lw=1.0))
+    ax.text(1.4, 8700, 'twist: $+\\sim$75\\%\n(ring \\& HD)',
+            ha='center', va='bottom', fontsize=6.5, fontweight='bold')
+
+    ax.set_title('Qwen 0.5B DDP AllReduce (128 nodes)')
     ax.legend(
-        [plt.Rectangle((0,0),1,1, fc=c, ec='black', lw=0.4) for c in [C_ORANGE, C_BLUE, C_RED]] +
-        [plt.Rectangle((0,0),1,1, fc=C_GREEN, ec='black', lw=0.4, hatch='///')],
-        ['Torus (ring)', 'Fat-Tree (HD)', 'TT (ring)', 'TT (HD)'],
-        loc='upper left', framealpha=0.9, fontsize=6
+        [plt.Rectangle((0, 0), 1, 1, fc=c, ec='black', lw=0.4) for c in [C_ORANGE, C_BLUE, C_RED]],
+        ['Std. Torus', 'Fat-Tree', 'Twisted Torus'],
+        loc='upper left', framealpha=0.9, fontsize=6, bbox_to_anchor=(0.0, 0.78)
     )
     plt.tight_layout()
     plt.savefig(f'{outdir}/fig_5_2_qwen_ddp.pdf')

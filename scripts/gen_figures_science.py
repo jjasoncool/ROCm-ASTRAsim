@@ -520,13 +520,26 @@ def fig_5_5():
 # ============================================================
 # Fig 6.1: Cost Breakdown (unchanged)
 # ============================================================
+# fig_6_1 — v79 NIC cost model (3×dual-port 100GbE NIC, both families identical)
+# 變更內容：
+#   1. 兩個拓樸都用 100GbE NIC（per-GPU-rank logical topology 需 physical NIC 承載 logical bandwidth）：
+#        FT NIC    = 48 × ConnectX-6 dual-port 100GbE @ US$900 → NT$1.296M（每台3張=600G,匹配520G需求）
+#        Torus NIC = 48 × ConnectX-6 dual-port 100GbE @ US$900 → NT$1.296M（每台3張=600G,同FT；NIC不進模擬,只需non-blocking）
+#   2. Torus 總額 → 7.840M；FT 總額 → 13.596M；省下 → 5.76M；Torus ≈ 58% of FT；switch 佔 FT 42%
+#   3. 省錢來源是 eliminating managed switch fabric；Torus NIC 反而比 FT 貴（誠實：不主打 cheap NIC）
+# 若 Dx 鎖價不是 US$900，改 NIC_NTM_PER_CARD 一行；其餘需同步 Table 6.1 與正文。
+
 def fig_6_1():
     fig, ax = plt.subplots(figsize=(4.5, 3.5))
 
-    categories = ['Fat-Tree\n(L16\_S8)', 'Torus /\nTwisted Torus']
+    NIC_NTM_PER_CARD = 900 * 30 / 1e6      # 單張雙埠100GbE: US$900 × NT$30 / 1e6 = 0.027M
+    FT_NIC_NTM    = 48 * NIC_NTM_PER_CARD  # 3×/server × 16 = 48 張 → 1.296M
+    TORUS_NIC_NTM = 48 * NIC_NTM_PER_CARD  # 3×/server × 16 = 48 張 → 1.296M (同FT,non-blocking)
+
+    categories = ['Fat-Tree\n(L16\\_S8)', 'Torus /\nTwisted Torus']
     gpu    = [2.944, 2.944]
     server = [3.600, 3.600]
-    nic    = [0.384, 0.384]
+    nic    = [FT_NIC_NTM, TORUS_NIC_NTM]
     switch = [5.756, 0.000]
 
     x = np.arange(len(categories))
@@ -538,7 +551,7 @@ def fig_6_1():
     ax.bar(x, server, width, bottom=gpu, label='Server platform (16×)',
            color=colors_cost[1], edgecolor='black', linewidth=0.4)
     ax.bar(x, nic, width, bottom=[g+s for g, s in zip(gpu, server)],
-           label='NIC (32×ConnectX-6 Lx)', color=colors_cost[2],
+           label='NIC (3×dual-port 100GbE/server, both)', color=colors_cost[2],
            edgecolor='black', linewidth=0.4)
     ax.bar(x, switch, width, bottom=[g+s+n for g, s, n in zip(gpu, server, nic)],
            label='Switch (24×SN2700)', color=colors_cost[3],
@@ -546,32 +559,28 @@ def fig_6_1():
 
     totals = [sum(t) for t in zip(gpu, server, nic, switch)]
     for i, total in enumerate(totals):
-        ax.text(x[i], total + 0.15, f'NT\${total:.1f}M',
+        ax.text(x[i], total + 0.18, f'NT\\${total:.2f}M',
                 ha='center', fontweight='bold', fontsize=9)
 
     ax.axhline(y=10.0, color=C_GRAY, linestyle='--', linewidth=0.8)
-    ax.text(0.98, 10.25, 'NT\$10M budget', ha='right', fontsize=7,
+    ax.text(0.98, 10.25, 'NT\\$10M budget', ha='right', fontsize=7,
             color=C_GRAY, transform=ax.get_yaxis_transform())
-    ax.annotate('Switches = 45\%\nof total cost', xy=(0.22, 10.5),
-                xytext=(0.55, 12.5), fontsize=7, color=C_RED, fontweight='bold',
-                arrowprops=dict(arrowstyle='->', color=C_RED, lw=1))
+    ax.text(0.30, 11.3, 'Switches = 42\\%\nof Fat-Tree cost',
+            color=C_RED, fontweight='bold', fontsize=7, ha='left', va='center')
 
-    ax.set_ylabel('Total Cost (NT\$ millions)')
+    ax.set_ylabel('Total Cost (NT\\$ millions)')
     ax.set_xticks(x)
     ax.set_xticklabels(categories, fontsize=9)
-    ax.set_ylim(0, 14)
-    ax.legend(loc='upper right', fontsize=6, framealpha=0.9)
+    ax.set_ylim(0, 16)
+    ax.legend(loc='upper right', fontsize=5.4, framealpha=0.9)
     ax.set_title('Hardware Cost Breakdown (128 GPUs)')
     plt.tight_layout()
     plt.savefig(f'{outdir}/fig_6_1_cost.pdf')
     plt.savefig(f'{outdir}/fig_6_1_cost.png')
     plt.close()
-    print("  Fig 6.1 done")
+    print(f"  Fig 6.1 done — FT={totals[0]:.3f}M Torus={totals[1]:.3f}M ratio={totals[1]/totals[0]*100:.1f}%")
 
 
-# ============================================================
-# Run all
-# ============================================================
 if __name__ == '__main__':
     print(f"Output directory: {outdir}")
     print("Generating figures...")

@@ -5,7 +5,7 @@
 > **Thesis:** *"Cost-Effective Twisted Torus for AI Training: An ASTRA-sim Evaluation Using Traces from Consumer-Grade AMD GPUs with ROCm"*
 > National Cheng Kung University (NCKU), Graduate Institute of Computer Science and Information Engineering, 2026
 
-This repository implements a three-stage trace-driven simulation pipeline for collecting real training traces from **AMD ROCm/RCCL hardware** and feeding them into **ASTRA-sim** for cluster-scale AI network simulation. It is positioned for the setting where prior published ASTRA-sim studies predominantly assume **NVIDIA CUDA/NCCL**.
+A three-stage pipeline that collects real training traces from AMD ROCm/RCCL hardware and feeds them into ASTRA-sim for cluster-scale network simulation. Most published ASTRA-sim work assumes NVIDIA CUDA/NCCL; this targets the AMD ROCm/RCCL path instead.
 
 The thesis evaluates Fat-Tree, standard 3D Torus, and Twisted Torus at 128-node scale across **four communication regimes**:
 
@@ -14,7 +14,7 @@ The thesis evaluates Fat-Tree, standard 3D Torus, and Twisted Torus at 128-node 
 3. **Hierarchical TP+DDP** — Qwen2.5-1.5B (TP=8 × DDP=16)
 4. **All-to-All bandwidth saturation** — synthetic stress test (1 GB / collective)
 
-The principal finding is that the Twisted Torus's behavior is *algorithm-dependent*: with Ring AllReduce it is 76% slower than the standard Torus on the Qwen 0.5B workload, but with Halving-Doubling on the twisted dimensions it becomes the fastest configuration (21% faster than standard Torus + ring) at zero additional hardware cost.
+The thesis concludes that the twist's value depends on the workload: it helps bandwidth-bound All-to-All but hurts communication-intensive DDP AllReduce. The configs here let you reproduce that comparison; the full results and analysis are in the thesis (Chapter 5). Numbers quoted in this README come from single simulated runs and are meant as reference points, not guarantees, so re-run the configs on your own setup before relying on them.
 
 ---
 
@@ -59,7 +59,7 @@ All real-hardware measurements are performed on:
 
 | Component | Specification |
 |---|---|
-| CPU | AMD Ryzen 7 5800X |
+| CPU | AMD Ryzen 7 5700X |
 | GPUs | 2× AMD Radeon RX 9070 XT (Navi 48, 16 GB GDDR6) |
 | GPU interconnect | PCIe Gen4 x8 (via host PCIe root complex) |
 | OS | Ubuntu 24.04 |
@@ -186,21 +186,24 @@ python scripts/run_ns3.py \
   --system configs/astra-sim/system/system_128nodes_Torus_4x4x8.json \
   --virtual-world 128 --lmbw 540 --no-autocalib
 
-# Experiment 2 — Qwen 0.5B DDP, *requires* active-chunks=4 (deadlock workaround, see below)
+# Experiment 2 — Qwen 0.5B DDP, *requires* active-chunks=4 (deadlock workaround, see below).
+# NOTE: Qwen 0.5B uses the EXACT fraction 127/64 = 1.984375 (not the rounded 1.984) so the
+# scaled comm_size stays divisible by preferred-dataset-splits=4 (thesis §4.2.6 / §5.2.1).
 python scripts/run_ns3.py \
   --workload data/chakra/workload_et --model-tag qwen05b \
   --topo file:configs/astra-sim/topos/logical_128nodes_TwistedTorus_4x4x8.json \
   --phys-topo configs/astra-sim/topos/128nodes_TwistedTorus_4x4x8.txt \
   --system configs/astra-sim/system/system_128nodes_TwistedTorus_4x4x8_4chunks.json \
-  --virtual-world 128 --lmbw 540 --comm-scale 1.984 --no-autocalib --no-qlen
+  --virtual-world 128 --lmbw 540 --comm-scale 1.984375 --no-autocalib --no-qlen
 
-# Experiment 2 (best DDP configuration) — Twisted Torus + Halving-Doubling on X/Y dimensions
+# Experiment 2 (Twisted Torus + Halving-Doubling on X/Y dimensions) — the 2×2 factorial arm
+# that isolates congestion from the topology's route structure (HD also removes the deadlock).
 python scripts/run_ns3.py \
   --workload data/chakra/workload_et --model-tag qwen05b \
   --topo file:configs/astra-sim/topos/logical_128nodes_TwistedTorus_4x4x8.json \
   --phys-topo configs/astra-sim/topos/128nodes_TwistedTorus_4x4x8.txt \
   --system configs/astra-sim/system/system_128nodes_TwistedTorus_4x4x8_4chunks_hd.json \
-  --virtual-world 128 --lmbw 540 --comm-scale 1.984 --no-autocalib --no-qlen
+  --virtual-world 128 --lmbw 540 --comm-scale 1.984375 --no-autocalib --no-qlen
 
 # Experiment 3 — Qwen 1.5B TP+DDP (TP=8 × DDP=16) on Torus
 python scripts/run_ns3.py \
@@ -224,7 +227,7 @@ python scripts/run_ns3.py \
 | Flag | Purpose |
 |---|---|
 | `--virtual-world N` | Replicate the per-rank trace to a `N`-node simulation |
-| `--comm-scale F`    | Scale `comm_size` by `F` (the thesis uses `1.984` for the M=2 → N=128 correction in Qwen experiments) |
+| `--comm-scale F`    | Scale `comm_size` by `F` for the M=2 → N=128 correction. Qwen 0.5B (Exp 2) uses the exact fraction `1.984375` (127/64) for split divisibility; the TP+DDP (Exp 3) and other experiments use the rounded `1.984` |
 | `--no-qlen`         | Redirect `qlen.txt` to `/dev/null` to avoid hundreds of GB of debug output at 128-node scale |
 | `--payload`         | Override ns-3 packet payload (use `12000` for the All-to-All 1 GB stress test to keep event count manageable) |
 | `--no-autocalib`    | Disable automatic α calculation (only use at 2-GPU calibration; required at 128 nodes) |
@@ -234,10 +237,10 @@ python scripts/run_ns3.py \
 
 ## Calibration
 
-Calibration runs at 2-GPU scale and produces the conversion factor α (µs / cycle) that maps simulation cycles to wall-clock time. In the thesis, calibration is used primarily to validate the **relative-comparison regime** through systematic parameter sensitivity analysis, rather than to claim exact absolute communication-time prediction.
+Calibration runs at 2-GPU scale and produces the conversion factor α (µs / cycle) that maps simulation cycles to wall-clock time. The thesis uses it to support relative comparisons between topologies, not to predict absolute communication time.
 
-- **ResNet-50 (bandwidth-bound):** Primary calibration benchmark. Wall-clock calibration yields **α_step = 0.002411 µs/cycle**. ns-3 communication time is stable across parameter sweeps but shows an approximately **+100% overestimate** relative to measured RCCL GPU kernel duration, most plausibly due to the transport-path mismatch between ns-3's Ethernet RDMA model and the physical PCIe DMA path.
-- **CIFAR-10 (latency-bound):** Excluded from large-scale evaluation. Software-stack overhead dominates step time, so ASTRA-sim is not suitable for absolute prediction in this regime.
+- **ResNet-50 (bandwidth-bound):** the primary benchmark. Wall-clock calibration gives α_step = 0.002411 µs/cycle. ns-3 communication time is stable across parameter sweeps but runs about 2× the measured RCCL GPU kernel duration. The likely cause is a transport mismatch: ns-3 models Ethernet RDMA, while the 2-GPU platform talks over PCIe DMA.
+- **CIFAR-10 (latency-bound):** excluded from large-scale runs. Software-stack overhead dominates the step time, so ASTRA-sim can't predict absolute timing here.
 
 **Measured calibration results (2-GPU, per training step):**
 
@@ -248,13 +251,13 @@ Calibration runs at 2-GPU scale and produces the conversion factor α (µs / cyc
 | ns-3 vs real | **+100%** (overestimate) | **−34%** (underestimate) |
 | Calibration status | primary baseline | excluded (scope boundary) |
 
-> For ResNet-50, a parameter sweep across bandwidth, latency, packet payload, and congestion-control settings shows that ns-3 communication time remains in the 14.0–15.1 ms range. This supports the interpretation that the discrepancy is structural rather than parameter-sensitive. For topology studies, this systematic bias is expected to affect all topologies similarly, preserving relative comparisons.
+> For ResNet-50, sweeping bandwidth, latency, packet payload, and congestion control keeps ns-3 communication time in the 14.0–15.1 ms range. Since tuning doesn't move it, the gap looks structural rather than a bad parameter choice. The same bias hits every topology, so relative comparisons still hold.
 
 The α value and per-run calibration results are logged to `runs/calibration_all.csv`. See [scripts/README.md](scripts/README.md) for the full calibration methodology.
 
 ### Additional workload validation: Qwen2.5-0.5B
 
-The pipeline has also been validated on a **Qwen2.5-0.5B** DDP trace collected on the same 2-GPU AMD platform. This LLM workload contains **494M parameters**, producing **37 AllReduce communication nodes** and about **1.84 GiB** of total communication volume per training step. A 2-GPU calibration run confirms the trace produces reasonable metrics (comm/step ≈ 57.7%, ns-3 underestimates measured communication by 52%), consistent with accumulated per-collective startup overhead across 37 AllReduce operations that ns-3 does not model. Qwen 0.5B is the workload used for Experiment 2 in the thesis.
+The pipeline also runs on a Qwen2.5-0.5B DDP trace from the same 2-GPU AMD platform. This 494M-parameter model produces 37 AllReduce nodes and about 1.84 GiB of communication per step. The 2-GPU calibration looks reasonable (comm/step ≈ 57.7%; ns-3 here underestimates measured communication by 52%, in line with the per-collective startup overhead across 37 AllReduce ops that ns-3 doesn't model). Qwen 0.5B is the Experiment 2 workload.
 
 ---
 
@@ -290,8 +293,8 @@ The system configurations under `configs/astra-sim/system/` enumerate the algori
 | `system_128nodes_Torus_4x4x8.json` | 1 | ring × 3 | Experiment 1 (ResNet-50) |
 | `system_128nodes_Torus_4x4x8_4chunks.json` | 4 | ring × 3 | Experiment 2 (Qwen 0.5B), Torus baseline |
 | `system_128nodes_TwistedTorus_4x4x8.json` | 1 | ring × 3 | Experiment 1 |
-| `system_128nodes_TwistedTorus_4x4x8_4chunks.json` | 4 | ring × 3 | Experiment 2 (TT + ring; demonstrates 76% slowdown) |
-| `system_128nodes_TwistedTorus_4x4x8_4chunks_hd.json` | 4 | halvingDoubling, halvingDoubling, ring | Experiment 2 (TT + HD; **best DDP configuration**) |
+| `system_128nodes_TwistedTorus_4x4x8_4chunks.json` | 4 | ring × 3 | Experiment 2 (TT + ring arm) |
+| `system_128nodes_TwistedTorus_4x4x8_4chunks_hd.json` | 4 | halvingDoubling, halvingDoubling, ring | Experiment 2 (TT + HD arm) |
 | `system_128nodes_FatTree_L16_S8.json` | 1 | halvingDoubling | Experiment 1 |
 | `system_128nodes_FatTree_L16_S8_4chunks.json` | 4 | halvingDoubling | Experiment 2 |
 | `system_128nodes_*_TP8DDP*.json` | 1 / 4 | ring × 3 / HD on X/Y | Experiment 3 (TP+DDP) |
@@ -320,18 +323,24 @@ If you only want to reproduce the thesis topologies, use the prebuilt files unde
 
 ---
 
-## Topology-Aware Algorithm Selection (Experiment 2 highlight)
+## Experiment 2: Twisted Torus AllReduce (Qwen 0.5B)
 
-Under communication-intensive AllReduce (Qwen 0.5B, 1.84 GiB / step), the *combination* of topology and collective algorithm dominates the result:
+Experiment 2 runs communication-intensive AllReduce as a 2×2 over
+{Torus, Twisted Torus} × {Ring, Halving-Doubling} (all at `active-chunks=4`,
+`comm-scale=1.984375`), to tell apart two factors: network congestion and the
+topology's route structure. The four configs to run and compare:
 
-| Configuration | Wall (M cycles) | vs. Torus + ring | Notes |
-|---|---|---|---|
-| 3D Torus + ring × 3 | 5,418 | baseline | symmetric paths, no straggler |
-| Fat-Tree + halvingDoubling | 5,963 | +10.1% | 2.6× higher BW, but multi-hop switch traversal |
-| **Twisted Torus + ring × 3** | **9,549** | **+76.3%** | path asymmetry compounds through ring's sequential chain |
-| **Twisted Torus + HD on X/Y, ring on Z** | **4,302** | **−20.6%** | best observed configuration; PFC events drop 99.7% |
+| Topology (physical) | System config | Algorithm |
+|---|---|---|
+| `128nodes_Torus_4x4x8.txt` | `system_128nodes_Torus_4x4x8_4chunks.json` | ring × 3 |
+| `128nodes_Torus_4x4x8.txt` | `system_128nodes_TwistedTorus_4x4x8_4chunks_hd.json` | HD on X/Y, ring on Z |
+| `128nodes_TwistedTorus_4x4x8.txt` | `system_128nodes_TwistedTorus_4x4x8_4chunks.json` | ring × 3 |
+| `128nodes_TwistedTorus_4x4x8.txt` | `system_128nodes_TwistedTorus_4x4x8_4chunks_hd.json` | HD on X/Y, ring on Z |
 
-The twist is **neither inherently beneficial nor harmful**. Its effect depends on whether the collective algorithm exploits or conflicts with the modified path structure. Ring AllReduce's sequential chain magnifies the twist's path asymmetry into a system-wide straggler; Halving-Doubling's bidirectional pair exchanges are immune to it. Practical recommendation: for Twisted Torus deployments, use **Halving-Doubling** for AllReduce on the twisted dimensions (HD is natively supported by RCCL/NCCL).
+Run all four (commands in [scripts/commands.md](scripts/commands.md)) and compare `Wall time` and
+`PFC events` from each `out/metrics.csv`. What matters is how the four points relate to each
+other, not the absolute numbers, which shift with your calibration and machine. The thesis
+(Chapter 5) has the reference values and the analysis.
 
 ---
 
@@ -341,7 +350,7 @@ The twist is **neither inherently beneficial nor harmful**. Its effect depends o
 
 When running 128-node Twisted Torus AllReduce experiments at high communication intensity (Qwen 0.5B), the default `active-chunks-per-dimension=1` triggers a deterministic scheduling deadlock under `localBWAware` optimization. The Twisted Torus's asymmetric X-axis wrap-around link causes phase desynchronization across nodes, producing a cross-dimensional circular wait in ASTRA-sim's chunk queues. Symptom: ns-3 stops issuing flows at ~5,337 of an expected ~985,088 flows.
 
-**Workaround:** Set `active-chunks-per-dimension: 4` (matching `preferred-dataset-splits: 4`). The thesis Qwen 0.5B experiments use the `*_4chunks*.json` system configurations; the `*_4chunks_hd.json` variants additionally swap ring → halvingDoubling on the X/Y dimensions to address the underlying path-asymmetry root cause (which the chunks=4 setting only masks at the scheduler level).
+**Workaround:** Set `active-chunks-per-dimension: 4` (matching `preferred-dataset-splits: 4`). The thesis Qwen 0.5B experiments use the `*_4chunks*.json` system configurations. The `*_4chunks_hd.json` variant additionally swaps ring → halvingDoubling on the X/Y dimensions (the second arm of the 2×2 factorial), which also avoids the deadlock. `active-chunks=4` resolves the scheduler-level deadlock; it does not change the topology's route structure (see the thesis for what that implies).
 
 The standard 3D Torus and Fat-Tree do not require this workaround because their symmetric paths keep node phase progress synchronized. Other thesis experiments (ResNet-50 AllReduce, TP+DDP, All-to-All) also do not trigger the deadlock and use the default `active-chunks=1` configurations.
 
@@ -349,7 +358,7 @@ The standard 3D Torus and Fat-Tree do not require this workaround because their 
 
 ## All-to-All Stress Test (Experiment 4)
 
-When running AllReduce with the original ResNet-50 trace (~89.7 MiB total per step), communication is fully hidden by GPU computation and no topology difference is observable. To stress the network and expose topological differences, `src/scale_et_comm_workload.py` rewrites every `COMM_COLL_NODE` in-place:
+With the original ResNet-50 trace (~89.7 MiB per step), AllReduce hides behind GPU compute and the topologies look identical. To push traffic onto the network, `src/scale_et_comm_workload.py` rewrites every `COMM_COLL_NODE` in place:
 
 1. **`comm_type`** → forced to `ALL_TO_ALL` (from the original `ALL_REDUCE`)
 2. **`comm_size`** → set to the specified byte count (e.g. 1 GB = 1,073,741,824 bytes)
@@ -393,7 +402,7 @@ python scripts/run_ns3.py \
   --virtual-world 128 --payload 12000 --lmbw 540 --no-autocalib
 ```
 
-> **Observability regimes (thesis Section 5.4.1):** the original ~89.7 MiB AllReduce trace is fully hidden; 100 MB All-to-All causes selective Torus exposure (Twisted Torus and Fat-Tree still hidden); 512 MB–1 GB produces full topology divergence with the Twisted Torus 18% faster than the standard Torus and Fat-Tree 1.62× faster than the standard Torus. The 1 GB All-to-All case is therefore a simulation-only upper-bound stress test, not a production trace. The 1 GB / collective volume also exceeds physical 16 GB VRAM at 128 nodes and is not directly executable on real hardware.
+> **Observability regimes (thesis Section 5.4.1):** the original ~89.7 MiB AllReduce trace is fully hidden by compute; small All-to-All payloads expose the topologies selectively, and at 512 MB–1 GB all three diverge. Sweep `--bytes` (100 MB → 1 GB) yourself to see where the topologies separate on your setup; the thesis reports its reference values and ratios. The 1 GB All-to-All case is a simulation-only upper-bound stress test, not a production trace — the 1 GB / collective volume also exceeds physical 16 GB VRAM at 128 nodes and is not directly executable on real hardware.
 
 ---
 
@@ -452,7 +461,7 @@ runs/20260324-013221+0800_ns3_128gpu_qwen05b_file_logical_128nodes_FatTree_L16_S
 If `fct.txt` continues to receive new values, the simulation is usually still progressing. Use `--deadlock-timeout` (default 12 h) to auto-kill genuinely stuck runs. Keep `--trace-steps` at 1–4 when generating traces — very large ET files can exhaust ASTRA-sim's ETFeeder. Multiple experiments can be run in parallel across separate shell sessions.
 
 **Q: My Twisted Torus Qwen 0.5B run stops at ~5,337 completed flows.**
-A: That is the multi-dimensional ring scheduling deadlock described above (also in thesis Section 6.2.7). Use the `*_4chunks*.json` system configuration so that `active-chunks-per-dimension=4`. For the best observed performance under DDP, use `system_128nodes_TwistedTorus_4x4x8_4chunks_hd.json`, which additionally switches ring → halvingDoubling on the X/Y dimensions.
+A: That is the multi-dimensional ring scheduling deadlock described above (also in thesis Section 6.2.7). Use the `*_4chunks*.json` system configuration so that `active-chunks-per-dimension=4`. The `*_4chunks_hd.json` variant (ring → halvingDoubling on X/Y) is the second arm of the 2×2 factorial and also avoids the deadlock. Note that `active-chunks=4` resolves the scheduler-level deadlock but does not change the topology's route structure; see the thesis (Chapter 5 / Section 6.2.7) for what each arm implies.
 
 **Q: `"Node X in ctrl_dep graph, but not found in index"` error from ASTRA-sim?**
 A: The ET file has a DAG integrity issue (self-dependency or cycle). Run `conver_to_chakra_et.py` again — the built-in DAG repair pass (`fix_et_dag_inplace`) should resolve this automatically.
@@ -461,13 +470,13 @@ A: The ET file has a DAG integrity issue (self-dependency or cycle). Run `conver
 A: Add `--inject-sync-hack` to the trace-collection script. This injects synchronization events to align CPU (ms) and GPU (µs) timestamps before trace linking.
 
 **Q: Why does ns-3 overestimate ResNet-50 communication time by about 2×?**
-A: The thesis finds this discrepancy to be structurally insensitive to all tested tuning parameters. The most plausible explanation is a transport-path mismatch: ns-3 models Ethernet RDMA transport, while the physical 2-GPU platform communicates over a PCIe DMA path. Because the same ns-3 transport model is applied to all evaluated topologies, this bias cancels in relative comparisons.
+A: No tuning parameter moves it, so it isn't a calibration mistake. The likely cause is a transport mismatch: ns-3 models Ethernet RDMA, while the 2-GPU platform communicates over PCIe DMA. The same model applies to every topology, so the bias cancels out when you compare topologies against each other.
 
 **Q: Why is CIFAR-10 excluded from large-scale evaluation?**
 A: Its shallow architecture leaves more than half of the step time in unmodeled software overhead (kernel launch, RCCL handshake, CPU scheduling). This causes wall-clock and communication calibration factors to diverge by 1.3×, making ASTRA-sim unsuitable for absolute prediction in this latency-dominated regime. See thesis Section 4.3 for details.
 
-**Q: Why is `--comm-scale 1.984` used for Qwen experiments?**
-A: It corrects the per-collective communication size when the M=2 source trace is replicated to N=128 ranks. Specifically, `M(N-1) / (N(M-1)) = 2 × 127 / (128 × 1) ≈ 1.984` aligns the scaled trace's payload with the calibrated 2-GPU baseline. Applied uniformly across all topologies, it does not affect relative comparisons. See thesis Section 4.6.2 for the derivation.
+**Q: Why is `--comm-scale ≈ 1.984` used for Qwen experiments, and why does Qwen 0.5B use `1.984375`?**
+A: It corrects the per-collective communication size when the M=2 source trace is replicated to N=128 ranks. Specifically, `M(N-1) / (N(M-1)) = 2 × 127 / (128 × 1) = 127/64 = 1.984375` aligns the scaled trace's payload with the calibrated 2-GPU baseline. The **Qwen 0.5B DDP** experiment (Exp 2) uses the exact fraction `1.984375` because the scaled `comm_size` must stay divisible by `preferred-dataset-splits=4`; rounding to `1.984` breaks that divisibility and was one of two bugs that contaminated an earlier result set. The TP+DDP (Exp 3) and ResNet-50 experiments, which impose no such divisibility requirement, use the rounded `1.984`. Applied uniformly across all topologies within an experiment, the factor does not affect relative comparisons. See thesis Sections 4.2.6 / 4.6.2 for the derivation.
 
 ---
 

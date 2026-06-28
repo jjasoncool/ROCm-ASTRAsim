@@ -226,7 +226,7 @@ python scripts/run_ns3.py \
 | 參數 | 描述 | 範例 |
 |---|---|---|
 | `--virtual-world N` | 將每 rank trace 複製擴展到 `N` 節點模擬 | `128` |
-| `--comm-scale F` | 將每個 `comm_size` 乘以 `F`；論文 Qwen 系列實驗使用 **`1.984`** 修正 M=2 → N=128 | `1.984` |
+| `--comm-scale F` | 將每個 `comm_size` 乘以 `F` 修正 M=2 → N=128。Qwen 0.5B(實驗 2)須用精確分數 **`1.984375`**(127/64)以確保 split 整除;TP+DDP(實驗 3)與其他實驗用四捨五入的 **`1.984`** | `1.984375` |
 | `--no-qlen` | 將 `qlen.txt` 導向 `/dev/null`，避免 128 節點時產生數百 GB 除錯輸出 | — |
 | `--deadlock-timeout S` | `fct.txt` 連續 `S` 秒未更新即自動 kill（預設 `43200` = 12 h，`0` 表示停用） | `43200` |
 
@@ -242,7 +242,7 @@ python scripts/run_ns3.py \
 
 ### Twisted Torus + ring AllReduce 的排程死鎖
 
-預設的 `active-chunks-per-dimension=1` 在 Twisted Torus 上跑高通訊量多維 ring AllReduce（Qwen 0.5B）時，會觸發確定性的 ASTRA-sim 排程死鎖。Twisted Torus 的 X 軸非對稱繞回鏈路造成各節點階段進度不同步，在 ASTRA-sim chunk queue 中產生跨維度循環等待——`fct.txt` 通常會在 ~5,337 個 flow（預期 ~985,088 個）後停止更新。Twisted Torus AllReduce 實驗請改用 `*_4chunks*.json` 系列設定（`active-chunks-per-dimension: 4`）。若想取得 DDP 最佳效能，使用 `system_128nodes_TwistedTorus_4x4x8_4chunks_hd.json`：在 chunks=4 之上，把 X/Y 維的 ring 換成 halvingDoubling，從根本化解路徑不對稱問題。已回報為 [ASTRA-sim Issue #370](https://github.com/astra-sim/astra-sim/issues/370)。
+預設的 `active-chunks-per-dimension=1` 在 Twisted Torus 上跑高通訊量多維 ring AllReduce（Qwen 0.5B）時，會觸發確定性的 ASTRA-sim 排程死鎖。Twisted Torus 的 X 軸非對稱繞回鏈路造成各節點階段進度不同步，在 ASTRA-sim chunk queue 中產生跨維度循環等待——`fct.txt` 通常會在 ~5,337 個 flow（預期 ~985,088 個）後停止更新。Twisted Torus AllReduce 實驗請改用 `*_4chunks*.json` 系列設定（`active-chunks-per-dimension: 4`）。`*_4chunks_hd.json` 變體在 chunks=4 之上，把 X/Y 維的 ring 換成 halvingDoubling，作為 2×2 因子分析的第二臂；注意 HD 雖能移除 deadlock 並大幅降低 PFC，卻**無法**移除 twist 的 step-time 懲罰（Twisted Torus + HD 仍比 Torus + ring 慢 +74.7%——路徑不對稱仍在）。`active-chunks=4` 同樣只化解排程層級的 deadlock，並非根本的路徑不對稱。DDP 部署請用標準 Torus + ring（最快且不會 deadlock）。已回報為 [ASTRA-sim Issue #370](https://github.com/astra-sim/astra-sim/issues/370)。
 
 ---
 

@@ -226,7 +226,7 @@ python scripts/run_ns3.py \
 | Parameter | Description | Example |
 |---|---|---|
 | `--virtual-world N` | Replicate per-rank trace to `N`-node simulation | `128` |
-| `--comm-scale F` | Multiply every `comm_size` by `F`; the thesis Qwen experiments use **`1.984`** to correct M=2 → N=128 | `1.984` |
+| `--comm-scale F` | Multiply every `comm_size` by `F` to correct M=2 → N=128. Qwen 0.5B (Exp 2) uses the exact fraction **`1.984375`** (127/64) for split divisibility; TP+DDP (Exp 3) and other experiments use the rounded **`1.984`** | `1.984375` |
 | `--no-qlen` | Redirect `qlen.txt` to `/dev/null` (avoid hundreds of GB of debug output at 128 nodes) | — |
 | `--deadlock-timeout S` | Kill the run if `fct.txt` stops updating for `S` seconds (default `43200` = 12 h, set `0` to disable) | `43200` |
 
@@ -242,7 +242,7 @@ python scripts/run_ns3.py \
 
 ### Scheduling deadlock on Twisted Torus + ring AllReduce
 
-The default `active-chunks-per-dimension=1` triggers a deterministic ASTRA-sim scheduling deadlock when running multi-dimensional ring AllReduce on the Twisted Torus under heavy load (Qwen 0.5B). The Twisted Torus's asymmetric X-axis wrap-around link causes phase desynchronization that produces a cross-dimensional circular wait in ASTRA-sim's chunk queues — `fct.txt` typically stops updating at ~5,337 of an expected ~985,088 flows. Use the `*_4chunks*.json` system configurations (`active-chunks-per-dimension: 4`) for Twisted Torus AllReduce runs. For best DDP performance, `system_128nodes_TwistedTorus_4x4x8_4chunks_hd.json` additionally swaps ring → halvingDoubling on the X/Y dimensions to address the underlying path-asymmetry root cause. Reported upstream as [ASTRA-sim Issue #370](https://github.com/astra-sim/astra-sim/issues/370).
+The default `active-chunks-per-dimension=1` triggers a deterministic ASTRA-sim scheduling deadlock when running multi-dimensional ring AllReduce on the Twisted Torus under heavy load (Qwen 0.5B). The Twisted Torus's asymmetric X-axis wrap-around link causes phase desynchronization that produces a cross-dimensional circular wait in ASTRA-sim's chunk queues — `fct.txt` typically stops updating at ~5,337 of an expected ~985,088 flows. Use the `*_4chunks*.json` system configurations (`active-chunks-per-dimension: 4`) for Twisted Torus AllReduce runs. The `*_4chunks_hd.json` variant additionally swaps ring → halvingDoubling on the X/Y dimensions as the second arm of the 2×2 factorial; note that HD removes the deadlock and collapses PFC but does **not** remove the twist's step-time penalty (Twisted Torus + HD is still +74.7% vs. the Torus + ring baseline — the route-level asymmetry persists). `active-chunks=4` likewise only resolves the scheduler-level deadlock, not the underlying path asymmetry. For DDP deployment, use the standard Torus with ring (the fastest configuration, which does not deadlock). Reported upstream as [ASTRA-sim Issue #370](https://github.com/astra-sim/astra-sim/issues/370).
 
 ---
 

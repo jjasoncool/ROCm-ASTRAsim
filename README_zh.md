@@ -5,7 +5,7 @@
 > **論文：** *《Cost-Effective Twisted Torus for AI Training: An ASTRA-sim Evaluation Using Traces from Consumer-Grade AMD GPUs with ROCm》*
 > 國立成功大學資訊工程研究所,2026
 
-本 Repository 實作一套三階段的追蹤驅動 (trace-driven) 模擬 Pipeline,以 **AMD ROCm/RCCL 實體硬體**收集訓練追蹤資料並送入 **ASTRA-sim** 進行叢集規模網路模擬。其研究定位對應的是:既有公開 ASTRA-sim 研究多半假設 **NVIDIA CUDA/NCCL** 平台,而本工作補足 AMD ROCm/RCCL 的端到端流程文件化。
+一套三階段的 trace-driven 模擬 pipeline,從 AMD ROCm/RCCL 實體硬體收集訓練追蹤,再送進 ASTRA-sim 做叢集規模的網路模擬。多數已發表的 ASTRA-sim 研究假設的是 NVIDIA CUDA/NCCL,這裡補上 AMD ROCm/RCCL 這條路徑。
 
 論文在 128 節點規模下評估 Fat-Tree、標準 3D Torus、Twisted Torus 三種拓撲,涵蓋**四種通訊強度**:
 
@@ -14,7 +14,7 @@
 3. **階層式 TP+DDP** — Qwen2.5-1.5B(TP=8 × DDP=16)
 4. **All-to-All 頻寬飽和** — 合成壓力測試(每次集合 1 GB)
 
-論文的核心發現是:Twisted Torus 的表現是**演算法相關**的——在 Qwen 0.5B workload 上,搭配 Ring AllReduce 比標準 Torus 慢 76%,但若改用 Halving-Doubling 則反而成為最快的設定(比標準 Torus + ring 快 21%),且不增加任何硬體成本。
+論文的結論是:twist 的價值取決於 workload——它對頻寬受限的 All-to-All 有幫助,對通訊密集的 DDP AllReduce 則是拖累。這裡的設定檔可以讓你自己重現這個比較,完整結果與分析在論文第 5 章。README 裡引用的數字都來自單次模擬,只能當參考,不是保證;要採用前請先在自己的環境重跑。
 
 ---
 
@@ -59,7 +59,7 @@
 
 | 元件 | 規格 |
 |---|---|
-| CPU | AMD Ryzen 7 5800X |
+| CPU | AMD Ryzen 7 5700X |
 | GPU | 2× AMD Radeon RX 9070 XT(Navi 48,16 GB GDDR6) |
 | GPU 互連 | PCIe Gen4 x8(透過主機 PCIe Root Complex) |
 | 作業系統 | Ubuntu 24.04 |
@@ -73,7 +73,7 @@
 | 每條鏈路有效延遲 | 14 µs | `rccl-tests` 4 B + 實驗校準 |
 | 本地 GPU 記憶體頻寬 | 540 GB/s | `rocm-bandwidth-test` |
 
-> **消費級 GPU 限制說明:** AMD Radeon(RDNA 架構)GPU 不支援 GPUDirect RDMA。所有節點間傳輸均須經由主機 CPU 的系統記憶體中轉(bounce-buffer)。校準後的 14 µs 有效延遲吸收了這部分軟體堆疊開銷,而非單純反映實體傳播延遲。
+> **消費級 GPU 限制:** AMD Radeon(RDNA)GPU 不支援 GPUDirect RDMA,所有節點間傳輸都得經主機 CPU 的系統記憶體中轉(bounce-buffer)。校準後的 14 µs 有效延遲把這部分軟體堆疊開銷也算了進去,不是單純的實體傳播延遲。
 
 ---
 
@@ -186,20 +186,23 @@ python scripts/run_ns3.py \
   --virtual-world 128 --lmbw 540 --no-autocalib
 
 # 實驗 2 — Qwen 0.5B DDP,*必須*使用 active-chunks=4(避免 deadlock,詳見下節)
+# 注意:Qwen 0.5B 須用精確分數 127/64 = 1.984375(非四捨五入的 1.984),
+# 以確保縮放後的 comm_size 能被 preferred-dataset-splits=4 整除(論文 §4.2.6 / §5.2.1)。
 python scripts/run_ns3.py \
   --workload data/chakra/workload_et --model-tag qwen05b \
   --topo file:configs/astra-sim/topos/logical_128nodes_TwistedTorus_4x4x8.json \
   --phys-topo configs/astra-sim/topos/128nodes_TwistedTorus_4x4x8.txt \
   --system configs/astra-sim/system/system_128nodes_TwistedTorus_4x4x8_4chunks.json \
-  --virtual-world 128 --lmbw 540 --comm-scale 1.984 --no-autocalib --no-qlen
+  --virtual-world 128 --lmbw 540 --comm-scale 1.984375 --no-autocalib --no-qlen
 
-# 實驗 2(DDP 最佳設定)— Twisted Torus + X/Y 維度使用 Halving-Doubling
+# 實驗 2(2×2 因子分析的 HD 那一臂)— Twisted Torus + X/Y 維度使用 Halving-Doubling
+# 2×2 因子分析的 HD 那一臂,用來區分壅塞與拓撲路徑結構(HD 同時也可避開 deadlock)
 python scripts/run_ns3.py \
   --workload data/chakra/workload_et --model-tag qwen05b \
   --topo file:configs/astra-sim/topos/logical_128nodes_TwistedTorus_4x4x8.json \
   --phys-topo configs/astra-sim/topos/128nodes_TwistedTorus_4x4x8.txt \
   --system configs/astra-sim/system/system_128nodes_TwistedTorus_4x4x8_4chunks_hd.json \
-  --virtual-world 128 --lmbw 540 --comm-scale 1.984 --no-autocalib --no-qlen
+  --virtual-world 128 --lmbw 540 --comm-scale 1.984375 --no-autocalib --no-qlen
 
 # 實驗 3 — Qwen 1.5B TP+DDP(TP=8 × DDP=16),Torus
 python scripts/run_ns3.py \
@@ -223,7 +226,7 @@ python scripts/run_ns3.py \
 | 參數 | 用途 |
 |---|---|
 | `--virtual-world N` | 將每個 rank 的 trace 複製擴展到 `N` 節點模擬 |
-| `--comm-scale F`    | 將 `comm_size` 乘以 `F`(論文中 Qwen 實驗使用 `1.984`,對應 M=2 → N=128 修正係數) |
+| `--comm-scale F`    | 將 `comm_size` 乘以 `F`,對應 M=2 → N=128 修正係數。Qwen 0.5B(實驗 2)須用精確分數 `1.984375`(127/64)以確保 split 整除;TP+DDP(實驗 3)及其他實驗用四捨五入的 `1.984` |
 | `--no-qlen`         | 將 `qlen.txt` 導向 `/dev/null`,避免 128 節點時產生數百 GB 除錯輸出 |
 | `--payload`         | 覆寫 ns-3 封包 payload(All-to-All 1 GB 壓力測試使用 `12000` 控制事件量) |
 | `--no-autocalib`    | 停用自動 α 計算(僅在 2-GPU 校準時可用;128 節點必加此參數) |
@@ -233,10 +236,10 @@ python scripts/run_ns3.py \
 
 ## 校準
 
-校準在 2-GPU 規模下執行,產生校準因子 α(µs/cycle),用於將模擬 cycle 數換算為真實時間。校準的主要目的在於透過系統性的參數敏感度分析,確認模擬適合用於**相對拓撲比較**,而非宣稱通訊時間的絕對精準預測。
+校準在 2-GPU 規模下執行,產生校準因子 α(µs/cycle),把模擬 cycle 數換算成真實時間。論文用它來支撐拓撲之間的相對比較,而不是預測絕對通訊時間。
 
-- **ResNet-50(頻寬限制型):** 主要校準基準。wall-clock 校準得到 **α_step = 0.002411 µs/cycle**。ns-3 的通訊時間相對實測 RCCL GPU kernel duration 約有 **+100% 高估**,最合理的解釋是 ns-3 的 Ethernet RDMA 傳輸模型與實體平台的 PCIe DMA 路徑不一致。
-- **CIFAR-10(延遲限制型):** 排除於大規模評估之外。此 workload 的 step time 主要由未建模的軟體堆疊開銷主導,因此 ASTRA-sim 不適合做絕對時間預測。
+- **ResNet-50(頻寬限制型):** 主要基準。wall-clock 校準得到 α_step = 0.002411 µs/cycle。ns-3 的通訊時間穩定,但大約是實測 RCCL GPU kernel duration 的 2 倍。原因應該是傳輸路徑不一致:ns-3 模擬的是 Ethernet RDMA,而 2-GPU 平台走的是 PCIe DMA。
+- **CIFAR-10(延遲限制型):** 不納入大規模評估。它的 step time 大半花在 ASTRA-sim 沒建模的軟體堆疊開銷上,所以這裡無法預測絕對時間。
 
 **實測校準結果(2-GPU,每個訓練步驟):**
 
@@ -247,13 +250,13 @@ python scripts/run_ns3.py \
 | ns-3 vs real | **+100%**(高估) | **−34%**(低估) |
 | 校準狀態 | 主基準 | 排除(scope boundary) |
 
-> 針對 ResNet-50,論文進一步掃描頻寬、延遲、封包 payload 與擁塞控制設定,發現 ns-3 通訊時間穩定落在 14.0–15.1 ms,支持此差異主要是結構性偏差而非參數敏感度問題。對拓撲比較而言,這種系統性偏差預期會同樣作用於所有拓撲,因此不影響相對排序。
+> 針對 ResNet-50,掃過頻寬、延遲、封包 payload 與擁塞控制後,ns-3 通訊時間都穩定落在 14.0–15.1 ms。調參數動不了它,代表這是結構性偏差,不是參數沒調好。這個偏差對每種拓撲一視同仁,所以相對排序仍然成立。
 
 α 值與每次執行的校準結果記錄於 `runs/calibration_all.csv`。完整校準方法論請見 [scripts/README.md](scripts/README.md)。
 
 ### 額外工作負載驗證:Qwen2.5-0.5B
 
-此 Pipeline 也已在相同 2-GPU AMD 平台上,以 **Qwen2.5-0.5B** 的 DDP trace 進行驗證。這個 LLM workload 具有 **494M 參數**,每個 training step 產生 **37 個 AllReduce 通訊節點**,總通訊量約 **1.84 GiB**。2-GPU 校準結果(comm/step ≈ 57.7%、ns-3 低估實測通訊 52%)與「ns-3 未建模 37 個 AllReduce 累積的軟體啟動開銷」的解釋一致。Qwen 0.5B 即為論文實驗 2 所使用的工作負載。
+這套 pipeline 也跑過相同 2-GPU AMD 平台上的 Qwen2.5-0.5B DDP trace。這個 494M 參數的模型每個 step 產生 37 個 AllReduce 節點、約 1.84 GiB 通訊量。2-GPU 校準結果看起來合理(comm/step ≈ 57.7%;這裡 ns-3 低估實測通訊 52%,跟「37 個 AllReduce 累積的啟動開銷 ns-3 沒建模」一致)。Qwen 0.5B 就是實驗 2 的工作負載。
 
 ---
 
@@ -288,8 +291,8 @@ python scripts/run_ns3.py \
 | `system_128nodes_Torus_4x4x8.json` | 1 | ring × 3 | 實驗 1(ResNet-50) |
 | `system_128nodes_Torus_4x4x8_4chunks.json` | 4 | ring × 3 | 實驗 2(Qwen 0.5B,Torus 基準) |
 | `system_128nodes_TwistedTorus_4x4x8.json` | 1 | ring × 3 | 實驗 1 |
-| `system_128nodes_TwistedTorus_4x4x8_4chunks.json` | 4 | ring × 3 | 實驗 2(TT + ring,呈現 76% 退化) |
-| `system_128nodes_TwistedTorus_4x4x8_4chunks_hd.json` | 4 | halvingDoubling、halvingDoubling、ring | 實驗 2(TT + HD,**DDP 最佳設定**) |
+| `system_128nodes_TwistedTorus_4x4x8_4chunks.json` | 4 | ring × 3 | 實驗 2(TT + ring 那一臂) |
+| `system_128nodes_TwistedTorus_4x4x8_4chunks_hd.json` | 4 | halvingDoubling、halvingDoubling、ring | 實驗 2(TT + HD 那一臂) |
 | `system_128nodes_FatTree_L16_S8.json` | 1 | halvingDoubling | 實驗 1 |
 | `system_128nodes_FatTree_L16_S8_4chunks.json` | 4 | halvingDoubling | 實驗 2 |
 | `system_128nodes_*_TP8DDP*.json` | 1 / 4 | ring × 3 / X/Y 改用 HD | 實驗 3(TP+DDP) |
@@ -318,18 +321,18 @@ python3 src/topology_generator.py \
 
 ---
 
-## 拓撲感知演算法選擇(實驗 2 重點)
+## 實驗 2:Twisted Torus AllReduce(Qwen 0.5B)
 
-在通訊密集 AllReduce(Qwen 0.5B,每 step 1.84 GiB)情境下,拓撲與集合演算法的**組合**主導結果:
+實驗 2 在通訊密集 AllReduce 下,用 {Torus, Twisted Torus} × {Ring, Halving-Doubling} 的 2×2 組合,來分開「網路壅塞」和「拓撲路徑結構」兩個因素(四組都用 `active-chunks=4`、`comm-scale=1.984375`)。四組設定如下:
 
-| 設定 | Wall(M cycles) | vs. Torus + ring | 說明 |
-|---|---|---|---|
-| 3D Torus + ring × 3 | 5,418 | 基準 | 對稱路徑、無 straggler |
-| Fat-Tree + halvingDoubling | 5,963 | +10.1% | 頻寬高 2.6×,但需經多 hop 交換器 |
-| **Twisted Torus + ring × 3** | **9,549** | **+76.3%** | 路徑不對稱經 ring 序列鏈累積放大 |
-| **Twisted Torus + X/Y 改用 HD,Z 維仍用 ring** | **4,302** | **−20.6%** | 觀測到的最佳設定;PFC 事件下降 99.7% |
+| 拓撲(實體) | system 設定 | 演算法 |
+|---|---|---|
+| `128nodes_Torus_4x4x8.txt` | `system_128nodes_Torus_4x4x8_4chunks.json` | ring × 3 |
+| `128nodes_Torus_4x4x8.txt` | `system_128nodes_TwistedTorus_4x4x8_4chunks_hd.json` | X/Y 用 HD、Z 用 ring |
+| `128nodes_TwistedTorus_4x4x8.txt` | `system_128nodes_TwistedTorus_4x4x8_4chunks.json` | ring × 3 |
+| `128nodes_TwistedTorus_4x4x8.txt` | `system_128nodes_TwistedTorus_4x4x8_4chunks_hd.json` | X/Y 用 HD、Z 用 ring |
 
-twist 本身**並非絕對的優點或缺點**,效果完全取決於集合演算法是否能夠利用或衝突於修改後的路徑結構。Ring AllReduce 的單向序列鏈會將 twist 的不對稱性放大成系統級 straggler;Halving-Doubling 的雙向配對交換對此免疫。實務建議:在 Twisted Torus 部署上,把 AllReduce 的 X/Y 維演算法設為 **Halving-Doubling**(RCCL/NCCL 原生支援)。
+四組都跑完(指令見 [scripts/commands.md](scripts/commands.md)),從各自的 `out/metrics.csv` 比 `Wall time` 和 `PFC 事件`。要看的是這四個點彼此的關係,不是絕對數字;絕對值會隨你的校準和機器變動。參考值和分析在論文第 5 章。
 
 ---
 
@@ -339,7 +342,7 @@ twist 本身**並非絕對的優點或缺點**,效果完全取決於集合演算
 
 在 128 節點 Twisted Torus 跑高通訊量 AllReduce(Qwen 0.5B)時,預設的 `active-chunks-per-dimension=1` 在 `localBWAware` 優化下會觸發確定性的排程死鎖。Twisted Torus 的 X 軸非對稱繞回鏈路使各節點階段進度不同步,在 ASTRA-sim chunk queue 中產生跨維度的循環等待。徵狀:ns-3 在 ~5,337 個 flow 處停止發出新 flow(預期約 985,088)。
 
-**解法:** 將 `active-chunks-per-dimension: 4` 設為與 `preferred-dataset-splits: 4` 相同。論文 Qwen 0.5B 實驗都使用 `*_4chunks*.json` 系列;`*_4chunks_hd.json` 在此基礎上,進一步把 X/Y 維度的 ring 換成 halvingDoubling,從根本上化解路徑不對稱問題(只調 chunks=4 僅是排程層級的緩解)。
+**解法:** 將 `active-chunks-per-dimension: 4` 設為與 `preferred-dataset-splits: 4` 相同。論文 Qwen 0.5B 實驗都使用 `*_4chunks*.json` 系列。`*_4chunks_hd.json` 是 2×2 因子分析的第二臂,把 X/Y 維度的 ring 換成 halvingDoubling,同樣可避開 deadlock。`active-chunks=4` 化解的是排程層級的 deadlock,並不改變拓撲的路徑結構(其含義見論文)。
 
 標準 3D Torus 與 Fat-Tree 的對稱路徑可保證各節點階段同步,因此不會觸發此死鎖。其他論文實驗(ResNet-50 AllReduce、TP+DDP、All-to-All)亦不會觸發,皆使用預設 `active-chunks=1` 的設定檔。
 
@@ -347,7 +350,7 @@ twist 本身**並非絕對的優點或缺點**,效果完全取決於集合演算
 
 ## All-to-All 壓力測試(實驗 4)
 
-直接使用 ResNet-50 原始 trace(每 step 約 89.7 MiB)執行 AllReduce 時,通訊會被 GPU 計算完全掩蓋,拓撲間差異無從觀察。為了將壓力施加到網路、放大拓撲差異,可使用 `src/scale_et_comm_workload.py` 對每個 `COMM_COLL_NODE` 進行就地修補:
+用 ResNet-50 原始 trace(每 step 約 89.7 MiB)跑 AllReduce 時,通訊被 GPU 計算蓋掉,三種拓撲看起來一樣。要把流量壓到網路上,可以用 `src/scale_et_comm_workload.py` 就地改寫每個 `COMM_COLL_NODE`:
 
 1. **`comm_type`** → 強制設為 `ALL_TO_ALL`(原為 `ALL_REDUCE`)
 2. **`comm_size`** → 設為指定的位元組數(例如 1 GB = 1,073,741,824 bytes)
@@ -391,7 +394,7 @@ python scripts/run_ns3.py \
   --virtual-world 128 --payload 12000 --lmbw 540 --no-autocalib
 ```
 
-> **可觀察性三階段(論文 5.4.1):** 原始 ~89.7 MiB AllReduce 完全被遮蔽;100 MB All-to-All 時僅標準 Torus 先行暴露(Twisted Torus 與 Fat-Tree 仍被掩蓋);512 MB–1 GB 時三種拓撲完全分化,Twisted Torus 比標準 Torus 快 18%、Fat-Tree 比標準 Torus 快 1.62×。因此 1 GB All-to-All 應視為 simulation-only 的上界壓力測試,而非實際生產工作負載。1 GB / collective 的通訊量在 128 節點規模下也已超過 16 GB VRAM,在實體硬體上無法直接執行。
+> **可觀察性三階段(論文 5.4.1):** 原始 ~89.7 MiB AllReduce 完全被計算遮蔽;小的 All-to-All payload 會讓拓撲差異逐步暴露,到 512 MB–1 GB 時三種拓撲完全分化。建議自己掃 `--bytes`(100 MB → 1 GB),看在你的環境下三種拓撲從哪裡開始分離;論文提供其參考值與比例。1 GB All-to-All 是 simulation-only 的上界壓力測試,而非實際生產工作負載——1 GB / collective 的通訊量在 128 節點規模下也已超過 16 GB VRAM,在實體硬體上無法直接執行。
 
 ---
 
@@ -450,7 +453,7 @@ runs/20260324-013221+0800_ns3_128gpu_qwen05b_file_logical_128nodes_FatTree_L16_S
 若 `fct.txt` 持續有新數值寫入,通常代表模擬仍在正常進行。可使用 `--deadlock-timeout`(預設 12 小時)自動 kill 真正卡死的實驗。生成追蹤時建議將 `--trace-steps` 控制在 1–4——非常大的 ET 檔可能耗盡 ASTRA-sim ETFeeder 的資源。多個實驗也可以使用不同 shell 視窗平行執行。
 
 **Q:Twisted Torus 跑 Qwen 0.5B 時,fct.txt 在約 5,337 個 flow 後停下不動。**
-A:這是上述的「多維度 Ring 排程死鎖」(亦即論文 6.2.7 節)。請改用 `*_4chunks*.json` 系列設定,使 `active-chunks-per-dimension=4`。若希望取得 DDP 最佳效能,推薦使用 `system_128nodes_TwistedTorus_4x4x8_4chunks_hd.json`,該設定同時把 X/Y 維度的 ring 換成 halvingDoubling。
+A:這是上述的「多維度 Ring 排程死鎖」(亦即論文 6.2.7 節)。請改用 `*_4chunks*.json` 系列設定,使 `active-chunks-per-dimension=4`。`*_4chunks_hd.json`(X/Y 改用 halvingDoubling)是 2×2 因子分析的第二臂,同樣可避開 deadlock。`active-chunks=4` 化解的是排程層級的 deadlock,並不改變拓撲的路徑結構(其含義見論文第 5 章 / 6.2.7 節)。
 
 **Q:ASTRA-sim 出現 `"Node X in ctrl_dep graph, but not found in index"` 錯誤?**
 A:ET 檔案的 DAG 完整性異常(自依賴或循環依賴)。重新執行 `conver_to_chakra_et.py`,內建的 DAG 修復 Pass(`fix_et_dag_inplace`)應可自動解決。
@@ -459,13 +462,13 @@ A:ET 檔案的 DAG 完整性異常(自依賴或循環依賴)。重新執行 `con
 A:在 trace 收集腳本加上 `--inject-sync-hack`。此選項會注入同步事件,對齊 CPU(毫秒)與 GPU(微秒)的時間軸。
 
 **Q:為什麼 ns-3 會把 ResNet-50 的通訊時間高估約 2 倍?**
-A:這個差異對所有測試參數都不敏感,最合理的解釋是傳輸路徑不匹配:ns-3 使用 Ethernet RDMA 模型,而實體 2-GPU 平台實際走的是 PCIe DMA 路徑。由於同一個 ns-3 傳輸模型套用在所有拓撲上,這個偏差會在相對拓撲比較中相互抵消。
+A:調任何參數都動不了它,所以不是校準調錯。原因應該是傳輸路徑不一致:ns-3 模擬 Ethernet RDMA,而 2-GPU 平台走 PCIe DMA。同一個模型套在每種拓撲上,所以拓撲互相比較時這個偏差會抵消掉。
 
 **Q:為什麼 CIFAR-10 被排除在大規模評估之外?**
 A:它超過一半的 step time 都落在 ASTRA-sim 未建模的軟體堆疊開銷(kernel launch、RCCL handshake、CPU scheduling),導致 wall-clock 與 communication calibration factor 發散 1.3 倍,因此不適合用來做大規模絕對時間預測。詳見論文第 4.3 節。
 
-**Q:為什麼 Qwen 實驗都加了 `--comm-scale 1.984`?**
-A:這是為了把 M=2 的來源 trace 複製成 N=128 ranks 後,修正每個集合的通訊量。具體公式為 `M(N-1) / (N(M-1)) = 2 × 127 / (128 × 1) ≈ 1.984`,使得擴展後的 trace 與校準時的 2-GPU 基準對齊。此倍率對所有拓撲一致套用,不影響相對比較。詳見論文 4.6.2 節。
+**Q:為什麼 Qwen 實驗用 `--comm-scale ≈ 1.984`,而 Qwen 0.5B 要用 `1.984375`?**
+A:這是為了把 M=2 的來源 trace 複製成 N=128 ranks 後,修正每個集合的通訊量。具體公式為 `M(N-1) / (N(M-1)) = 2 × 127 / (128 × 1) = 127/64 = 1.984375`,使擴展後的 trace 與校準時的 2-GPU 基準對齊。**Qwen 0.5B DDP**(實驗 2)須用精確分數 `1.984375`,因為縮放後的 `comm_size` 必須能被 `preferred-dataset-splits=4` 整除;四捨五入成 `1.984` 會破壞整除性,正是先前污染某組舊結果的兩個 bug 之一。TP+DDP(實驗 3)與 ResNet-50 實驗無此整除需求,故用四捨五入的 `1.984`。在同一實驗內對所有拓撲一致套用,此倍率不影響相對比較。詳見論文 4.2.6 / 4.6.2 節。
 
 ---
 

@@ -173,7 +173,7 @@ python scripts/run_ns3.py \
  --system configs/astra-sim/system/system_128nodes_FatTree_L16_S8_4chunks.json \
  --virtual-world 128 \
  --lmbw 540 \
- --comm-scale 1.984 \
+ --comm-scale 1.984375 \
  --no-autocalib --no-qlen
 ```
 

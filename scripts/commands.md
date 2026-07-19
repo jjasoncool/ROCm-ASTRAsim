@@ -177,6 +177,49 @@ python scripts/run_ns3.py \
  --no-autocalib --no-qlen
 ```
 
+## ResNet-50 AllReduce 128 nodes
+### ResNet-50 · Torus (ring)
+```bash
+python scripts/run_ns3.py \
+ --workload data/chakra/workload_et \
+ --model-tag resnet50 \
+ --topo file:configs/astra-sim/topos/logical_128nodes_Torus_4x4x8.json \
+ --phys-topo configs/astra-sim/topos/128nodes_Torus_4x4x8.txt \
+ --system configs/astra-sim/system/system_128nodes_Torus_4x4x8.json \
+ --virtual-world 128 \
+ --lmbw 540 \
+ --comm-scale 1.984375 \
+ --no-autocalib --no-qlen
+```
+
+### ResNet-50 · Fat-Tree (halvingDoubling)
+```bash
+python scripts/run_ns3.py \
+ --workload data/chakra/workload_et \
+ --model-tag resnet50 \
+ --topo file:configs/astra-sim/topos/logical_128nodes_FatTree_L16_S8.json \
+ --phys-topo configs/astra-sim/topos/128nodes_FatTree_L16_S8.txt \
+ --system configs/astra-sim/system/system_128nodes_FatTree_L16_S8.json \
+ --virtual-world 128 \
+ --lmbw 540 \
+ --comm-scale 1.984375 \
+ --no-autocalib --no-qlen
+```
+
+### ResNet-50 · Twisted Torus (ring) — 可能 deadlock,見上方註 1
+```bash
+python scripts/run_ns3.py \
+ --workload data/chakra/workload_et \
+ --model-tag resnet50 \
+ --topo file:configs/astra-sim/topos/logical_128nodes_TwistedTorus_4x4x8.json \
+ --phys-topo configs/astra-sim/topos/128nodes_TwistedTorus_4x4x8.txt \
+ --system configs/astra-sim/system/system_128nodes_TwistedTorus_4x4x8.json \
+ --virtual-world 128 \
+ --lmbw 540 \
+ --comm-scale 1.984375 \
+ --no-autocalib --no-qlen
+```
+
 # 128 nodes Torus (8TP+16DDP)
 ```bash
 python scripts/run_ns3.py \

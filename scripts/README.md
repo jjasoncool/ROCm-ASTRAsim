@@ -226,7 +226,7 @@ python scripts/run_ns3.py \
 | Parameter | Description | Example |
 |---|---|---|
 | `--virtual-world N` | Replicate per-rank trace to `N`-node simulation | `128` |
-| `--comm-scale F` | Multiply every `comm_size` by `F` to correct M=2 → N=128. Qwen 0.5B (Exp 2) uses the exact fraction **`1.984375`** (127/64) for split divisibility; TP+DDP (Exp 3) and other experiments use the rounded **`1.984`** | `1.984375` |
+| `--comm-scale F` | Multiply every `comm_size` by `F` to correct M=2 → N=128. Use the ring-AllReduce factor 2·(N−1)/N ≈ **`1.984`** (N=128); applied uniformly across all topologies within an experiment, so it does not affect relative comparisons | `1.984` |
 | `--no-qlen` | Redirect `qlen.txt` to `/dev/null` (avoid hundreds of GB of debug output at 128 nodes) | — |
 | `--deadlock-timeout S` | Kill the run if `fct.txt` stops updating for `S` seconds (default `43200` = 12 h, set `0` to disable) | `43200` |
 

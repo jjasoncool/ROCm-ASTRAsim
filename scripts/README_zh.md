@@ -226,7 +226,7 @@ python scripts/run_ns3.py \
 | 參數 | 描述 | 範例 |
 |---|---|---|
 | `--virtual-world N` | 將每 rank trace 複製擴展到 `N` 節點模擬 | `128` |
-| `--comm-scale F` | 將每個 `comm_size` 乘以 `F` 修正 M=2 → N=128。Qwen 0.5B(實驗 2)須用精確分數 **`1.984375`**(127/64)以確保 split 整除;TP+DDP(實驗 3)與其他實驗用四捨五入的 **`1.984`** | `1.984375` |
+| `--comm-scale F` | 將每個 `comm_size` 乘以 `F` 修正 M=2 → N=128。使用 ring-AllReduce 係數 2·(N−1)/N ≈ **`1.984`**(N=128);同一實驗內對所有拓撲一致套用,不影響相對比較 | `1.984` |
 | `--no-qlen` | 將 `qlen.txt` 導向 `/dev/null`，避免 128 節點時產生數百 GB 除錯輸出 | — |
 | `--deadlock-timeout S` | `fct.txt` 連續 `S` 秒未更新即自動 kill（預設 `43200` = 12 h，`0` 表示停用） | `43200` |
 

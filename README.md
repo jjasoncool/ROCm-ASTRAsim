@@ -2,7 +2,7 @@
 
 > [繁體中文](README_zh.md) | **English**
 
-> **Thesis:** *"Cost-Effective Twisted Torus for AI Training: An ASTRA-sim Evaluation Using Traces from Consumer-Grade AMD GPUs with ROCm"*
+> **Thesis:** *"Cost-Effective AI Training Performance Evaluation for Torus Topology based on AMD ROCm and the Trace-Driven simulator ASTRA-sim"*
 > National Cheng Kung University (NCKU), Graduate Institute of Computer Science and Information Engineering, 2026
 
 A three-stage pipeline that collects real training traces from AMD ROCm/RCCL hardware and feeds them into ASTRA-sim for cluster-scale network simulation. Most published ASTRA-sim work assumes NVIDIA CUDA/NCCL; this targets the AMD ROCm/RCCL path instead.
@@ -187,8 +187,8 @@ python scripts/run_ns3.py \
   --virtual-world 128 --lmbw 540 --no-autocalib
 
 # Experiment 2 — Qwen 0.5B DDP, *requires* active-chunks=4 (deadlock workaround, see below).
-# NOTE: Qwen 0.5B uses the EXACT fraction 127/64 = 1.984375 (not the rounded 1.984) so the
-# scaled comm_size stays divisible by preferred-dataset-splits=4 (thesis §4.2.6 / §5.2.1).
+# NOTE: --comm-scale ≈ 1.984 is the M=2 → N=128 ring-AllReduce correction 2·(N-1)/N;
+# applied uniformly across topologies, so it does not affect the relative comparison.
 python scripts/run_ns3.py \
   --workload data/chakra/workload_et --model-tag qwen05b \
   --topo file:configs/astra-sim/topos/logical_128nodes_TwistedTorus_4x4x8.json \
@@ -227,7 +227,7 @@ python scripts/run_ns3.py \
 | Flag | Purpose |
 |---|---|
 | `--virtual-world N` | Replicate the per-rank trace to a `N`-node simulation |
-| `--comm-scale F`    | Scale `comm_size` by `F` for the M=2 → N=128 correction. Qwen 0.5B (Exp 2) uses the exact fraction `1.984375` (127/64) for split divisibility; the TP+DDP (Exp 3) and other experiments use the rounded `1.984` |
+| `--comm-scale F`    | Scale `comm_size` by `F` for the M=2 → N=128 correction. Use the ring-AllReduce factor 2·(N-1)/N ≈ `1.984` (N=128); applied uniformly across all topologies within an experiment, so it does not affect relative comparisons |
 | `--no-qlen`         | Redirect `qlen.txt` to `/dev/null` to avoid hundreds of GB of debug output at 128-node scale |
 | `--payload`         | Override ns-3 packet payload (use `12000` for the All-to-All 1 GB stress test to keep event count manageable) |
 | `--no-autocalib`    | Disable automatic α calculation (only use at 2-GPU calibration; required at 128 nodes) |
@@ -327,7 +327,7 @@ If you only want to reproduce the thesis topologies, use the prebuilt files unde
 
 Experiment 2 runs communication-intensive AllReduce as a 2×2 over
 {Torus, Twisted Torus} × {Ring, Halving-Doubling} (all at `active-chunks=4`,
-`comm-scale=1.984375`), to tell apart two factors: network congestion and the
+`comm-scale ≈ 1.984`), to tell apart two factors: network congestion and the
 topology's route structure. The four configs to run and compare:
 
 | Topology (physical) | System config | Algorithm |
@@ -475,8 +475,8 @@ A: No tuning parameter moves it, so it isn't a calibration mistake. The likely c
 **Q: Why is CIFAR-10 excluded from large-scale evaluation?**
 A: Its shallow architecture leaves more than half of the step time in unmodeled software overhead (kernel launch, RCCL handshake, CPU scheduling). This causes wall-clock and communication calibration factors to diverge by 1.3×, making ASTRA-sim unsuitable for absolute prediction in this latency-dominated regime. See thesis Section 4.3 for details.
 
-**Q: Why is `--comm-scale ≈ 1.984` used for Qwen experiments, and why does Qwen 0.5B use `1.984375`?**
-A: It corrects the per-collective communication size when the M=2 source trace is replicated to N=128 ranks. Specifically, `M(N-1) / (N(M-1)) = 2 × 127 / (128 × 1) = 127/64 = 1.984375` aligns the scaled trace's payload with the calibrated 2-GPU baseline. The **Qwen 0.5B DDP** experiment (Exp 2) uses the exact fraction `1.984375` because the scaled `comm_size` must stay divisible by `preferred-dataset-splits=4`; rounding to `1.984` breaks that divisibility and was one of two bugs that contaminated an earlier result set. The TP+DDP (Exp 3) and ResNet-50 experiments, which impose no such divisibility requirement, use the rounded `1.984`. Applied uniformly across all topologies within an experiment, the factor does not affect relative comparisons. See thesis Sections 4.2.6 / 4.6.2 for the derivation.
+**Q: Why is `--comm-scale ≈ 1.984` used for the scaled experiments?**
+A: It corrects the per-collective communication size when the M=2 source trace is replicated to N=128 ranks. The correction factor is `M(N-1) / (N(M-1)) = 2 × 127 / 128 ≈ 1.984` for N=128, which realigns the scaled trace's payload with the calibrated 2-GPU baseline. Because the same factor is applied uniformly across all topologies within an experiment, it does not affect the relative comparison between topologies. See thesis Sections 4.2.6 / 4.6.2 for the derivation.
 
 ---
 
@@ -496,10 +496,10 @@ Early-stage debugging and integration reports documenting issues encountered and
 If you use this pipeline or the simulation results, please cite:
 
 ```bibtex
-@mastersthesis{chen2026twisted,
+@mastersthesis{chen2026torus,
   author  = {jjasoncool},
-  title   = {Cost-Effective Twisted Torus for AI Training: An ASTRA-sim Evaluation
-             Using Traces from Consumer-Grade AMD GPUs with ROCm},
+  title   = {Cost-Effective AI Training Performance Evaluation for Torus Topology
+             based on AMD ROCm and the Trace-Driven simulator ASTRA-sim},
   school  = {National Cheng Kung University},
   year    = {2026},
   note    = {Code available at \url{https://github.com/jjasoncool/ROCm-ASTRAsim}}

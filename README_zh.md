@@ -2,7 +2,8 @@
 
 > **繁體中文** | [English](README.md)
 
-> **論文：** *《Cost-Effective Twisted Torus for AI Training: An ASTRA-sim Evaluation Using Traces from Consumer-Grade AMD GPUs with ROCm》*
+> **論文：** *《基於AMD ROCm及追蹤驅動模擬器ASTRA-sim之具成本效益人工智慧訓練在環面拓撲上之效能評估》*
+> *(Cost-Effective AI Training Performance Evaluation for Torus Topology based on AMD ROCm and the Trace-Driven simulator ASTRA-sim)*
 > 國立成功大學資訊工程研究所,2026
 
 一套三階段的 trace-driven 模擬 pipeline,從 AMD ROCm/RCCL 實體硬體收集訓練追蹤,再送進 ASTRA-sim 做叢集規模的網路模擬。多數已發表的 ASTRA-sim 研究假設的是 NVIDIA CUDA/NCCL,這裡補上 AMD ROCm/RCCL 這條路徑。
@@ -186,8 +187,8 @@ python scripts/run_ns3.py \
   --virtual-world 128 --lmbw 540 --no-autocalib
 
 # 實驗 2 — Qwen 0.5B DDP,*必須*使用 active-chunks=4(避免 deadlock,詳見下節)
-# 注意:Qwen 0.5B 須用精確分數 127/64 = 1.984375(非四捨五入的 1.984),
-# 以確保縮放後的 comm_size 能被 preferred-dataset-splits=4 整除(論文 §4.2.6 / §5.2.1)。
+# 注意:--comm-scale ≈ 1.984 是 M=2 → N=128 的 ring-AllReduce 修正 2·(N-1)/N;
+# 對所有拓撲一致套用,不影響相對比較。
 python scripts/run_ns3.py \
   --workload data/chakra/workload_et --model-tag qwen05b \
   --topo file:configs/astra-sim/topos/logical_128nodes_TwistedTorus_4x4x8.json \
@@ -226,7 +227,7 @@ python scripts/run_ns3.py \
 | 參數 | 用途 |
 |---|---|
 | `--virtual-world N` | 將每個 rank 的 trace 複製擴展到 `N` 節點模擬 |
-| `--comm-scale F`    | 將 `comm_size` 乘以 `F`,對應 M=2 → N=128 修正係數。Qwen 0.5B(實驗 2)須用精確分數 `1.984375`(127/64)以確保 split 整除;TP+DDP(實驗 3)及其他實驗用四捨五入的 `1.984` |
+| `--comm-scale F`    | 將 `comm_size` 乘以 `F`,對應 M=2 → N=128 修正。使用 ring-AllReduce 係數 2·(N-1)/N ≈ `1.984`(N=128);同一實驗內對所有拓撲一致套用,不影響相對比較 |
 | `--no-qlen`         | 將 `qlen.txt` 導向 `/dev/null`,避免 128 節點時產生數百 GB 除錯輸出 |
 | `--payload`         | 覆寫 ns-3 封包 payload(All-to-All 1 GB 壓力測試使用 `12000` 控制事件量) |
 | `--no-autocalib`    | 停用自動 α 計算(僅在 2-GPU 校準時可用;128 節點必加此參數) |
@@ -323,7 +324,7 @@ python3 src/topology_generator.py \
 
 ## 實驗 2:Twisted Torus AllReduce(Qwen 0.5B)
 
-實驗 2 在通訊密集 AllReduce 下,用 {Torus, Twisted Torus} × {Ring, Halving-Doubling} 的 2×2 組合,來分開「網路壅塞」和「拓撲路徑結構」兩個因素(四組都用 `active-chunks=4`、`comm-scale=1.984375`)。四組設定如下:
+實驗 2 在通訊密集 AllReduce 下,用 {Torus, Twisted Torus} × {Ring, Halving-Doubling} 的 2×2 組合,來分開「網路壅塞」和「拓撲路徑結構」兩個因素(四組都用 `active-chunks=4`、`comm-scale ≈ 1.984`)。四組設定如下:
 
 | 拓撲(實體) | system 設定 | 演算法 |
 |---|---|---|
@@ -467,8 +468,8 @@ A:調任何參數都動不了它,所以不是校準調錯。原因應該是傳�
 **Q:為什麼 CIFAR-10 被排除在大規模評估之外?**
 A:它超過一半的 step time 都落在 ASTRA-sim 未建模的軟體堆疊開銷(kernel launch、RCCL handshake、CPU scheduling),導致 wall-clock 與 communication calibration factor 發散 1.3 倍,因此不適合用來做大規模絕對時間預測。詳見論文第 4.3 節。
 
-**Q:為什麼 Qwen 實驗用 `--comm-scale ≈ 1.984`,而 Qwen 0.5B 要用 `1.984375`?**
-A:這是為了把 M=2 的來源 trace 複製成 N=128 ranks 後,修正每個集合的通訊量。具體公式為 `M(N-1) / (N(M-1)) = 2 × 127 / (128 × 1) = 127/64 = 1.984375`,使擴展後的 trace 與校準時的 2-GPU 基準對齊。**Qwen 0.5B DDP**(實驗 2)須用精確分數 `1.984375`,因為縮放後的 `comm_size` 必須能被 `preferred-dataset-splits=4` 整除;四捨五入成 `1.984` 會破壞整除性,正是先前污染某組舊結果的兩個 bug 之一。TP+DDP(實驗 3)與 ResNet-50 實驗無此整除需求,故用四捨五入的 `1.984`。在同一實驗內對所有拓撲一致套用,此倍率不影響相對比較。詳見論文 4.2.6 / 4.6.2 節。
+**Q:為什麼縮放實驗要用 `--comm-scale ≈ 1.984`?**
+A:這是為了把 M=2 的來源 trace 複製成 N=128 ranks 後,修正每個集合的通訊量。修正係數為 `M(N-1) / (N(M-1)) = 2 × 127 / 128 ≈ 1.984`(N=128),使擴展後的 trace 與校準時的 2-GPU 基準對齊。由於同一實驗內對所有拓撲一致套用同一係數,此倍率不影響拓撲之間的相對比較。詳見論文 4.2.6 / 4.6.2 節。
 
 ---
 
@@ -488,10 +489,10 @@ Pipeline 開發過程中遭遇並解決的問題,已記錄於 [`docs/archive/`](
 若使用本 Pipeline 或相關模擬結果,請引用:
 
 ```bibtex
-@mastersthesis{chen2026twisted,
+@mastersthesis{chen2026torus,
   author  = {jjasoncool},
-  title   = {Cost-Effective Twisted Torus for AI Training: An ASTRA-sim Evaluation
-             Using Traces from Consumer-Grade AMD GPUs with ROCm},
+  title   = {Cost-Effective AI Training Performance Evaluation for Torus Topology
+             based on AMD ROCm and the Trace-Driven simulator ASTRA-sim},
   school  = {National Cheng Kung University},
   year    = {2026},
   note    = {Code available at \url{https://github.com/jjasoncool/ROCm-ASTRAsim}}

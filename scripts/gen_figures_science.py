@@ -17,6 +17,8 @@ sudo apt install texlive-latex-base texlive-fonts-recommended texlive-fonts-extr
 
 All data from confirmed experimental results.
 α = 0.002411 μs/cycle for time conversion.
+
+2026-07-26: 七處 ax.set_title 註解停用 — 圖內標題與 docx 圖說 (ImageCaption) 重複,標題由圖說承載。要恢復把行首 # 拿掉即可。
 """
 
 import matplotlib
@@ -215,9 +217,9 @@ def fig_4_4():
     ax.set_yticklabels(workloads, fontsize=9)
     ax.set_xlabel('Proportion of step time (\\%)', fontsize=9)
     ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.28), ncol=3, fontsize=6.5, framealpha=0.9)
-    ax.set_title('Calibration Scope Boundary: Step Time Composition', fontsize=10)
+    # ax.set_title('Calibration Scope Boundary: Step Time Composition', fontsize=10)
     plt.tight_layout()
-    plt.savefig(f'{outdir}/fig_4_4_scope_boundary.pdf')
+    # plt.savefig(f'{outdir}/fig_4_4_scope_boundary.pdf')
     plt.savefig(f'{outdir}/fig_4_4_scope_boundary.png')
     plt.close()
     print("  Fig 4.4 done")
@@ -255,9 +257,9 @@ def fig_5_1():
             bbox=dict(boxstyle='round,pad=0.3', facecolor='#f0f0f0',
                       edgecolor='#cccccc', alpha=0.8))
 
-    ax.set_title('AllReduce Experiment (128 nodes, ResNet-50)')
+    # ax.set_title('AllReduce Experiment (128 nodes, ResNet-50)')
     plt.tight_layout()
-    plt.savefig(f'{outdir}/fig_5_1_allreduce.pdf')
+    # plt.savefig(f'{outdir}/fig_5_1_allreduce.pdf')
     plt.savefig(f'{outdir}/fig_5_1_allreduce.png')
     plt.close()
     print("  Fig 5.1 done")
@@ -322,14 +324,14 @@ def fig_5_2():
     ax.text(1.4, 8700, 'twist: $+\\sim$75\\%\n(ring \\& HD)',
             ha='center', va='bottom', fontsize=6.5, fontweight='bold')
 
-    ax.set_title('Qwen 0.5B DDP AllReduce (128 nodes)')
+    # ax.set_title('Qwen 0.5B DDP AllReduce (128 nodes)')
     ax.legend(
         [plt.Rectangle((0, 0), 1, 1, fc=c, ec='black', lw=0.4) for c in [C_ORANGE, C_BLUE, C_RED]],
         ['Std. Torus', 'Fat-Tree', 'Twisted Torus'],
         loc='upper left', framealpha=0.9, fontsize=6, bbox_to_anchor=(0.0, 0.78)
     )
     plt.tight_layout()
-    plt.savefig(f'{outdir}/fig_5_2_qwen_ddp.pdf')
+    # plt.savefig(f'{outdir}/fig_5_2_qwen_ddp.pdf')
     plt.savefig(f'{outdir}/fig_5_2_qwen_ddp.png')
     plt.close()
     print("  Fig 5.2 done")
@@ -372,9 +374,9 @@ def fig_5_3():
         ax.annotate(label, xy=(x[i], wall_ms[i] + 700), fontsize=6.5,
                     ha='center', color=TOPO_COLORS[i], fontweight='bold')
 
-    ax.set_title('All-to-All Stress Test (128 nodes, 1 GB)')
+    # ax.set_title('All-to-All Stress Test (128 nodes, 1 GB)')
     plt.tight_layout()
-    plt.savefig(f'{outdir}/fig_5_3_all2all.pdf')
+    # plt.savefig(f'{outdir}/fig_5_3_all2all.pdf')
     plt.savefig(f'{outdir}/fig_5_3_all2all.png')
     plt.close()
     print("  Fig 5.3 done")
@@ -434,7 +436,7 @@ def fig_5_4():
     ax1.set_xticks(x)
     ax1.set_xticklabels(comm_sizes, fontsize=7)
     ax1.set_xlim(-0.3, 3.5)
-    ax1.set_title('Topology Divergence vs. Communication Volume (128 nodes)')
+    # ax1.set_title('Topology Divergence vs. Communication Volume (128 nodes)')
 
     # --- Improvement ratio (right Y-axis) ---
     ax2 = ax1.twinx()
@@ -475,7 +477,7 @@ def fig_5_4():
     ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=6.5, framealpha=0.9)
 
     plt.tight_layout()
-    plt.savefig(f'{outdir}/fig_5_4_sweep.pdf')
+    # plt.savefig(f'{outdir}/fig_5_4_sweep.pdf')
     plt.savefig(f'{outdir}/fig_5_4_sweep.png')
     plt.close()
     print("  Fig 5.4 done")
@@ -509,9 +511,9 @@ def fig_5_5():
                 arrowprops=dict(arrowstyle='->', color=C_GRAY, lw=1.2))
     ax.text(0.28, 1.38, 'Direction\nconsistent', fontsize=6, color=C_GRAY)
 
-    ax.set_title('Twisted Torus Improvement Factor')
+    # ax.set_title('Twisted Torus Improvement Factor')
     plt.tight_layout()
-    plt.savefig(f'{outdir}/fig_5_5_improvement_factor.pdf')
+    # plt.savefig(f'{outdir}/fig_5_5_improvement_factor.pdf')
     plt.savefig(f'{outdir}/fig_5_5_improvement_factor.png')
     plt.close()
     print("  Fig 5.5 done")
@@ -573,9 +575,9 @@ def fig_6_1():
     ax.set_xticklabels(categories, fontsize=9)
     ax.set_ylim(0, 16)
     ax.legend(loc='upper right', fontsize=5.4, framealpha=0.9)
-    ax.set_title('Hardware Cost Breakdown (128 GPUs)')
+    # ax.set_title('Hardware Cost Breakdown (128 GPUs)')
     plt.tight_layout()
-    plt.savefig(f'{outdir}/fig_6_1_cost.pdf')
+    # plt.savefig(f'{outdir}/fig_6_1_cost.pdf')
     plt.savefig(f'{outdir}/fig_6_1_cost.png')
     plt.close()
     print(f"  Fig 6.1 done — FT={totals[0]:.3f}M Torus={totals[1]:.3f}M ratio={totals[1]/totals[0]*100:.1f}%")
@@ -592,4 +594,4 @@ if __name__ == '__main__':
     fig_5_5()   # was fig_5_4: TPU v4 improvement factor
     fig_6_1()
     print(f"\n=== All 7 figures generated in {outdir}/ ===")
-    print("Each figure has both .pdf (for LaTeX/Word) and .png (for preview)")
+    print("Done.")

@@ -340,7 +340,7 @@ def fig_5_2():
 # ============================================================
 # Fig 5.3: All-to-All 1GB Stacked Bar (was Fig 5.2)
 # ============================================================
-def fig_5_3():
+def fig_5_4():
     fig, ax = plt.subplots(figsize=(3.5, 3.0))
 
     wall_ms = [
@@ -376,18 +376,18 @@ def fig_5_3():
 
     # ax.set_title('All-to-All Stress Test (128 nodes, 1 GB)')
     plt.tight_layout()
-    # plt.savefig(f'{outdir}/fig_5_3_all2all.pdf')
-    plt.savefig(f'{outdir}/fig_5_3_all2all.png')
+    # plt.savefig(f'{outdir}/fig_5_4_all2all.pdf')
+    plt.savefig(f'{outdir}/fig_5_4_all2all.png')
     plt.close()
-    print("  Fig 5.3 done")
+    print("  Fig 5.4 done")
 
 
 # ============================================================
-# Fig 5.4: Communication Volume Sweep (was Fig 5.3) (line chart)
+# Fig 5.3: Communication Volume Sweep (v90 renumber; was 5.4) (line chart)
 # Shows wall time vs comm_size for all 3 topologies
 # (was Fig 5.5; old Fig 5.3 3-panel bar chart deleted as redundant)
 # ============================================================
-def fig_5_4():
+def fig_5_3():
     fig, ax1 = plt.subplots(figsize=(4.5, 3.2))
 
     # X-axis: comm_size labels (not linear scale — use categorical)
@@ -477,10 +477,10 @@ def fig_5_4():
     ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=6.5, framealpha=0.9)
 
     plt.tight_layout()
-    # plt.savefig(f'{outdir}/fig_5_4_sweep.pdf')
-    plt.savefig(f'{outdir}/fig_5_4_sweep.png')
+    # plt.savefig(f'{outdir}/fig_5_3_sweep.pdf')
+    plt.savefig(f'{outdir}/fig_5_3_sweep.png')
     plt.close()
-    print("  Fig 5.4 done")
+    print("  Fig 5.3 done")
 
 
 # ============================================================
@@ -589,8 +589,8 @@ if __name__ == '__main__':
     fig_4_4()
     fig_5_1()
     fig_5_2()   # NEW: Qwen 0.5B DDP bar chart
-    fig_5_3()   # was fig_5_2: All-to-All 1GB stacked bar
-    fig_5_4()   # was fig_5_3: Communication volume sweep
+    fig_5_3()   # v90: Communication volume sweep
+    fig_5_4()   # v90: All-to-All 1GB stacked bar
     fig_5_5()   # was fig_5_4: TPU v4 improvement factor
     fig_6_1()
     print(f"\n=== All 7 figures generated in {outdir}/ ===")

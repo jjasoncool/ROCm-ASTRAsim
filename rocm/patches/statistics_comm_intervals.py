@@ -1,12 +1,16 @@
-"""
-patch_statistics_debug.py
-Patch Statistics.cc to add COMM interval debug logging.
-Read-only instrumentation — does NOT change simulation logic.
+#!/usr/bin/env python3
+"""Log one line per COMM interval in ASTRA-sim's statistics pass.
 
-Usage:
-    python3 patch_statistics_debug.py /path/to/astra-sim/astra-sim/workload/Statistics.cc
+Read-only: logs intervals that are already being reduced, does not change
+type_time or any simulation result. ASTRA-sim otherwise reports only the merged
+COMM total, so per-collective cost cannot be recovered from a run.
+
+Usage: python3 statistics_comm_intervals.py <astra-sim-root>
 """
 import sys
+
+REL = "astra-sim/workload/Statistics.cc"
+MARKER = "[DEBUG] COMM interval"
 
 FIND = """\
     this->type_time.clear();
@@ -36,17 +40,22 @@ REPLACE = """\
         }
     }"""
 
-if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else "/workspace/astra-sim/astra-sim/workload/Statistics.cc"
-    with open(path, "r") as f:
+path = f"{sys.argv[1] if len(sys.argv) > 1 else '/workspace/astra-sim'}/{REL}"
+try:
+    with open(path, newline="") as f:
         src = f.read()
-    if FIND not in src:
-        print(f"[ERROR] Pattern not found in {path} — file may already be patched or upstream changed", file=sys.stderr)
-        sys.exit(1)
-    count = src.count(FIND)
-    if count > 1:
-        print(f"[ERROR] Pattern found {count} times — expected exactly 1", file=sys.stderr)
-        sys.exit(1)
-    with open(path, "w") as f:
-        f.write(src.replace(FIND, REPLACE))
-    print(f"[OK] Patched {path} — added COMM interval debug logging")
+except OSError as e:
+    sys.exit(f"[statistics_comm_intervals] ERROR: {e}")
+
+if MARKER in src:
+    print(f"[statistics_comm_intervals] already patched: {REL}")
+    sys.exit(0)
+
+n = src.count(FIND)
+if n != 1:
+    sys.exit(f"[statistics_comm_intervals] ERROR: anchor found {n} times, expected 1 "
+             f"(upstream changed?) in {REL}")
+
+with open(path, "w", newline="") as f:
+    f.write(src.replace(FIND, REPLACE))
+print(f"[statistics_comm_intervals] patched: {REL}")

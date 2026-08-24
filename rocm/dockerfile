@@ -35,9 +35,6 @@ RUN ln -s $ROCM_PATH/lib/cmake/hip/FindHIP* /workspace/horovod/cmake/Modules/
 RUN sed -i 's/rccl\.h/rccl\/rccl\.h/' /workspace/horovod/horovod/common/ops/nccl_operations.h
 RUN pip install --no-cache-dir /workspace/horovod/.
 
-# Install Python protobuf package
-RUN pip install protobuf==5.29.0
-
 # 安裝 ASTRA-sim
 ENV ASTRA_SIM="/workspace/astra-sim"
 RUN git clone --recursive https://github.com/astra-sim/astra-sim.git ${ASTRA_SIM} && \
@@ -48,30 +45,36 @@ RUN ./build/astra_analytical/build.sh
 ENV ASTRA_SIM_BIN=${ASTRA_SIM}/build/astra_analytical/build/bin/AstraSim_Analytical_Congestion_Aware
 
 # 編譯 astra-sim 的 ns3 模組
-# C++ 20 引入了新的 fmt 庫，這可能會導致 ASTRA-sim 的一些舊程式無法編譯。
 WORKDIR /workspace/astra-sim/extern/network_backend/ns-3
 RUN git checkout astra-sim
-WORKDIR /workspace/astra-sim/extern/helper/spdlog_setup
-RUN sed -i 's/\bformat(/fmt::format(/g' conf.h details/conf_impl.h details/template_impl.h \
-    && sed -i 's/fmt::fmt::format(/fmt::format(/g' conf.h details/conf_impl.h details/template_impl.h \
-    && echo '#include <spdlog/fmt/fmt.h>' | cat - conf.h > temp && mv temp conf.h \
-    && echo '#include <spdlog/fmt/fmt.h>' | cat - details/conf_impl.h > temp && mv temp details/conf_impl.h \
-    && echo '#include <spdlog/fmt/fmt.h>' | cat - details/template_impl.h > temp && mv temp details/template_impl.h
 WORKDIR ${ASTRA_SIM}
-# [OPTIONAL DEBUG] Patch Statistics.cc to emit per-AllReduce timing logs.
-# Remove the two lines below for production builds.
-COPY patch_statistics_debug.py /tmp/
-RUN python3 /tmp/patch_statistics_debug.py ${ASTRA_SIM}/astra-sim/workload/Statistics.cc
+
+# astra-sim patch，see patches/ files。
+ARG ASTRA_PATCHES=all
+COPY patches/ /tmp/patches/
+# 必要：spdlog_setup 缺 fmt include，沒有這個編不過
+RUN python3 /tmp/patches/spdlog_fmt_compat.py ${ASTRA_SIM}
+# 選用：除錯用的 instrumentation。
+RUN case "$ASTRA_PATCHES" in \
+      all) python3 /tmp/patches/statistics_comm_intervals.py ${ASTRA_SIM} && \
+           python3 /tmp/patches/entry_flow_diagnostics.py ${ASTRA_SIM} ;; \
+      none) echo "[patches] instrumentation skipped (ASTRA_PATCHES=none)" ;; \
+      *) echo "[patches] ERROR: ASTRA_PATCHES must be 'all' or 'none', got '$ASTRA_PATCHES'" >&2; exit 1 ;; \
+    esac
 RUN ./build/astra_ns3/build.sh -c 2>&1 | tee /workspace/ns3_build_log.txt
 
-# 安裝 Chakra (從 astra-sim fork)
-# 修正 AMD GPU trace 無法被偵測的問題
-RUN git clone https://github.com/astra-sim/chakra.git /workspace/chakra && \
-    cd /workspace/chakra && git checkout bf222b2 && \
+# 安裝 Chakra (用 mlcommons/chakra ec41090)
+# fix protobuf 版本造成的 gencode/runtime 衝突
+RUN git clone https://github.com/mlcommons/chakra.git /workspace/chakra && \
+    cd /workspace/chakra && \
+    git checkout ec410904d5e8b88c231df64ad0ec3aa313393484 && \
     pip install --no-cache-dir .
 
-# https://github.com/mlcommons/chakra/issues/195
-RUN pip install protobuf==6.32.1
+RUN pip install -U protobuf
+
+# grpcio-tools 沒有鎖定版本，gencode 有可能導致 build 出壞 image 故此處需先阻擋並失敗
+RUN python3 -c "from chakra.schema.protobuf.et_def_pb2 import Node" \
+    || (echo "[check] chakra protobuf gencode/runtime 不相容" >&2; exit 1)
 
 # 安裝其他 Chakra 依賴 Param
 # REF https://github.com/mlcommons/chakra/blob/main/USER_GUIDE.md

@@ -4,6 +4,8 @@ services:
       context: "./rocm/"
       args:
         VERSION: ${VERSION}
+        # all = 全部套用；none = 只套必要的 build fix，跳過除錯 instrumentation
+        ASTRA_PATCHES: ${ASTRA_PATCHES:-all}
     container_name: rocm-horovod
     network_mode: host
     cap_add:

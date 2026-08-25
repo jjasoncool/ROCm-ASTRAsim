@@ -683,7 +683,7 @@ def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[
         # 一次迭代數成兩三次——這正是舊 steps_n 除數的來源。只保留未被任何
         # 其他區間包住的 user_annotation，才是真實迭代。
         iters = []
-        for a, b in sorted(step_spans):
+        for a, b in sorted(step_spans, key=lambda s: (s[0], -s[1])):
             if not any(a >= x and b <= y for x, y in iters):
                 iters.append((a, b))
         per_iter_kernels = [sum(1 for t in comm_kernel_ts if a <= t <= b) for a, b in iters]
@@ -831,7 +831,14 @@ def align_and_compare(per_rank_stats: dict, et_collective_count: int | None,
     if declared % trace_iters != 0 and trace_iters % declared != 0:
         raise SystemExit(
             f"[calib] ET 迭代數 {declared} 與 trace 迭代數 {trace_iters} 不成整數比，無法對齊。")
-    ratio = declared // trace_iters if declared >= trace_iters else 1
+    # declared < trace_iters 時沒有可用除數：real 總和涵蓋較多迭代，模擬涵蓋較少，
+    # 除以 1 等於拿少比多——與 steps_n 同一類的幻影誤差。寧可 raise 也不猜。
+    if declared < trace_iters:
+        raise SystemExit(
+            f"[calib] ET 迭代數 {declared} < trace 迭代數 {trace_iters}："
+            f"實測總和涵蓋 {trace_iters} 個迭代而模擬僅 {declared} 個，視窗無法對齊。"
+            f"請以相同迭代數重轉 ET，或改用 per-iteration 對齊。")
+    ratio = declared // trace_iters
 
     et_per_iter = et_collective_count / declared if declared else None
     trace_per_iter = sel["kernels"] / trace_iters
@@ -848,7 +855,7 @@ def align_and_compare(per_rank_stats: dict, et_collective_count: int | None,
         out["flags"].append("per_iter_granularity_mismatch")
         print(f"[calib] ⚠ 每迭代顆粒度不符：ET {et_per_iter:.0f}/iter vs "
               f"trace {trace_per_iter:.0f}/iter（倍率 {et_per_iter / trace_per_iter:.3g}）。"
-              f" 兩側迭代數同為 {trace_iters}，除數仍為 {ratio}；"
+              f" trace {trace_iters} 迭代 / ET {declared} 迭代，除數 {ratio}；"
               f" 誤差值需人工確認語意後方可引用。")
 
     if out["ns3_comm_ms"] is not None:

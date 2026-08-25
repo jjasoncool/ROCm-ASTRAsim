@@ -178,7 +178,7 @@ def fig_4_4():
             label='Network comm (ns-3 models this)',
             color=C_GREEN, edgecolor='black', linewidth=0.3, zorder=3)
     ax.barh(y, over_pct, h, left=[g+c for g, c in zip(gpu_pct, comm_pct)],
-            label='Framework + OS overhead (not modeled)',
+            label='Unmodeled residual (not modeled)',
             color='#CCCCCC', edgecolor='black', linewidth=0.3, zorder=3)
 
     # Labels inside bars

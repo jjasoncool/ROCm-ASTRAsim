@@ -72,8 +72,11 @@ CALIB_FIELDS = [
     'mode', 'tag', 'calib_id', 'world', 'logical_dims', 'topo_desc',
     'qcn', 'pfc_dyn', 'buffer', 'payload', 'coll_opt', 'lmbw',
     'alpha_us', 'alpha_comm_us', 'alpha_gpu_us', 'sim_cycles_step', 'sim_cycles_comm', 'sim_cycles_gpu', 'sim_t_step_ms', 'sim_t_comm_ms',
-    'ns3_comm_ms', 'ns3_rel_err_comm',
-    'real_t_step_ms', 'real_t_comm_ms', 'real_t_net_comm_ms', 'real_t_kernel_ms', 'run_dir', 'rel_err_step', 'rel_err_comm', 'sim_t_comm_ms_comm', 'rel_err_comm_comm',
+    'ns3_comm_ms', 'ns3_comm_ms_aligned', 'ns3_signed_err_comm', 'ns3_abs_err_comm',
+    'selected_rank', 'trace_kernel_count', 'et_collective_count', 'window_ratio', 'et_iterations',
+    'real_t_step_ms', 'real_t_comm_ms', 'real_t_net_comm_ms', 'real_t_kernel_ms',
+    'real_t_net_comm_ms_rank0', 'real_t_net_comm_ms_rank1',
+    'run_dir',
     'flags'  # 執行狀態標記（例如 comm_equals_wall_no_compute）
 ]
 
@@ -569,11 +572,11 @@ def _dur_units_to_ms(ev_obj: dict, dur_val: float) -> float:
     """
     將 Trace 中的持續時間數值 (dur) 統一轉換為毫秒 (ms)。
 
-    [修訂歷史]
-    v1: 讀取 ev_obj["displayTimeUnit"] → 不可靠（AMD 標 "ms" 實為 us）。
-    v2: ProfilerStep 特殊判定 ns vs us → 當 step > 1 秒時誤判（Qwen 3.4s 被當 ns）。
-    v3 (current): 依據 Chrome Trace Event Format 規範，dur 一律為微秒 (us)。
-        移除 ProfilerStep 特殊判定。僅保留極端值防呆（> 10^9 = 1000 秒，視為 ns）。
+    Chrome Trace Event Format 規範 dur 一律為微秒，直接照規範轉換。
+
+    別用 ev_obj["displayTimeUnit"] 判定單位：AMD 標 "ms" 但實際是 us。
+    也別對 ProfilerStep 另做 ns/us 判定：step 超過 1 秒時會誤判（Qwen 的 3.4s
+    會被當成 ns）。
     """
     val = float(dur_val)
 
@@ -583,7 +586,7 @@ def _dur_units_to_ms(ev_obj: dict, dur_val: float) -> float:
         return val / 1_000_000.0  # ns → ms
     return val / 1_000.0          # us → ms
 
-def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[float | None, float | None, float | None, int | None]:
+def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[float | None, dict, int | None]:
     """
     掃描 trace 群組，回傳多項 real metrics，用於研究比較（Strategy C 默認行為）：
       • real_t_step_ms: per-step wall time（median of per-rank medians）
@@ -597,12 +600,11 @@ def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[
     groups = list_trace_groups(trace_dir, tag)
     if not groups:
         print(f"[WARN] {trace_dir} 找不到任何可用的 trace 群組（device_/host_/trace_rank_*/hdt_*）。")
-        return None, None, None, None
+        return None, {}, None
 
     used_epoch, ranks, src = groups[0]
     per_rank_step_medians = []
-    per_rank_net_comm = []
-    per_rank_kernel = []
+    per_rank_stats: dict[int, dict] = {}
 
     print(f"[INFO] 正在分析 Trace (Source: {src})...")
 
@@ -629,6 +631,7 @@ def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[
         # compute total network-only and kernel-only durations in ms
         net_ms_total = 0.0
         kernel_ms_total = 0.0
+        comm_kernel_count = 0
         step_durations = []
 
         for ev in obj.get('traceEvents', []):
@@ -650,7 +653,7 @@ def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[
             # (c) CPU 端通訊 API 標記（如 nccl:all_reduce）→ 跳過（避免雙重計算）
             # 注意：AMD RCCL 的 ncclDevKernel cat=kernel，但它是通訊操作，不是計算
             #
-            # [Critical Fix] 每個 AllReduce 會產生 GPU 端 ncclDevKernel（實際傳輸）
+            # 每個 AllReduce 會產生 GPU 端 ncclDevKernel（實際傳輸）
             # 和 CPU 端 nccl:all_reduce annotation（launch wrapper）兩種事件。
             # CPU wrapper 的 duration 包含了 GPU kernel 的執行時間，
             # 兩者都計入會導致 net_ms_total 膨脹約 2 倍。
@@ -660,6 +663,7 @@ def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[
             if is_nccl_kernel:
                 # (a) RCCL/NCCL 通訊 kernel → 計入 net_comm
                 net_ms_total += d_ms
+                comm_kernel_count += 1
             elif 'kernel' in lcat:
                 # (b) 一般 GPU compute kernel → 計入 kernel
                 kernel_ms_total += d_ms
@@ -667,17 +671,23 @@ def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[
 
         if step_durations:
             per_rank_step_medians.append(median(step_durations))
-        # per-step metrics: divide totals by number of steps to get ms/step
-        if steps_n > 0:
-            per_rank_net_comm.append(net_ms_total / steps_n)
-            per_rank_kernel.append(kernel_ms_total / steps_n)
+        # 別除 steps_n：它與 comm 視窗沒有固定關係，除下去等於混單位。
+        # 視窗由呼叫端用 collective 數對齊。
+        per_rank_stats[r] = {
+            "kernels": comm_kernel_count,
+            "net_ms_total": net_ms_total,
+            "kernel_ms_total": kernel_ms_total,
+            "steps_n": steps_n,
+        }
 
     real_t_step_ms = median(per_rank_step_medians) if per_rank_step_medians else None
-    real_t_net_comm_ms = median(per_rank_net_comm) if per_rank_net_comm else None
-    real_t_kernel_ms = median(per_rank_kernel) if per_rank_kernel else None
 
-    print(f"[INFO] 使用群組 source={src} epoch={used_epoch} 的 {len(ranks)} 個 rank 做為 real metrics (net_comm/kernel split)")
-    return real_t_step_ms, real_t_net_comm_ms, real_t_kernel_ms, used_epoch
+    print(f"[INFO] 使用群組 source={src} epoch={used_epoch} 的 {len(ranks)} 個 rank 做為 real metrics")
+    for r, st in sorted(per_rank_stats.items()):
+        print(f"[INFO]   rank{r}: rccl_kernels={st['kernels']} "
+              f"net_comm_total={st['net_ms_total']:.6f} ms "
+              f"kernel_total={st['kernel_ms_total']:.6f} ms steps_n={st['steps_n']}")
+    return real_t_step_ms, per_rank_stats, used_epoch
 
 # ---------- 解析 ASTRA‑sim stdout.log（cycles） ----------
 def parse_astra_stdout_cycles(stdout_path: Path) -> tuple[int | None, int | None, int | None]:
@@ -736,6 +746,111 @@ def _node_has_compute_cycles(n: Node) -> bool:
         if a.name in keys and isinstance(getattr(a, "int64_val", None), int):
             return True
     return False
+
+def align_and_compare(per_rank_stats: dict, et_collective_count: int | None,
+                      sim_cycles_step: int | None, sim_cycles_comm: int | None,
+                      real_t_step_ms: float | None, et_iters: int | None) -> dict:
+    """Align the measured and simulated comm windows, then compare them.
+
+    The two sides cover different amounts of work unless aligned: the trace holds
+    one rank's RCCL kernels, the ET holds whatever the simulator replayed. The
+    profiler's ProfilerStep count matches neither and is never used here.
+
+    Raises rather than guessing when the windows cannot be aligned — a plausible
+    looking ratio is worse than a stopped run.
+    """
+    out = {k: None for k in (
+        "selected_rank", "trace_kernel_count", "window_ratio",
+        "real_t_net_comm_ms", "real_t_kernel_ms",
+        "real_t_net_comm_rank0", "real_t_net_comm_rank1",
+        "ns3_comm_ms", "ns3_comm_ms_aligned",
+        "ns3_signed_err_comm", "ns3_abs_err_comm",
+        "alpha_us", "sim_t_step_ms", "alpha_comm_us", "et_iterations")}
+    out["flags"] = []
+    if sim_cycles_comm is not None:
+        out["ns3_comm_ms"] = sim_cycles_comm / 1_000_000.0
+    if not per_rank_stats:
+        return out
+
+    if not et_collective_count:
+        raise SystemExit(f"[calib] ET collective 數為 {et_collective_count}，無法對齊視窗。")
+
+    for r, st in per_rank_stats.items():
+        if r == 0:
+            out["real_t_net_comm_rank0"] = st["net_ms_total"]
+        elif r == 1:
+            out["real_t_net_comm_rank1"] = st["net_ms_total"]
+
+    eligible = [r for r, st in sorted(per_rank_stats.items())
+                if st["kernels"] > 0 and et_collective_count % st["kernels"] == 0]
+    if not eligible:
+        detail = ", ".join(f"rank{r}={st['kernels']}" for r, st in sorted(per_rank_stats.items()))
+        raise SystemExit(
+            f"[calib] 沒有任何 rank 的 RCCL kernel 數能整除 ET collective 數 "
+            f"{et_collective_count}（{detail}）。視窗無法對齊，拒絕輸出誤差。")
+
+    sel_rank = eligible[0]
+    sel = per_rank_stats[sel_rank]
+    ratio = et_collective_count // sel["kernels"]
+    out.update(selected_rank=sel_rank, trace_kernel_count=sel["kernels"],
+               window_ratio=ratio,
+               real_t_net_comm_ms=sel["net_ms_total"],
+               real_t_kernel_ms=sel["kernel_ms_total"])
+
+    if out["ns3_comm_ms"] is not None:
+        aligned = out["ns3_comm_ms"] / ratio
+        out["ns3_comm_ms_aligned"] = aligned
+        real = sel["net_ms_total"]
+        # 實測通訊小於 10 us 時比值沒有意義（量測雜訊主導），但要留下標記，
+        # 不能讓誤差欄靜默留空看起來像「沒算」。
+        if real > 0.01:
+            out["ns3_signed_err_comm"] = (aligned - real) / real
+            out["ns3_abs_err_comm"] = abs(out["ns3_signed_err_comm"])
+        else:
+            out["flags"].append(f"comm_err_skipped_real_below_10us({real:.6f}ms)")
+        if sim_cycles_comm:
+            out["alpha_comm_us"] = (real * 1000.0) / max(1.0, sim_cycles_comm / ratio)
+
+    # alpha_us: numerator is per-step, so the denominator must be too.
+    if sim_cycles_step is not None and real_t_step_ms is not None:
+        if et_iters is None:
+            out["flags"].append("alpha_skipped_no_et_iters")
+        else:
+            if et_collective_count % et_iters != 0:
+                raise SystemExit(
+                    f"[calib] --et-iters={et_iters} 無法整除 ET collective 數 "
+                    f"{et_collective_count}，申報值與 ET 不符。")
+            cps = sim_cycles_step / et_iters
+            out["et_iterations"] = et_iters
+            out["alpha_us"] = (real_t_step_ms * 1000.0) / max(1.0, cps)
+            out["sim_t_step_ms"] = cps * (out["alpha_us"] / 1000.0)
+    return out
+
+
+def count_et_collectives(workload_dir: Path, tag: str = None) -> int | None:
+    """Count COMM collectives in one rank's ET.
+
+    This is the window the simulator reports over. It is compared against the
+    RCCL kernel count in the Kineto trace to align the two sides; steps_n from
+    the profiler matches neither and must not be used for that.
+    """
+    et_map = list_et_rank_files(workload_dir, tag)
+    if not et_map:
+        return None
+    first = sorted(et_map.items())[0][1]
+    try:
+        _, nodes = _read_all_nodes(first)
+    except Exception as e:
+        print(f"[WARN] 無法讀取 {first} 計算 collective 數: {e}")
+        return None
+    n = 0
+    for node in nodes:
+        for a in node.attr:
+            if a.name == "comm_type" and a.int64_val in COMM_TYPES:
+                n += 1
+                break
+    return n
+
 
 def detect_compute_nodes_in_et(workload_dir: Path, tag: str = None, sample_limit: int = 2) -> bool:
     """
@@ -1108,10 +1223,12 @@ def main():
     ap.add_argument("--log-dir", default="runs", help="本次輸出根目錄（預設 runs）")
     ap.add_argument("--dry-run", action="store_true", help="只產生 patched 檔與指令，不執行")
     # 自動校準/輸出
-    ap.add_argument("--calib-db", default="runs/calibration_all.csv", help="校準彙總 CSV（去重追加）")
+    ap.add_argument("--calib-db", default="runs/calibration_aligned.csv", help="校準彙總 CSV（去重追加）")
     ap.add_argument("--no-autocalib", action="store_true", help="停用從 traces 自動校準 alpha_us")
+    ap.add_argument("--et-iters", type=int, default=None,
+                    help="ET 涵蓋幾次訓練迭代（等於產生 ET 時的 --trace-steps）。"
+                         "alpha_us 需要它把 sim_cycles_step 正規化成每步；未給則 alpha 留空不猜。")
     ap.add_argument("--trace-dir", default=None, help="覆蓋 traces 位置（預設為 ../data/chakra/pytorch_traces）")
-    # [新增] 模型標籤
     ap.add_argument("--model-tag", type=str, default=None, help="模型標籤 (e.g., cifar10, resnet50)，用於選擇對應的 .et 與 trace")
     # [新增這行] 除錯開關
     ap.add_argument("--debug-ns3", action="store_true", help="啟用 NS-3 底層詳細 Log (用於偵測卡死)")
@@ -1134,7 +1251,6 @@ def main():
     # 建立目錄
     stamp = time.strftime("%Y%m%d-%H%M%S%z")
     # world（若將擴張，命名用 N，但實際跑會在 expand 時回傳 actual_world）
-    # [修改] 計算 world size 時傳入 tag
     world_for_name = args.virtual_world if args.virtual_world is not None else count_world_size(workload_dir, args.model_tag)
 
     # 解析邏輯維度（用於命名）
@@ -1155,7 +1271,6 @@ def main():
         logical_dims = load_logical_dims(topo_json_path)
 
     topo_desc = extract_topo_description(topo_arg, logical_dims)
-    # [修改] 在 log 目錄名加入 tag 和物理拓撲名稱
     tag_str = f"_{args.model_tag}" if args.model_tag else ""
     phys_str = f"_{Path(args.phys_topo).stem}" if args.phys_topo else f"_{topo_desc}"
     logroot = Path(args.log_dir).resolve() / f"{stamp}_ns3_{world_for_name}gpu{tag_str}{phys_str}"
@@ -1166,7 +1281,6 @@ def main():
     logroot.chmod(0o777)
 
     # 虛擬擴張（如有）
-    # [修改] 傳入 tag
     workload_dir2, actual_world, expansion_meta = expand_workload_virtual_if_needed(workload_dir, tmp_dir, args.virtual_world, args.model_tag, args.comm_scale)
     print(f"[INFO] workload={workload_dir2}  world_size={actual_world}  tag={args.model_tag}")
 
@@ -1215,7 +1329,6 @@ def main():
                       no_qlen=args.no_qlen)
 
     # Workload prefix 參數
-    # [修改] 傳入 tag
     workload_arg, workload_desc = build_workload_arg(workload_dir2, args.model_tag)
     print(f"[INFO] workload-configuration 以 {workload_desc}")
 
@@ -1261,7 +1374,6 @@ def main():
         return
 
     # 執行前的工作負載驗證
-    # [修改] 傳入 tag
     _validate_workload_integrity(workload_dir2, args.model_tag)
 
     stdout_path = (logroot / "stdout.log")
@@ -1299,90 +1411,67 @@ def main():
     real_t_kernel_ms = None
     used_epoch = None
 
-    # [修改] 只有在未禁用且 world=2 時才校準，並傳入 tag
+    # ---- 校準：兩側視窗必須對齊，steps_n 一律不當除數 ----
+    per_rank_stats = {}
+    selected_rank = None
+    trace_kernel_count = None
+    et_collective_count = None
+    window_ratio = None
+    real_t_net_comm_rank0 = None
+    real_t_net_comm_rank1 = None
+
     if not args.no_autocalib and count_world_size(workload_dir, args.model_tag) == 2:
         if trace_dir.exists():
-            # [修改] 傳入 tag
-            res = extract_real_metrics_from_traces(trace_dir, args.model_tag)
-            if not res or res[0] is None:
+            real_t_step_ms, per_rank_stats, used_epoch = \
+                extract_real_metrics_from_traces(trace_dir, args.model_tag)
+            if real_t_step_ms is None:
                 print(f"[WARN] 無法從 {trace_dir} 抓到 ProfilerStep，略過 auto calibration。")
-            else:
-                # Expecting either (step, net_comm, kernel, epoch) or older (step, comm, epoch)
-                if len(res) == 4:
-                    real_t_step_ms, real_t_net_comm_ms, real_t_kernel_ms, used_epoch = res
-                    # maintain legacy name real_t_comm_ms as network-only for downstream code
-                    real_t_comm_ms = real_t_net_comm_ms
-                elif len(res) == 3:
-                    # older callers returned (step, comm, epoch)
-                    real_t_step_ms, real_t_comm_ms, used_epoch = res
-                    real_t_net_comm_ms = real_t_comm_ms
-                else:
-                    try:
-                        real_t_step_ms = res[0]
-                        real_t_comm_ms = res[1] if len(res) > 1 else None
-                        used_epoch = res[2] if len(res) > 2 else None
-                        real_t_net_comm_ms = real_t_comm_ms
-                    except Exception:
-                        print(f"[WARN] extract_real_metrics_from_traces() 回傳非預期格式: {res}")
         else:
             print(f"[WARN] {trace_dir} 不存在，略過 auto calibration。")
 
-    alpha_us = None
-    sim_t_step_ms = None
-    sim_t_comm_ms = None
+    et_collective_count = None
+    if per_rank_stats:
+        et_collective_count = count_et_collectives(workload_dir, args.model_tag)
+    calib = align_and_compare(per_rank_stats, et_collective_count, sim_cycles_step,
+                            sim_cycles_comm, real_t_step_ms, args.et_iters)
+    selected_rank = calib["selected_rank"]
+    trace_kernel_count = calib["trace_kernel_count"]
+    window_ratio = calib["window_ratio"]
+    real_t_net_comm_ms = calib["real_t_net_comm_ms"]
+    real_t_kernel_ms = calib["real_t_kernel_ms"] or real_t_kernel_ms
+    real_t_comm_ms = real_t_net_comm_ms
+    real_t_net_comm_rank0 = calib["real_t_net_comm_rank0"]
+    real_t_net_comm_rank1 = calib["real_t_net_comm_rank1"]
+    alpha_us = calib["alpha_us"]
+    sim_t_step_ms = calib["sim_t_step_ms"]
+    alpha_comm_us = calib["alpha_comm_us"]
+    et_iterations = calib["et_iterations"]
+    if selected_rank is not None:
+        print(f"[calib] selected_rank={selected_rank} trace_kernels={trace_kernel_count} "
+              f"et_collectives={et_collective_count} window_ratio={window_ratio}")
 
-    # 若有 cycles 與 real_t_step_ms，計算 alpha_us 與對應的 sim_t_step_ms
-    if sim_cycles_step is not None:
-        if real_t_step_ms is not None:
-            alpha_us = (real_t_step_ms * 1000.0) / max(1, sim_cycles_step)
-            sim_t_step_ms = sim_cycles_step * (alpha_us / 1000.0)
-
-            # [新增] System-Aware Calibration 檢查
-            if 0.95 <= alpha_us <= 1.05:
-                print(f"[INFO] Alpha={alpha_us:.4f} 接近 1.0，表示 System-Aware Calibration (計算時間攤提) 有效。")
-        else:
-            # 無實測（例如 N>2 虛擬擴張），sim_t_step_ms 與 alpha 只能留空或沿用前次（此處留空，只記 cycles）
-            pass
-
-    # 額外計算 comm 尺度的 alpha（alpha_comm_us），以便診斷 sim_comm 與 real_comm 是否共享相同尺度
-    alpha_comm_us = None
-    if sim_cycles_comm is not None and real_t_comm_ms is not None:
-        # real_t_comm_ms (ms/step) -> microsecond per sim cycle
-        alpha_comm_us = (real_t_comm_ms * 1000.0) / max(1, sim_cycles_comm)
-
-    # 額外計算 gpu 尺度的 alpha（alpha_gpu_us），以便診斷 sim_gpu 與 real_kernel 是否匹配
     alpha_gpu_us = None
     if sim_cycles_gpu is not None and real_t_kernel_ms is not None:
         alpha_gpu_us = (real_t_kernel_ms * 1000.0) / max(1, sim_cycles_gpu)
 
-    # ---------- ns-3 直接通訊時間（不經過 alpha 轉換） ----------
-    # ASTRA-sim 的 CLOCK_PERIOD = 1ns，所以 sim_cycles_comm 的單位就是 nanoseconds
-    # 直接轉換成 ms，不需要任何 alpha 係數
-    ns3_comm_ms = None
-    ns3_rel_err_comm = None
-    if sim_cycles_comm is not None:
-        ns3_comm_ms = sim_cycles_comm / 1_000_000.0  # ns → ms
-        if real_t_comm_ms is not None and real_t_comm_ms > 0.01:
-            ns3_rel_err_comm = abs(ns3_comm_ms - real_t_comm_ms) / real_t_comm_ms
+    ns3_comm_ms = calib["ns3_comm_ms"]
+    ns3_comm_ms_aligned = calib["ns3_comm_ms_aligned"]
+    ns3_signed_err_comm = calib["ns3_signed_err_comm"]   # 負值 = 模擬低估
+    ns3_abs_err_comm = calib["ns3_abs_err_comm"]
+    if ns3_signed_err_comm is not None:
+        print(f"[calib] ns3_aligned={ns3_comm_ms_aligned:.6f} ms  "
+              f"real_total={real_t_net_comm_ms:.6f} ms  "
+              f"signed_err={ns3_signed_err_comm * 100:+.2f}%")
 
-    # 使用通用 alpha 計算 sim_t_comm_ms
     sim_t_comm_ms = None
     if sim_cycles_comm is not None and alpha_us is not None:
         sim_t_comm_ms = sim_cycles_comm * (alpha_us / 1000.0)
 
-    # 若存在 comm-specific alpha，計算使用 comm alpha 的 sim comm 時間與對應誤差（便於比較）
-    sim_t_comm_ms_comm = None
-    rel_err_comm_comm = None
-    if sim_cycles_comm is not None and alpha_comm_us is not None:
-        sim_t_comm_ms_comm = sim_cycles_comm * (alpha_comm_us / 1000.0)
-        # [修改] 加入 > 0.01ms (10us) 的門檻
-        # 意義：如果真實通訊時間小於 10us，我們視為雜訊/Overhead，不計算誤差，避免 CIFAR-10 出現巨大誤差數值
-        if real_t_comm_ms is not None and sim_t_comm_ms_comm is not None and real_t_comm_ms > 0.01:
-            rel_err_comm_comm = (abs(sim_t_comm_ms_comm - real_t_comm_ms) / real_t_comm_ms)
+    # 別加 step-time 準確度欄位：alpha 由 real/cycles 定義，再乘回 cycles 必然
+    # 還原 real，誤差恆為 0。唯一有內容的準確度指標是 ns3_signed_err_comm。
 
     # ---------- A-保護：Comm==Wall 與 ET 是否有 Compute ----------
-    flags: list[str] = []
-    # [修改] 傳入 tag
+    flags: list[str] = list(calib["flags"])
     has_compute_nodes = detect_compute_nodes_in_et(workload_dir2, args.model_tag)
     comm_equals_wall = (sim_cycles_step is not None and sim_cycles_comm is not None and sim_cycles_comm == sim_cycles_step)
 
@@ -1399,15 +1488,11 @@ def main():
             # ★feeder 未消化 compute 的常見情況；同樣抑制不可信的通訊時間
             flags.append("comm_equals_wall")
 
-    # 相對誤差（只有在 real_* 與對應 sim_* 存在時才有）
-    rel_err_step = (abs(sim_t_step_ms - real_t_step_ms) / real_t_step_ms) if (sim_t_step_ms is not None and real_t_step_ms) else None
-    rel_err_comm = (abs(sim_t_comm_ms - real_t_comm_ms) / real_t_comm_ms) if (sim_t_comm_ms is not None and real_t_comm_ms) else None
 
     # 匯出 metrics
     row = {
-        # [修改] 若有 real_t_step_ms 且是 2-GPU 才視為 calibration
+        # 只有 2-GPU 且有實測值才算校準
         "mode": "calibrate" if (count_world_size(workload_dir, args.model_tag) == 2 and real_t_step_ms is not None) else "simulate",
-        # [新增] 紀錄 tag
         "tag": args.model_tag if args.model_tag else "",
         "calib_id": used_epoch if used_epoch is not None else "",
         "world": actual_world,
@@ -1427,19 +1512,22 @@ def main():
         "sim_cycles_gpu": sim_cycles_gpu if sim_cycles_gpu is not None else "",
         "sim_t_step_ms": f"{sim_t_step_ms:.6f}" if sim_t_step_ms is not None else "",
         "sim_t_comm_ms": f"{sim_t_comm_ms:.6f}" if sim_t_comm_ms is not None else "",
-        "sim_t_comm_ms_comm": f"{sim_t_comm_ms_comm:.6f}" if sim_t_comm_ms_comm is not None else "",
         "ns3_comm_ms": f"{ns3_comm_ms:.6f}" if ns3_comm_ms is not None else "",
-        "ns3_rel_err_comm": f"{ns3_rel_err_comm:.6f}" if ns3_rel_err_comm is not None else "",
+        "ns3_comm_ms_aligned": f"{ns3_comm_ms_aligned:.6f}" if ns3_comm_ms_aligned is not None else "",
+        "ns3_signed_err_comm": f"{ns3_signed_err_comm:.6f}" if ns3_signed_err_comm is not None else "",
+        "ns3_abs_err_comm": f"{ns3_abs_err_comm:.6f}" if ns3_abs_err_comm is not None else "",
+        "selected_rank": selected_rank if selected_rank is not None else "",
+        "trace_kernel_count": trace_kernel_count if trace_kernel_count is not None else "",
+        "et_collective_count": et_collective_count if et_collective_count is not None else "",
+        "window_ratio": window_ratio if window_ratio is not None else "",
+        "et_iterations": et_iterations if et_iterations is not None else "",
+        "real_t_net_comm_ms_rank0": f"{real_t_net_comm_rank0:.6f}" if real_t_net_comm_rank0 is not None else "",
+        "real_t_net_comm_ms_rank1": f"{real_t_net_comm_rank1:.6f}" if real_t_net_comm_rank1 is not None else "",
         "real_t_step_ms": f"{real_t_step_ms:.6f}" if real_t_step_ms is not None else "",
         "real_t_comm_ms": f"{real_t_comm_ms:.6f}" if real_t_comm_ms is not None else "",
         "real_t_net_comm_ms": f"{real_t_net_comm_ms:.6f}" if real_t_net_comm_ms is not None else "",
         "real_t_kernel_ms": f"{real_t_kernel_ms:.6f}" if real_t_kernel_ms is not None else "",
-        "alpha_comm_us": f"{alpha_comm_us:.6f}" if alpha_comm_us is not None else "",
-        "alpha_gpu_us": f"{alpha_gpu_us:.6f}" if alpha_gpu_us is not None else "",
         "run_dir": str(logroot),
-        "rel_err_step": f"{rel_err_step:.6f}" if rel_err_step is not None else "",
-        "rel_err_comm": f"{rel_err_comm:.6f}" if rel_err_comm is not None else "",
-        "rel_err_comm_comm": f"{rel_err_comm_comm:.6f}" if rel_err_comm_comm is not None else "",
         "flags": "|".join(flags) if flags else "",
     }
 
@@ -1450,11 +1538,13 @@ def main():
         print("-" * 72)
         if real_t_step_ms is not None and alpha_us is not None:
             print(f"  Wall-clock:  real = {real_t_step_ms:.2f} ms | α_step = {alpha_us:.6f} μs/cycle")
-        if ns3_comm_ms is not None and real_t_comm_ms is not None:
-            direction = "overestimate" if ns3_comm_ms > real_t_comm_ms else "underestimate"
-            err_pct = ns3_rel_err_comm * 100 if ns3_rel_err_comm is not None else float('nan')
-            print(f"  ns-3 通訊:   ns3 = {ns3_comm_ms:.2f} ms | real = {real_t_comm_ms:.2f} ms | "
-                  f"差距 = {err_pct:.1f}% ({direction})")
+        if ns3_comm_ms_aligned is not None and real_t_net_comm_ms is not None:
+            direction = "overestimate" if ns3_signed_err_comm > 0 else "underestimate"
+            print(f"  視窗:        rank{selected_rank} kernels={trace_kernel_count} | "
+                  f"ET collectives={et_collective_count} | ratio={window_ratio}")
+            print(f"  ns-3 通訊:   ns3(aligned) = {ns3_comm_ms_aligned:.2f} ms | "
+                  f"real total = {real_t_net_comm_ms:.2f} ms | "
+                  f"誤差 = {ns3_signed_err_comm * 100:+.2f}% ({direction})")
             print(f"               (ns3 cycles = {sim_cycles_comm:,} ns，直接轉 ms，不經 α_step)")
         if sim_t_comm_ms is not None and real_t_comm_ms is not None:
             print(f"  [診斷] α_step 轉換通訊 = {sim_t_comm_ms:.2f} ms（← 用錯時鐘，僅供參考）")
@@ -1462,8 +1552,9 @@ def main():
 
     export_metrics(out_dir, row)
 
-    # 若是 2-GPU 且有實測，就把校準資訊追加到共用的 runs/calibration_all.csv（去重）
-    if row["mode"] == "calibrate" and alpha_us is not None:
+    # 2-GPU 且有實測值時，把校準結果追加進 --calib-db（去重）
+    # 不綁 alpha_us：未申報 --et-iters 時 alpha 會留空，但視窗對齊後的誤差仍然有效
+    if row["mode"] == "calibrate":
         _append_calibration_db(Path(args.calib_db).resolve(), row)
 
 if __name__ == "__main__":

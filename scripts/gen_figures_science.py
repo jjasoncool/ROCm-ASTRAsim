@@ -156,18 +156,18 @@ QWEN_PFC = {
 
 # ============================================================
 # Fig 4.4: Scope Boundary — Step Time Composition
-# Horizontal stacked bar: comm 1.6% vs 40% is the key contrast
+# Horizontal stacked bar: comm 34.2% vs 2.4% is the key contrast
 # ============================================================
 def fig_4_4():
     fig, ax = plt.subplots(figsize=(5.0, 2.2))
 
-    # Percentages of step time (updated after B1/B2/B3 fix)
-    # ResNet-50: total=662.92, gpu=141.70(21.4%), comm=7.54(1.1%), overhead=513.68(77.5%)
-    # CIFAR-10:  total=224.32, gpu=39.96(17.8%), comm=61.98(27.6%), overhead=122.38(54.6%)
+    # Percentages of step time (window-corrected divisors; see calibration_aligned.csv)
+    # ResNet-50: total=662.92, gpu=284.10(42.9%), comm=15.87(2.4%), overhead=362.95(54.8%)
+    # CIFAR-10:  total=224.32, gpu=50.15(22.4%), comm=76.69(34.2%), overhead=97.48(43.5%)
     workloads = ['CIFAR-10 CNN\n(Latency-bound)', 'ResNet-50\n(Bandwidth-bound)']
-    gpu_pct   = [17.8, 21.4]
-    comm_pct  = [27.6,  1.1]
-    over_pct  = [54.6, 77.5]
+    gpu_pct   = [22.4, 42.9]
+    comm_pct  = [34.2,  2.4]
+    over_pct  = [43.5, 54.8]
 
     y = np.arange(2)
     h = 0.5
@@ -209,8 +209,8 @@ def fig_4_4():
                 ha='center', va='center', fontsize=7, fontweight='bold', color='#555555')
 
     # Absolute times as annotation
-    ax.text(101, y[1], '662.92 ms', va='center', fontsize=7, color=C_GRAY)
-    ax.text(101, y[0], '224.32 ms', va='center', fontsize=7, color=C_GRAY)
+    ax.text(100.8, y[1], '662.92 ms', va='center', fontsize=7, color=C_GRAY)
+    ax.text(100.8, y[0], '224.32 ms', va='center', fontsize=7, color=C_GRAY)
 
     ax.set_xlim(0, 115)
     ax.set_yticks(y)

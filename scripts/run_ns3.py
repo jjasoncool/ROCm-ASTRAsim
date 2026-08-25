@@ -74,6 +74,7 @@ CALIB_FIELDS = [
     'alpha_us', 'alpha_comm_us', 'alpha_gpu_us', 'sim_cycles_step', 'sim_cycles_comm', 'sim_cycles_gpu', 'sim_t_step_ms', 'sim_t_comm_ms',
     'ns3_comm_ms', 'ns3_comm_ms_aligned', 'ns3_signed_err_comm', 'ns3_abs_err_comm',
     'selected_rank', 'trace_kernel_count', 'et_collective_count', 'window_ratio', 'et_iterations',
+    'trace_iterations', 'et_per_iter', 'trace_per_iter',
     'real_t_step_ms', 'real_t_comm_ms', 'real_t_net_comm_ms', 'real_t_kernel_ms',
     'real_t_net_comm_ms_rank0', 'real_t_net_comm_ms_rank1',
     'run_dir',
@@ -633,6 +634,8 @@ def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[
         kernel_ms_total = 0.0
         comm_kernel_count = 0
         step_durations = []
+        step_spans = []        # user_annotation 的 [ts, ts+dur]，用來還原真實迭代
+        comm_kernel_ts = []
 
         for ev in obj.get('traceEvents', []):
             if ev.get('ph') != 'X':
@@ -646,6 +649,8 @@ def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[
             # step durations collected for step median (use deduplicated step_map)
             if KINETO_STEP_PAT.match(name) and name in step_map and ev is step_map[name]:
                 step_durations.append(d_ms)
+            if KINETO_STEP_PAT.match(name) and lcat == 'user_annotation':
+                step_spans.append((ev.get('ts', 0.0), ev.get('ts', 0.0) + ev.get('dur', 0.0)))
 
             # 邏輯：區分三類事件
             # (a) NCCL/RCCL 通訊 kernel（如 ncclDevKernel_Generic_4）→ net_comm
@@ -664,6 +669,7 @@ def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[
                 # (a) RCCL/NCCL 通訊 kernel → 計入 net_comm
                 net_ms_total += d_ms
                 comm_kernel_count += 1
+                comm_kernel_ts.append(ev.get('ts', 0.0))
             elif 'kernel' in lcat:
                 # (b) 一般 GPU compute kernel → 計入 kernel
                 kernel_ms_total += d_ms
@@ -673,11 +679,22 @@ def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[
             per_rank_step_medians.append(median(step_durations))
         # 別除 steps_n：它與 comm 視窗沒有固定關係，除下去等於混單位。
         # 視窗由呼叫端用 collective 數對齊。
+        # ProfilerStep 是三層巢狀（外框 + 內層真步 + gpu 鏡射）。天真計數會把
+        # 一次迭代數成兩三次——這正是舊 steps_n 除數的來源。只保留未被任何
+        # 其他區間包住的 user_annotation，才是真實迭代。
+        iters = []
+        for a, b in sorted(step_spans):
+            if not any(a >= x and b <= y for x, y in iters):
+                iters.append((a, b))
+        per_iter_kernels = [sum(1 for t in comm_kernel_ts if a <= t <= b) for a, b in iters]
+
         per_rank_stats[r] = {
             "kernels": comm_kernel_count,
             "net_ms_total": net_ms_total,
             "kernel_ms_total": kernel_ms_total,
             "steps_n": steps_n,
+            "trace_iters": len(iters),
+            "per_iter_kernels": per_iter_kernels,
         }
 
     real_t_step_ms = median(per_rank_step_medians) if per_rank_step_medians else None
@@ -686,7 +703,9 @@ def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[
     for r, st in sorted(per_rank_stats.items()):
         print(f"[INFO]   rank{r}: rccl_kernels={st['kernels']} "
               f"net_comm_total={st['net_ms_total']:.6f} ms "
-              f"kernel_total={st['kernel_ms_total']:.6f} ms steps_n={st['steps_n']}")
+              f"kernel_total={st['kernel_ms_total']:.6f} ms "
+              f"trace_iters={st['trace_iters']} per_iter={st['per_iter_kernels']} "
+              f"(steps_n={st['steps_n']} 為巢狀計數，不使用)")
     return real_t_step_ms, per_rank_stats, used_epoch
 
 # ---------- 解析 ASTRA‑sim stdout.log（cycles） ----------
@@ -761,6 +780,7 @@ def align_and_compare(per_rank_stats: dict, et_collective_count: int | None,
     """
     out = {k: None for k in (
         "selected_rank", "trace_kernel_count", "window_ratio",
+        "trace_iterations", "et_per_iter", "trace_per_iter",
         "real_t_net_comm_ms", "real_t_kernel_ms",
         "real_t_net_comm_rank0", "real_t_net_comm_rank1",
         "ns3_comm_ms", "ns3_comm_ms_aligned",
@@ -791,23 +811,55 @@ def align_and_compare(per_rank_stats: dict, et_collective_count: int | None,
 
     sel_rank = eligible[0]
     sel = per_rank_stats[sel_rank]
-    ratio = et_collective_count // sel["kernels"]
+    trace_iters = sel.get("trace_iters") or 0
+    per_iter = sel.get("per_iter_kernels") or []
+
+    # 迭代歸屬自洽：每迭代 kernel 數加總必須等於總數，否則有 kernel 落在
+    # 任何 ProfilerStep 之外，迭代邊界不可信。
+    if trace_iters and sum(per_iter) != sel["kernels"]:
+        raise SystemExit(
+            f"[calib] rank{sel_rank} 有 {sel['kernels'] - sum(per_iter)} 個 comm kernel "
+            f"落在所有迭代區間之外（每迭代 {per_iter}，總數 {sel['kernels']}）。"
+            f"迭代邊界不可信，拒絕對齊。")
+
+    # window_ratio 是「迭代數比」，不是 collective 計數比。
+    # 計數比在 TP 上會把「ET 每迭代顆粒度是 trace 的 2 倍」誤讀成「ET 涵蓋 2 倍迭代」，
+    # 於是拿 1 個模擬迭代去比 2 個實測迭代——與 steps_n 除數同一類錯誤。
+    declared = et_iters if et_iters is not None else trace_iters
+    if not trace_iters:
+        raise SystemExit("[calib] 無法從 trace 還原迭代邊界（沒有 user_annotation ProfilerStep）。")
+    if declared % trace_iters != 0 and trace_iters % declared != 0:
+        raise SystemExit(
+            f"[calib] ET 迭代數 {declared} 與 trace 迭代數 {trace_iters} 不成整數比，無法對齊。")
+    ratio = declared // trace_iters if declared >= trace_iters else 1
+
+    et_per_iter = et_collective_count / declared if declared else None
+    trace_per_iter = sel["kernels"] / trace_iters
     out.update(selected_rank=sel_rank, trace_kernel_count=sel["kernels"],
-               window_ratio=ratio,
+               window_ratio=ratio, trace_iterations=trace_iters,
+               et_per_iter=et_per_iter, trace_per_iter=trace_per_iter,
                real_t_net_comm_ms=sel["net_ms_total"],
                real_t_kernel_ms=sel["kernel_ms_total"])
+
+    # 顆粒度差：兩側迭代數相同，但每迭代的 collective 數不同。ET 模擬了 trace
+    # 裡沒有對應 kernel 的 collective（例如被融合的控制型 op），兩側總和量的
+    # 不是同一批工作。大聲標記，不靜默套用。
+    if et_per_iter and abs(et_per_iter - trace_per_iter) > 1e-9:
+        out["flags"].append("per_iter_granularity_mismatch")
+        print(f"[calib] ⚠ 每迭代顆粒度不符：ET {et_per_iter:.0f}/iter vs "
+              f"trace {trace_per_iter:.0f}/iter（倍率 {et_per_iter / trace_per_iter:.3g}）。"
+              f" 兩側迭代數同為 {trace_iters}，除數仍為 {ratio}；"
+              f" 誤差值需人工確認語意後方可引用。")
 
     if out["ns3_comm_ms"] is not None:
         aligned = out["ns3_comm_ms"] / ratio
         out["ns3_comm_ms_aligned"] = aligned
         real = sel["net_ms_total"]
-        # 實測通訊小於 10 us 時比值沒有意義（量測雜訊主導），但要留下標記，
-        # 不能讓誤差欄靜默留空看起來像「沒算」。
         if real > 0.01:
             out["ns3_signed_err_comm"] = (aligned - real) / real
             out["ns3_abs_err_comm"] = abs(out["ns3_signed_err_comm"])
         else:
-            out["flags"].append(f"comm_err_skipped_real_below_10us({real:.6f}ms)")
+            out["flags"].append("real_comm_below_threshold_10us")
         if sim_cycles_comm:
             out["alpha_comm_us"] = (real * 1000.0) / max(1.0, sim_cycles_comm / ratio)
 
@@ -1520,6 +1572,9 @@ def main():
         "trace_kernel_count": trace_kernel_count if trace_kernel_count is not None else "",
         "et_collective_count": et_collective_count if et_collective_count is not None else "",
         "window_ratio": window_ratio if window_ratio is not None else "",
+        "trace_iterations": calib["trace_iterations"] if calib["trace_iterations"] is not None else "",
+        "et_per_iter": f"{calib['et_per_iter']:.0f}" if calib["et_per_iter"] is not None else "",
+        "trace_per_iter": f"{calib['trace_per_iter']:.0f}" if calib["trace_per_iter"] is not None else "",
         "et_iterations": et_iterations if et_iterations is not None else "",
         "real_t_net_comm_ms_rank0": f"{real_t_net_comm_rank0:.6f}" if real_t_net_comm_rank0 is not None else "",
         "real_t_net_comm_ms_rank1": f"{real_t_net_comm_rank1:.6f}" if real_t_net_comm_rank1 is not None else "",

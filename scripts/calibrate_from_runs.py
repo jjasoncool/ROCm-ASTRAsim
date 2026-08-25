@@ -24,6 +24,7 @@ import run_ns3 as R
 
 FIELDS = ["tag", "run_dir", "selected_rank", "trace_kernel_count",
           "et_collective_count", "window_ratio", "et_iterations",
+          "trace_iterations", "et_per_iter", "trace_per_iter",
           "sim_cycles_step", "sim_cycles_comm",
           "ns3_comm_ms", "ns3_comm_ms_aligned",
           "real_t_net_comm_ms", "real_t_net_comm_ms_rank0", "real_t_net_comm_ms_rank1",
@@ -68,6 +69,7 @@ def main():
             "et_collective_count": et_n, "real_t_step_ms": real_step,
             **{k: calib.get(k) for k in
                ("selected_rank", "trace_kernel_count", "window_ratio", "et_iterations",
+                "trace_iterations", "et_per_iter", "trace_per_iter",
                 "ns3_comm_ms", "ns3_comm_ms_aligned", "real_t_net_comm_ms",
                 "real_t_net_comm_rank0", "real_t_net_comm_rank1", "real_t_kernel_ms",
                 "ns3_signed_err_comm", "ns3_abs_err_comm", "alpha_us", "alpha_comm_us")},

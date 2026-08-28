@@ -14,6 +14,7 @@
 4. [`run_ns3.py` 參數詳解](#4-run_ns3py-參數詳解)
 5. [校準原理](#5-校準原理)
 6. [進階：大規模擴展分析](#6-進階大規模擴展分析)
+7. [支援量測工具](#7-支援量測工具)
 
 ---
 
@@ -100,7 +101,7 @@ $$T_{link,init} = \frac{25\ \mu s}{2} = 12.5\ \mu s$$
 - **系統感知校準**（第 2 階段）：對 System-Bound 模型可使用 `--force-avg-kernel-ns` 攤提系統開銷
 - **TP+DDP 組合**（第 2 階段）：`--add-ddp --target-tp 8` 會把 DDP AllReduce 節點接到 TP trace 之後，並縮放計算時間
 - **虛擬擴展**（第 3 階段）：將小規模（2-GPU）trace 擴展至大規模（如 128-GPU）模擬
-- **自動校準**（第 3 階段）：自動計算 `alpha_us` 因子並儲存至 `runs/calibration_all.csv`
+- **自動校準**（第 3 階段）：對齊實測與模擬的通訊視窗，計算 `alpha_us`，並追加至 `runs/calibration_aligned.csv`（`calibration_all.csv` 是舊 log，見 §5）
 
 **論文涵蓋的工作負載。** 此 Pipeline 在四種通訊強度下被驗證：
 
@@ -111,7 +112,7 @@ $$T_{link,init} = \frac{25\ \mu s}{2} = 12.5\ \mu s$$
 | 3. 階層式 TP+DDP | Qwen 1.5B，TP=8 × DDP=16 | `train_rocm_tensor.py` + `conver_to_chakra_et.py --add-ddp --target-tp 8` | `qwen15b_tp8ddp` | |
 | 4. All-to-All 頻寬飽和 | 合成 1 GB All-to-All | 對 `resnet50_all2all` 跑 `scale_et_comm_workload.py --bytes 1G` | `resnet50_all2all_1GB` | ns-3 端建議 `--payload 12000` |
 
-Qwen 0.5B 的 2-GPU 校準結果亦驗證 trace 形式正確：每 step 含 37 個 AllReduce COMM 節點、總通訊量約 1.84 GiB、comm/step ≈ 57.7%。
+Qwen 0.5B 的 2-GPU 校準結果亦驗證 trace 形式正確：每 step 含 10,916 個 COMP 節點與 37 個 AllReduce COMM 節點，合計 1,884.6 MiB——正好是 494,032,768 個參數的 FP32 梯度量。
 
 ---
 
@@ -184,10 +185,10 @@ python scripts/run_ns3.py \
   --topo auto:1d \
   --phys-topo configs/astra-sim/topos/2_nodes_1_switch_topology.txt \
   --coll-opt localBWAware \
-  --lmbw 540
+  --lmbw 540 --et-iters 1
 ```
 
-> 檢查 `runs/calibration_all.csv`。ResNet-50 是主要校準基準；$\alpha_{step}$ 是主要 wall-clock 轉換係數，$\alpha_{comm}$ 僅作診斷用途。
+> ResNet-50 的 device 視窗涵蓋一次完整訓練迭代——它的五個通訊 kernel 恰好對應 DDP 的五個梯度 bucket——因此即使 trace 是以 `--trace-steps 2` 收集，這裡仍是 `--et-iters 1`。檢查 `runs/calibration_aligned.csv`。ResNet-50 是主要校準基準；$\alpha_{step}$ 是主要 wall-clock 轉換係數，$\alpha_{comm}$ 僅作診斷用途。
 
 ---
 
@@ -226,7 +227,8 @@ python scripts/run_ns3.py \
 | 參數 | 描述 | 範例 |
 |---|---|---|
 | `--virtual-world N` | 將每 rank trace 複製擴展到 `N` 節點模擬 | `128` |
-| `--comm-scale F` | 將每個 `comm_size` 乘以 `F` 修正 M=2 → N=128。使用 ring-AllReduce 係數 2·(N−1)/N ≈ **`1.984`**(N=128);同一實驗內對所有拓撲一致套用,不影響相對比較 | `1.984` |
+| `--comm-scale F` | 將每個 `comm_size` 乘以 `F`。這是**工作負載的通訊工作點設定**，不是對集合演算法的修正——ASTRA-sim 會依設定的參與節點數自行拆解每個集合操作。論文值為 `127/64` = **`1.984375`**；Qwen 0.5B 必須用精確分數，縮放後的尺寸才能被 `preferred-dataset-splits=4` 整除，TP+DDP 則可接受四捨五入的 `1.984`。同一實驗內對所有拓撲一致套用 | `1.984375` |
+| `--comm-group FILE` | 直接傳給 `--comm-group-configuration`；未指定則完全不帶該參數 | — |
 | `--no-qlen` | 將 `qlen.txt` 導向 `/dev/null`，避免 128 節點時產生數百 GB 除錯輸出 | — |
 | `--deadlock-timeout S` | `fct.txt` 連續 `S` 秒未更新即自動 kill（預設 `43200` = 12 h，`0` 表示停用） | `43200` |
 
@@ -235,8 +237,9 @@ python scripts/run_ns3.py \
 | 參數 | 描述 | 預設值 |
 |---|---|---|
 | `--no-autocalib` | 禁用自動校準 `alpha_us` | — |
+| `--et-iters N` | 這個 ET 涵蓋幾次訓練迭代（= 產生它時的 `--trace-steps`）。`alpha_us` 需要「每步」的分母，故為必要；未給則留空，絕不用猜的 | — |
 | `--trace-dir` | Kineto trace 來源目錄 | `data/chakra/pytorch_traces` |
-| `--calib-db` | 校準結果 CSV 路徑 | `runs/calibration_all.csv` |
+| `--calib-db` | 校準結果 CSV 路徑 | `runs/calibration_aligned.csv` |
 | `--log-dir` | 模擬輸出根目錄 | `runs` |
 | `--dry-run` | 僅產生設定檔與命令，不執行模擬 | — |
 
@@ -250,30 +253,60 @@ python scripts/run_ns3.py \
 
 當 `run_ns3.py` 在 `world=2` 下執行時（未加 `--no-autocalib`），流程如下：
 
-1. **解析模擬結果**：從 `stdout.log` 提取 `sim_cycles_step`（模擬的總 wall cycles）
-2. **查找真實 Trace**：根據 `--model-tag` 在 `--trace-dir` 中找到對應的 Kineto trace，提取 `real_t_step_ms`
-3. **計算 Alpha**：
+1. **解析模擬結果**：從 `stdout.log` 提取 `sim_cycles_step` 與 `sim_cycles_comm`。
+2. **查找真實 Trace**：根據 `--model-tag` 在 `--trace-dir` 中找到對應的 Kineto trace，提取 `real_t_step_ms`、RCCL kernel 總和（`real_t_net_comm_ms`）與非 RCCL 計算 kernel 總和（`real_t_kernel_ms`）。只計入 GPU 側的 `cat=kernel` 事件，CPU 側的 `user_annotation` 一律排除，避免同一操作被算兩次。
+3. **對齊兩側視窗** —— 讓後面所有數字有意義的關鍵步驟。實測側是單一 rank 的 RCCL kernel，模擬側是 ET 實際重播的內容，兩者唯有對齊才涵蓋相同的工作量。因此腳本會：
+   - 在程式內合併巢狀的 `ProfilerStep` 區間、保留未被包含者，藉此還原 trace 的迭代數（profiler 自己的 `steps_n` 與兩側都不相符，一律不使用）；
+   - 檢查每個通訊 kernel 都落在某個迭代區間內——若有 kernel 落在區間之外，迭代邊界即不可信，執行**直接停止**；
+   - 以**迭代數**而非 collective 計數推導 `window_ratio`。計數比會把「每迭代顆粒度差異」（TP trace 上很常見，ET 每迭代重播的 collective 比 trace 紀錄的多）誤讀成「涵蓋的迭代數不同」，結果拿 1 個模擬迭代去比 2 個實測迭代；
+   - 當 `--et-iters` 小於還原出的 trace 迭代數、或兩者不成整數比時**直接 raise**。一個看起來合理的比值比停下來更糟；
+   - 顆粒度不符時大聲標記 `per_iter_granularity_mismatch`，而不是把差異折進除數。
+4. **計算 Alpha**：
 
    $$
-   \alpha_{\mathrm{us}} = \frac{\mathrm{real\_t\_step\_ms} \times 1000}{\mathrm{sim\_cycles\_step}}
+   \alpha_{\mathrm{us}} = \frac{\mathrm{real\_t\_step\_ms} \times 1000}{\mathrm{sim\_cycles\_step} / \mathrm{et\_iters}}
    $$
 
-   $\alpha_{\mathrm{us}}$（即 $\alpha_{step}$）代表每個模擬 cycle 對應多少真實世界的微秒（µs），為所有 128 節點拓撲比較的**主要校準係數**。
+   分子是「每步」，分母也必須是——這正是 `--et-iters` 的用途。未提供時腳本會標記 `alpha_skipped_no_et_iters` 並把 `alpha_us` 留空。$\alpha_{\mathrm{us}}$（即 $\alpha_{step}$）代表每個模擬 cycle 對應多少真實世界的微秒（µs），為論文中所有 128 節點拓撲比較的**主要校準係數**。
 
-   腳本同時計算 $\alpha_{comm}$ 作為診斷指標，但因 ASTRA-sim 的 Comm time（排程延遲）與 PyTorch Profiler 的 RCCL kernel duration（累加總和）語意不同，**不用於校準**。
+   $\alpha_{comm}$ 由已對齊視窗的總和計算，僅作診斷、**不用於校準**：它作用在 ns-3 的奈秒 tick 上，而 $\alpha_{step}$ 作用在由 trace 導出的計算 cycle 上，兩者屬於不同的 cycle 域，本來就不該相等。
 
-4. **儲存結果**：寫入 `out/metrics.csv`，並追加至 `runs/calibration_all.csv`
+5. **儲存結果**：寫入 `out/metrics.csv`，並追加至 `runs/calibration_aligned.csv`。
 
-**參考實測數據（2-GPU，ResNet-50 與 CIFAR-10）：**
+> **`calibration_all.csv` 是舊的 append log。** 它早於視窗對齊機制，其中的誤差值比較的是涵蓋工作量不同的兩個視窗。論文中每一個校準數值都出自 `calibration_aligned.csv`；請勿引用舊檔。
+
+若想從既有的 run 目錄重算這些指標而不重跑模擬——`calibrate_from_runs.py` 直接複用 `run_ns3.align_and_compare`，兩者不會走鐘：
+
+```bash
+python3 scripts/calibrate_from_runs.py --out runs/calibration_aligned.csv \
+  resnet50=1:<run_dir> cifar10=4:<run_dir> qwen05b=2:<run_dir> qwen15b_tp=2:<run_dir>
+```
+
+每個參數的格式是 `tag=et_iters:run_dir`。
+
+**參考實測數據（2-GPU，已對齊視窗，每個訓練步驟）：**
 
 | 指標 | ResNet-50 | CIFAR-10 |
 |---|---|---|
-| `ns3_comm_ms`（ns-3 模擬值） | **15.06 ms** | **41.07 ms** |
-| `real_t_comm_ms`（硬體實測值） | **7.54 ms** | **61.98 ms** |
-| ns-3 vs real | **+100%** | **−34%** |
+| `real_t_step_ms` | 662.92 ms | 224.32 ms |
+| `real_t_net_comm_ms`（硬體實測） | **15.87 ms** | **76.69 ms** |
+| `real_t_kernel_ms` | 284.10 ms | 50.15 ms |
+| comm / step | 2.4% | 34.2% |
+| `ns3_comm_ms`（ns-3） | **15.06 ms** | **10.27 ms** |
+| ns-3 vs real | **−5.1%** | **−86.6%** |
+| $\alpha_{step}$ | **0.002411** | 0.004550 |
+| $\alpha_{comm}$ | 0.001054 | 0.007469 |
+| `--et-iters` | 1 | 4 |
 | 校準狀態 | 主基準 | 排除（scope boundary） |
 
-> 透過對頻寬、延遲、封包 payload 與擁塞控制設定的系統性掃描可知：對 ResNet-50 而言，ns-3 通訊時間在所有測試設定下都穩定落在約 14.0–15.1 ms，支持這個差異主要屬於結構性偏差（最合理解釋為 Ethernet RDMA 與 PCIe DMA 路徑不匹配），而非參數敏感度問題。
+LLM 工作負載，相同對齊方式：
+
+| Tag | `--et-iters` | `ns3_comm_ms` | `real_t_net_comm_ms` | ns-3 vs real | 旗標 |
+|---|---|---|---|---|---|
+| `qwen05b` | 2 | 573.08 ms | 3,393.27 ms | **−83.1%** | — |
+| `qwen15b_tp` | 2 | 392.25 ms | 5,918.81 ms | **−93.4%** | `per_iter_granularity_mismatch` |
+
+> 對封包 payload（1,000–8,000 B）、逐鏈路延遲（12.5–14 µs）與 QCN 開關的系統性掃描顯示：ResNet-50 的 ns-3 通訊時間在所有設定下都落在 14.0–15.1 ms，也就是每一組都比實測值低 5–12%。殘差對所有可調參數都不敏感。排程受限型的工作負載（CIFAR-10、兩個 Qwen trace）被低估得多得多，因為 ns-3 有建模資料傳輸，卻沒有建模集合排程與 backward 計算之間的同步等待。該成分屬於共用的 trace 與排程，三種拓撲完全相同，因此不會進入相對比較。
 
 ---
 
@@ -283,7 +316,7 @@ python scripts/run_ns3.py \
 
 ### 步驟 1：確認校準基線
 
-- 檢查 `runs/calibration_all.csv`
+- 檢查 `runs/calibration_aligned.csv`
 - ResNet-50：使用 $\alpha_{step}$ 作為 wall-clock 轉換係數，通訊時間則主要拿來做**相對拓撲比較**
 - CIFAR-10：因未建模軟體堆疊開銷主導 step time，排除於大規模拓撲評估之外
 
@@ -320,3 +353,38 @@ python scripts/run_ns3.py \
 - 若不同拓撲的 **`sim_t_step_ms` 幾乎相同**，通常表示通訊仍被計算遮蔽，拓撲差異尚未顯現。
 - 若 **communication / wall time ratio 上升** 且 `sim_t_step_ms` 開始分化，通常表示已進入拓撲敏感區間。
 - 若某一拓撲在 **相近 communication ratio 下仍有較低的 `sim_t_step_ms`**，可解讀為該拓撲在此工作負載下具有較佳的通訊效率或負載平衡效果。
+
+---
+
+## 7. 支援量測工具
+
+以下腳本拆解 AllReduce 成本的*實測*側，讓 §5 的 ns-3 落差可以被歸因而不是用猜的。輸出都落在 `runs/calibration/`。
+
+| 腳本 | 量測內容 | 輸出 |
+|---|---|---|
+| `bucket_micro_allreduce.py` | 以 ET 解出的 DDP bucket 尺寸執行 `torch.distributed.all_reduce`，GPU 上沒有其他工作——無競爭下限。刻意走 PyTorch 路徑（而非 rccl-tests），因為那才是 trace 紀錄的路徑；每次 `all_reduce` 各自用一對 CUDA event 包起來，對應 Kineto 回報單一 kernel 的方式 | `q2_micro.csv` |
+| `q4_overlap_off.py` | 同樣的 bucket，放在真實訓練迴圈內，但等 backward 完全結束後才發出——有框架成本、無競爭。第一階段以 DDP comm hook 記錄真實 bucket 尺寸，而非臆測 `bucket_cap_mb`；記錄到的多重集合必須與 ET 解出的尺寸相符 | `q4_overlap_off.csv` |
+| `fit_envelope.py` | 對 rccl-tests 掃描與 ns-3 逐 collective 的 COMM interval 各自擬合 `T(M) = α + M/B`，再逐 bucket 相減。模型對參數為線性，普通最小平方即為精確解，不需要 scipy | `step1_rccl_sweep.csv`、`ns3_collective_times.csv`、`envelope_fit_table.md` |
+| `gen_envelope_figures.py` | 畫出實測 RCCL 路徑與 ns-3 的 `T(M)` 與 `BW(M)` | `fig_envelope_T.png`、`fig_envelope_BW.png` |
+| `gen_figures_science.py` | 論文圖表（IEEE 樣式） | `thesis_figures/` |
+
+三個欄位合起來是：無競爭（`q2_micro`）、有框架成本但無競爭（`q4_overlap_off`）、以及與 backward 競爭的實地執行（Kineto trace）。相減即可分離出實測 RCCL kernel 時間中有多少是 ns-3 有建模的資料傳輸，有多少是它沒建模的同步等待。
+
+`fit_envelope.py` 的 ns-3 側輸入來自 `rocm/patches/statistics_comm_intervals.py` 加進 ASTRA-sim statistics pass 的 `COMM interval` 行，因此容器必須以 `ASTRA_PATCHES=all`（預設值）建置，這些輸入才會存在。
+
+```bash
+# 在 rocm-horovod 容器內執行；/workspace/runs 為 bind mount
+torchrun --nproc_per_node=2 scripts/bucket_micro_allreduce.py \
+    --sizes-file runs/calibration/bucket_sizes.json \
+    --out runs/calibration/q2_micro.csv
+
+torchrun --standalone --nproc_per_node=2 scripts/q4_overlap_off.py \
+    --out runs/calibration/q4_overlap_off.csv
+
+# 在 repo 根目錄執行
+python scripts/fit_envelope.py \
+    --rccl-log runs/calibration/step1_rccl_sweep_raw.log \
+    --sizes runs/calibration/bucket_sizes.json \
+    --out-csv runs/calibration/step1_rccl_sweep.csv
+python scripts/gen_envelope_figures.py
+```

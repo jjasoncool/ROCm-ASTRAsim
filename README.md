@@ -286,7 +286,7 @@ Calibration runs at 2-GPU scale and produces the conversion factor α_step (µs 
 
 > Sweeping packet payload (1,000–8,000 B), per-link latency (12.5–14 µs), and QCN on/off keeps ResNet-50's ns-3 communication time inside 14.0–15.1 ms — every configuration lands 5–12% *below* the measured value. The residual is insensitive to every knob tested, and the same ns-3 transport model is applied to every link and every topology, so a topology-independent multiplicative bias cancels in the reported ratios.
 
-α and per-run calibration results are written to `runs/calibration_aligned.csv`. `runs/calibration_all.csv` is a **legacy append log** kept for history only — do not quote numbers from it. See [scripts/README.md](scripts/README.md) for the full methodology.
+α and per-run calibration results are written to `runs/calibration_aligned.csv`. `runs/calibration_all.csv` is a **legacy append log** produced by the pre-alignment pipeline; its error figures compare windows covering different amounts of work, so do not quote numbers from it. See [scripts/README.md](scripts/README.md) for the full methodology.
 
 ### Additional workload validation: Qwen 0.5B and Qwen 1.5B TP
 

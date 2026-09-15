@@ -181,7 +181,7 @@ python ./src/conver_to_chakra_et.py --model-tag resnet50_all2all
 
 ```bash
 # 2-GPU 校準執行(任一 workload 均可)。--et-iters 是「這個 ET 涵蓋幾次訓練迭代」
-# (產生 ET 時使用的 --trace-steps);沒給的話 alpha_us 會留空而不是用猜的。
+# (產生 ET 時使用的 --trace-steps);未給則 alpha_us 留空,不以推測值填補。
 # 結果寫入 runs/calibration_aligned.csv。
 python ./scripts/run_ns3.py \
   --workload data/chakra/workload_et --model-tag resnet50 \
@@ -250,7 +250,7 @@ python scripts/run_ns3.py \
 |---|---|
 | `--virtual-world N` | 將每個 rank 的 trace 複製擴展到 `N` 節點模擬(round-robin:偶數虛擬 rank 拿 rank-0 的 ET,奇數拿 rank-1;對映關係寫入 `expansion_map.json`) |
 | `--comm-scale F`    | 將每個 COMM 節點的 `comm_size` 乘以 `F`。這是**工作負載的通訊工作點設定**,不是對集合演算法的修正——ASTRA-sim 會依設定的參與節點數自行拆解每個集合操作。論文用 `127/64 = 1.984375`;Qwen 0.5B 必須用精確分數,縮放後的 `comm_size` 才能被 `preferred-dataset-splits=4` 整除,TP+DDP 則可接受四捨五入的 `1.984`。同一實驗內對所有拓撲一致套用,不影響相對比較 |
-| `--et-iters N`      | 這個 ET 涵蓋幾次訓練迭代(= 產生它時的 `--trace-steps`)。`alpha_us` 需要「每步」的分母,所以必須提供;未給則 `alpha_us` 留空,不會用猜的 |
+| `--et-iters N`      | 這個 ET 涵蓋幾次訓練迭代(= 產生它時的 `--trace-steps`)。`alpha_us` 需要「每步」的分母,所以必須提供;未給則 `alpha_us` 留空,不以推測值填補 |
 | `--comm-group FILE` | 直接傳給 `--comm-group-configuration`;未指定則完全不帶該參數 |
 | `--calib-db PATH`   | 校準結果要追加的 CSV(預設 `runs/calibration_aligned.csv`) |
 | `--no-qlen`         | 將 `qlen.txt` 導向 `/dev/null`,避免 128 節點時產生數百 GB 除錯輸出 |
@@ -286,7 +286,7 @@ python scripts/run_ns3.py \
 
 > 掃過封包 payload(1,000–8,000 B)、逐鏈路延遲(12.5–14 µs)與 QCN 開關後,ResNet-50 的 ns-3 通訊時間都落在 14.0–15.1 ms,每一組設定都比實測值*低* 5–12%。殘差對所有可調參數都不敏感;而同一套 ns-3 傳輸模型套用在每條鏈路、每種拓撲上,因此與拓撲無關的乘性偏差會在比值中互相抵銷。
 
-α 值與每次執行的校準結果寫入 `runs/calibration_aligned.csv`。`runs/calibration_all.csv` 是**留作歷史紀錄的舊 append log**,不要從中引用數字。完整校準方法論請見 [scripts/README.md](scripts/README.md)。
+α 值與每次執行的校準結果寫入 `runs/calibration_aligned.csv`。`runs/calibration_all.csv` 是**視窗對齊機制之前的舊 append log**,其誤差值比較的是涵蓋工作量不同的兩個視窗,不要從中引用數字。完整校準方法論請見 [scripts/README.md](scripts/README.md)。
 
 ### 額外工作負載驗證:Qwen 0.5B 與 Qwen 1.5B TP
 
@@ -299,7 +299,7 @@ python scripts/run_ns3.py \
 
 ### 支援量測工具
 
-以下三支腳本拆解 AllReduce 成本的*實測*側,讓 ns-3 的落差可以被歸因而不是用猜的。輸出都在 `runs/calibration/`。
+以下三支腳本拆解 AllReduce 成本的*實測*側,使 ns-3 的落差可被歸因,而非僅能推測。輸出都在 `runs/calibration/`。
 
 | 腳本 | 量測內容 |
 |---|---|
@@ -591,7 +591,7 @@ A:ET 檔案的 DAG 完整性異常(自依賴或循環依賴)。重新執行 `con
 A:在 trace 收集腳本加上 `--inject-sync-hack`。此選項會注入同步事件,對齊 CPU(毫秒)與 GPU(微秒)的時間軸。
 
 **Q:ns-3 的通訊時間對照實體硬體有多準?**
-A:以 ResNet-50 而言,把實測與模擬的視窗對齊之後,ns-3 的總和比實測 RCCL kernel 總和**低 5.1%**——這是聚合一致,內含互相抵銷的逐 collective 偏差。任何可調參數都動不了它(payload、延遲、QCN 都讓它落在 14.0–15.1 ms)。排程受限型的工作負載被低估得多得多(CIFAR-10 −86.6%、Qwen 0.5B −83.1%),因為模擬器有建模資料傳輸,卻沒有建模集合排程與 backward 計算之間的同步等待。那個未建模成分屬於共用的 trace 與排程,三種拓撲完全相同,因此不會進入相對比較。
+A:以 ResNet-50 而言,把實測與模擬的視窗對齊之後,ns-3 的總和比實測 RCCL kernel 總和**低 5.1%**——這是聚合一致,內含互相抵銷的逐 collective 偏差。任何可調參數均無法改變此結果(payload、延遲、QCN 都讓它落在 14.0–15.1 ms)。排程受限型的工作負載低估幅度顯著更大(CIFAR-10 −86.6%、Qwen 0.5B −83.1%),因為模擬器有建模資料傳輸,卻沒有建模集合排程與 backward 計算之間的同步等待。那個未建模成分屬於共用的 trace 與排程,三種拓撲完全相同,因此不會進入相對比較。
 
 > 本 README 的舊版本曾寫「ns-3 把 ResNet-50 *高估*約 2 倍」。該數字來自比較涵蓋工作量不同的兩個視窗,已作廢——見前面的「先對齊視窗,其他數字才有意義」。
 
@@ -602,7 +602,7 @@ A:它 43.5% 的 step time 落在 ASTRA-sim 未建模的殘差(kernel launch、RC
 A:它設定的是複製後 128 節點執行的**通訊工作點**,而不是對集合演算法的修正——後者 ASTRA-sim 會依設定的參與節點數自行推導。這個值是精確分數 `127/64`。Qwen 0.5B 必須用精確分數,縮放後的 `comm_size` 才能被 `preferred-dataset-splits=4` 整除;TP+DDP 則可接受四捨五入的 `1.984`。同一實驗內同一倍率、同一 trace 套用到三種拓撲,因此每次比較都在相同的 offered load 下進行。詳見論文 4.2.6 / 4.6.2 節。
 
 **Q:我的校準結果 `alpha_us` 是空的。**
-A:你沒有給 `--et-iters`。`alpha_us` 需要「每步」的分母,腳本寧可留空也不猜迭代數——猜出來的 α 會產生一個看起來合理、實際上默默算錯的換算係數。請填入產生該 ET 時使用的 `--trace-steps`。
+A:你沒有給 `--et-iters`。`alpha_us` 需要「每步」的分母,腳本留空而不推測迭代數——猜出來的 α 會產生一個看起來合理、實際上默默算錯的換算係數。請填入產生該 ET 時使用的 `--trace-steps`。
 
 **Q:我的校準列帶了 `per_iter_granularity_mismatch` 旗標。**
 A:ET 每迭代重播的 collective 數與 trace 紀錄的不同,兩側加總的不是同一批工作。執行不會被中止,但誤差值需先人工確認語意才可引用。`qwen15b_tp` 那一列就處於這個狀態。

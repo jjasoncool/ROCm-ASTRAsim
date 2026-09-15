@@ -237,7 +237,7 @@ python scripts/run_ns3.py \
 | 參數 | 描述 | 預設值 |
 |---|---|---|
 | `--no-autocalib` | 禁用自動校準 `alpha_us` | — |
-| `--et-iters N` | 這個 ET 涵蓋幾次訓練迭代（= 產生它時的 `--trace-steps`）。`alpha_us` 需要「每步」的分母，故為必要；未給則留空，絕不用猜的 | — |
+| `--et-iters N` | 這個 ET 涵蓋幾次訓練迭代（= 產生它時的 `--trace-steps`）。`alpha_us` 需要「每步」的分母，故為必要；未給則留空，不以推測值填補 | — |
 | `--trace-dir` | Kineto trace 來源目錄 | `data/chakra/pytorch_traces` |
 | `--calib-db` | 校準結果 CSV 路徑 | `runs/calibration_aligned.csv` |
 | `--log-dir` | 模擬輸出根目錄 | `runs` |
@@ -260,7 +260,7 @@ python scripts/run_ns3.py \
    - 檢查每個通訊 kernel 都落在某個迭代區間內——若有 kernel 落在區間之外，迭代邊界即不可信，執行**直接停止**；
    - 以**迭代數**而非 collective 計數推導 `window_ratio`。計數比會把「每迭代顆粒度差異」（TP trace 上很常見，ET 每迭代重播的 collective 比 trace 紀錄的多）誤讀成「涵蓋的迭代數不同」，結果拿 1 個模擬迭代去比 2 個實測迭代；
    - 當 `--et-iters` 小於還原出的 trace 迭代數、或兩者不成整數比時**直接 raise**。一個看起來合理的比值比停下來更糟；
-   - 顆粒度不符時大聲標記 `per_iter_granularity_mismatch`，而不是把差異折進除數。
+   - 顆粒度不符時明確標記 `per_iter_granularity_mismatch`，而不是把差異折進除數。
 4. **計算 Alpha**：
 
    $$
@@ -275,7 +275,7 @@ python scripts/run_ns3.py \
 
 > **`calibration_all.csv` 是舊的 append log。** 它早於視窗對齊機制，其中的誤差值比較的是涵蓋工作量不同的兩個視窗。論文中每一個校準數值都出自 `calibration_aligned.csv`；請勿引用舊檔。
 
-若想從既有的 run 目錄重算這些指標而不重跑模擬——`calibrate_from_runs.py` 直接複用 `run_ns3.align_and_compare`，兩者不會走鐘：
+若想從既有的 run 目錄重算這些指標而不重跑模擬——`calibrate_from_runs.py` 直接複用 `run_ns3.align_and_compare`，兩者不致分歧：
 
 ```bash
 python3 scripts/calibrate_from_runs.py --out runs/calibration_aligned.csv \
@@ -306,7 +306,7 @@ LLM 工作負載，相同對齊方式：
 | `qwen05b` | 2 | 573.08 ms | 3,393.27 ms | **−83.1%** | — |
 | `qwen15b_tp` | 2 | 392.25 ms | 5,918.81 ms | **−93.4%** | `per_iter_granularity_mismatch` |
 
-> 對封包 payload（1,000–8,000 B）、逐鏈路延遲（12.5–14 µs）與 QCN 開關的系統性掃描顯示：ResNet-50 的 ns-3 通訊時間在所有設定下都落在 14.0–15.1 ms，也就是每一組都比實測值低 5–12%。殘差對所有可調參數都不敏感。排程受限型的工作負載（CIFAR-10、兩個 Qwen trace）被低估得多得多，因為 ns-3 有建模資料傳輸，卻沒有建模集合排程與 backward 計算之間的同步等待。該成分屬於共用的 trace 與排程，三種拓撲完全相同，因此不會進入相對比較。
+> 對封包 payload（1,000–8,000 B）、逐鏈路延遲（12.5–14 µs）與 QCN 開關的系統性掃描顯示：ResNet-50 的 ns-3 通訊時間在所有設定下都落在 14.0–15.1 ms，也就是每一組都比實測值低 5–12%。殘差對所有可調參數都不敏感。排程受限型的工作負載（CIFAR-10、兩個 Qwen trace）低估幅度顯著更大，因為 ns-3 有建模資料傳輸，卻沒有建模集合排程與 backward 計算之間的同步等待。該成分屬於共用的 trace 與排程，三種拓撲完全相同，因此不會進入相對比較。
 
 ---
 
@@ -358,12 +358,12 @@ python scripts/run_ns3.py \
 
 ## 7. 支援量測工具
 
-以下腳本拆解 AllReduce 成本的*實測*側，讓 §5 的 ns-3 落差可以被歸因而不是用猜的。輸出都落在 `runs/calibration/`。
+以下腳本拆解 AllReduce 成本的*實測*側，使 §5 的 ns-3 落差可被歸因，而非僅能推測。輸出都落在 `runs/calibration/`。
 
 | 腳本 | 量測內容 | 輸出 |
 |---|---|---|
 | `bucket_micro_allreduce.py` | 以 ET 解出的 DDP bucket 尺寸執行 `torch.distributed.all_reduce`，GPU 上沒有其他工作——無競爭下限。刻意走 PyTorch 路徑（而非 rccl-tests），因為那才是 trace 紀錄的路徑；每次 `all_reduce` 各自用一對 CUDA event 包起來，對應 Kineto 回報單一 kernel 的方式 | `q2_micro.csv` |
-| `q4_overlap_off.py` | 同樣的 bucket，放在真實訓練迴圈內，但等 backward 完全結束後才發出——有框架成本、無競爭。第一階段以 DDP comm hook 記錄真實 bucket 尺寸，而非臆測 `bucket_cap_mb`；記錄到的多重集合必須與 ET 解出的尺寸相符 | `q4_overlap_off.csv` |
+| `q4_overlap_off.py` | 同樣的 bucket，放在真實訓練迴圈內，但等 backward 完全結束後才發出——有框架成本、無競爭。第一階段以 DDP comm hook 記錄並印出每步的 bucket 尺寸，而非臆測 `bucket_cap_mb`。要確認兩邊量的是同一批 collective，請將該輸出與 ET 中記錄的尺寸清單比對——用 `python src/tests/validate_et.py --prefix <tag>` 取得（需在容器內執行，它會 import `chakra`） | `q4_overlap_off.csv` |
 | `fit_envelope.py` | 對 rccl-tests 掃描與 ns-3 逐 collective 的 COMM interval 各自擬合 `T(M) = α + M/B`，再逐 bucket 相減。模型對參數為線性，普通最小平方即為精確解，不需要 scipy | `step1_rccl_sweep.csv`、`ns3_collective_times.csv`、`envelope_fit_table.md` |
 | `gen_envelope_figures.py` | 畫出實測 RCCL 路徑與 ns-3 的 `T(M)` 與 `BW(M)` | `fig_envelope_T.png`、`fig_envelope_BW.png` |
 | `gen_figures_science.py` | 論文圖表（IEEE 樣式） | `thesis_figures/` |

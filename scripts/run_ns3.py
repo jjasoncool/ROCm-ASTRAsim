@@ -22,12 +22,12 @@ ASTRA-sim NS-3 網路模擬器執行腳本
 主要特性：
 - PyTorch Kineto trace 分析，提取 real_t_step_ms 和 real_t_comm_ms
 - ASTRA-sim stdout.log 週期數解析 (Wall/Comm cycles)
-- 自動校準 alpha_us (微秒/週期)，導出 metrics.csv 和 calibration_all.csv
+- 自動校準 alpha_us (微秒/週期)，導出 metrics.csv 並追加至 --calib-db（預設 runs/calibration_aligned.csv）
 - A-保護機制：檢測並標記不可信的通訊時間測量
 
 輸出文件：
 - out/metrics.csv: 單次執行的詳細指標
-- runs/calibration_all.csv: 所有校準結果的彙總資料庫
+- runs/calibration_aligned.csv: 校準結果彙總（--calib-db 預設值）；calibration_all.csv 是視窗對齊前的舊 log
 - stdout.log: 完整的模擬執行日誌
 - command.txt: 實際執行的命令記錄
 
@@ -93,8 +93,17 @@ def list_et_rank_files(workload_dir: Path, tag: str = None) -> dict[int, Path]:
             # (例如 tag="net" 會錯誤匹配 "et.resnet50")，導致錯誤的 world size 計算
             if tag and m.group("prefix") != f"et.{tag}":
                 continue
-            files[int(m.group("rank"))] = p
-    return dict(sorted(files.items()))
+            files.setdefault(m.group("prefix"), {})[int(m.group("rank"))] = p
+    # 未給 tag 而目錄裡有多種 prefix 時，依 rank 合併會讓後掃到的模型覆蓋前者，
+    # ET 與 trace 也會各自選到不同的模型，校準就拿甲模型的模擬去比乙模型的實測。
+    if not tag and len(files) > 1:
+        raise SystemExit(
+            f"[ERR] {workload_dir} 含多種 workload（{', '.join(sorted(files))}），"
+            f"請用 --model-tag 指定其中一個。")
+    merged = {}
+    for ranks in files.values():
+        merged.update(ranks)
+    return dict(sorted(merged.items()))
 
 def count_world_size(workload_dir: Path, tag: str = None) -> int:
     et_map = list_et_rank_files(workload_dir, tag)
@@ -154,7 +163,9 @@ def infer_nodes_from_topo_filename(path: Path) -> int | None:
     return int(m.group(1)) if m else None
 
 def guess_phys_topo(topos_dir: Path, world: int) -> Path | None:
-    cands = list(topos_dir.glob(f"{world}_nodes_*_topology.txt"))
+    # 排序後再取：Path.glob 不保證順序，未排序時選到哪個拓撲取決於檔案系統，
+    # 同一條命令在兩台機器上可能跑到不同的網路。
+    cands = sorted(topos_dir.glob(f"{world}_nodes_*_topology.txt"))
     return cands[0].resolve() if cands else None
 
 # -------------------- Patch system.json / ns-3 config.txt --------------------
@@ -239,10 +250,13 @@ def patch_network_cfg(src: Path, out: Path, *,
         "QLEN_MON_FILE":     Path("/dev/null") if no_qlen else out_dir / "qlen.txt",
     }
     for k, v in out_targets.items():
-        v.parent.mkdir(parents=True, exist_ok=True, mode=0o777)
-        v.parent.chmod(0o777)
-        if not v.exists():
-            v.touch()
+        # /dev/null（--no-qlen）不是本次 run 的輸出檔：不要建目錄、不要 chmod /dev，
+        # 也不要 touch 它。只把路徑寫進設定即可。
+        if v != Path("/dev/null"):
+            v.parent.mkdir(parents=True, exist_ok=True, mode=0o777)
+            v.parent.chmod(0o777)
+            if not v.exists():
+                v.touch()
         lines2 = replace_key(lines2, k, v)
 
     new_lines = [f"FLOW_FILE {flow_placeholder.as_posix()}"]
@@ -589,14 +603,16 @@ def _dur_units_to_ms(ev_obj: dict, dur_val: float) -> float:
 
 def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[float | None, dict, int | None]:
     """
-    掃描 trace 群組，回傳多項 real metrics，用於研究比較（Strategy C 默認行為）：
-      • real_t_step_ms: per-step wall time（median of per-rank medians）
-      • real_t_net_comm_ms: per-step network-only communication time（只算 name 含 '|bytes=' 且非 kernel 的事件）
-      • real_t_kernel_ms: per-step GPU NCCL kernel time（kernel 類事件或 name 含 nccldevkernel）
+    掃描 trace 群組，回傳 (real_t_step_ms, per_rank_stats, used_epoch)：
+      • real_t_step_ms: 各 rank 穩態步長中位數的中位數。步長取自去巢狀後的
+        user_annotation ProfilerStep，且視窗內第一個迭代視為暖身丟棄。
+      • per_rank_stats: {rank: {kernels, net_ms_total, kernel_ms_total,
+        steps_n, trace_iters, per_iter_kernels}}
+          - net_ms_total: 名稱含 nccldevkernel/ncclkernel/rcclkernel 的 GPU kernel 時長總和
+          - kernel_ms_total: 其餘 cat 含 kernel 的 GPU 計算 kernel 時長總和
+          - steps_n: 去重後 ProfilerStep 名稱數，為巢狀計數，僅供診斷
       • used_epoch: 選用的 epoch id
-
-    回傳: (real_t_step_ms, real_t_net_comm_ms, real_t_kernel_ms, used_epoch)
-    為向後相容，呼叫端若只解包三個值則會拿到 (step, net_comm, used_epoch)
+    視窗對齊不在這裡做，由 align_and_compare 依迭代數處理。
     """
     groups = list_trace_groups(trace_dir, tag)
     if not groups:
@@ -612,6 +628,8 @@ def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[
     for r, p in sorted(ranks.items()):
         obj = _load_json(p)
         if not obj:
+            # 靜默丟棄會讓 real_t_step_ms 悄悄退化成單一 rank 的值。
+            print(f"[WARN] rank{r} 的 trace {p} 無法解析，已排除；real metrics 將只來自其餘 rank。")
             continue
 
         # steps list and count — deduplicate by step number
@@ -646,11 +664,13 @@ def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[
             lname = name.lower()
             lcat = cat.lower()
 
-            # step durations collected for step median (use deduplicated step_map)
-            if KINETO_STEP_PAT.match(name) and name in step_map and ev is step_map[name]:
-                step_durations.append(d_ms)
+            # 只收下 user_annotation 的區間與時長，不在這裡依名稱去重：同一個
+            # ProfilerStep#N 可能有兩個互不重疊的 user_annotation，依名稱去重會依
+            # 檔案順序丟掉其中一個，讓 real_t_step_ms 取決於事件在 JSON 裡的先後。
+            # 真實迭代與 step 時長都留到下面由同一組去巢狀結果決定。
             if KINETO_STEP_PAT.match(name) and lcat == 'user_annotation':
-                step_spans.append((ev.get('ts', 0.0), ev.get('ts', 0.0) + ev.get('dur', 0.0)))
+                ts0 = ev.get('ts', 0.0)
+                step_spans.append((ts0, ts0 + ev.get('dur', 0.0), d_ms))
 
             # 邏輯：區分三類事件
             # (a) NCCL/RCCL 通訊 kernel（如 ncclDevKernel_Generic_4）→ net_comm
@@ -675,18 +695,32 @@ def extract_real_metrics_from_traces(trace_dir: Path, tag: str = None) -> tuple[
                 kernel_ms_total += d_ms
             # (c) CPU 端 nccl:all_reduce 等 annotation → 不計入（已由 GPU kernel 覆蓋）
 
-        if step_durations:
-            per_rank_step_medians.append(median(step_durations))
         # 別除 steps_n：它與 comm 視窗沒有固定關係，除下去等於混單位。
-        # 視窗由呼叫端用 collective 數對齊。
+        # 視窗由呼叫端（align_and_compare）依迭代數對齊，不用 collective 數。
         # ProfilerStep 是三層巢狀（外框 + 內層真步 + gpu 鏡射）。天真計數會把
         # 一次迭代數成兩三次——這正是舊 steps_n 除數的來源。只保留未被任何
         # 其他區間包住的 user_annotation，才是真實迭代。
         iters = []
-        for a, b in sorted(step_spans, key=lambda s: (s[0], -s[1])):
-            if not any(a >= x and b <= y for x, y in iters):
-                iters.append((a, b))
-        per_iter_kernels = [sum(1 for t in comm_kernel_ts if a <= t <= b) for a, b in iters]
+        for a, b, d_ms in sorted(step_spans, key=lambda s: (s[0], -s[1])):
+            if not any(a >= x and b <= y for x, y, _ in iters):
+                iters.append((a, b, d_ms))
+        # step 時長必須取自這同一組區間。混入被包住的內層區間，會讓中位數變成
+        # 「外框與其子區間的平均」——一個沒有任何 ProfilerStep 真正有過的時長，
+        # 而且它會直接成為 alpha_us 的分子。
+        #
+        # 再丟掉視窗內的第一個迭代：即使 --trace-wait 已經略過暖身，錄製視窗的
+        # 第一步仍系統性偏高（profiler 啟動、allocator 成長、kernel autotune）。
+        # 實測差距可達 4 倍（qwen15b_tp 為 5713 / 1412 ms），兩者取中位數同樣會
+        # 產生一個沒有任何迭代真正有過的值。α 要代表的是穩態的一步。
+        step_durations = [d for _, _, d in iters]
+        if len(step_durations) > 1:
+            step_durations = step_durations[1:]
+        elif step_durations:
+            print(f"[WARN] rank{r} 視窗只有 1 個迭代，無暖身可丟；"
+                  f"real_t_step_ms 含首次迭代的額外開銷。")
+        if step_durations:
+            per_rank_step_medians.append(median(step_durations))
+        per_iter_kernels = [sum(1 for t in comm_kernel_ts if a <= t <= b) for a, b, _ in iters]
 
         per_rank_stats[r] = {
             "kernels": comm_kernel_count,
@@ -718,7 +752,9 @@ def parse_astra_stdout_cycles(stdout_path: Path) -> tuple[int | None, int | None
       • 若只抓到 wall，comm 回傳 None（避免誤把 wall 當 comm）。
     """
     if not stdout_path.exists():
-        return None, None
+        # 呼叫端（main 與 calibrate_from_runs）都解三個值；回傳兩個會變成難以診斷的 ValueError。
+        print(f"[WARN] 找不到 {stdout_path}，無法解析模擬 cycles。")
+        return None, None, None
 
     s = stdout_path.read_text(encoding="utf-8", errors="ignore")
 
@@ -939,8 +975,12 @@ def detect_compute_nodes_in_et(workload_dir: Path, tag: str = None, sample_limit
 
 # ---------- metrics / calibration 輸出 ----------
 def _row_key_for_dedup(row: dict) -> str:
-    """對 calibration_all.csv 做去重用的 key。"""
-    cols = ["world","logical_dims","topo_desc","qcn","pfc_dyn","buffer","payload","coll_opt","lmbw"]
+    """對 --calib-db 做去重用的 key。"""
+    # tag 與 et_iterations 必須進 key：少了 tag，不同 workload 只靠數值比對才不會
+    # 互相吃掉；少了 et_iterations，同一個 workload 以不同視窗重算的結果會被當成
+    # 重複而丟棄。寧可多留一列，也不要靜默少一列。
+    cols = ["tag","world","logical_dims","topo_desc","qcn","pfc_dyn","buffer",
+            "payload","coll_opt","lmbw","et_iterations"]
     base = "|".join(str(row.get(c,"")) for c in cols)
     return hashlib.md5(base.encode("utf-8")).hexdigest()
 
@@ -1003,7 +1043,7 @@ def _append_calibration_db(db_path: Path, row: dict) -> None:
                 same = False
                 break
             if same:
-                print(f"[INFO] calibration_all.csv 已有相同條目，略過追加。")
+                print(f"[INFO] {db_path.name} 已有相同條目，略過追加。")
                 return
 
     # 3) 追加一筆（確保用 CALIB_FIELDS 順序）
@@ -1450,6 +1490,11 @@ def main():
     if ret_code != 0:
         raise SystemExit(f"[ERR] 模擬執行失敗 (Code {ret_code})")
 
+    # A-保護用的 Compute 節點偵測必須在 cleanup 之前做：cleanup 會刪掉
+    # workload_dir2 裡的 .et，之後再偵測只會看到空目錄，於是每個 --virtual-world
+    # 的 run 都被判成「ET 沒有 Compute 節點」。
+    has_compute_nodes = detect_compute_nodes_in_et(workload_dir2, args.model_tag)
+
     # 虛擬擴張成功跑完後，清理重複的 expanded ET，只保留 expansion_map.json
     if expansion_meta and expansion_meta.get("expanded"):
         removed = cleanup_expanded_workload(expansion_meta["expanded_dir"])
@@ -1479,7 +1524,11 @@ def main():
     real_t_net_comm_rank0 = None
     real_t_net_comm_rank1 = None
 
-    if not args.no_autocalib and count_world_size(workload_dir, args.model_tag) == 2:
+    # 看實際模擬規模，不是來源 workload：虛擬擴張後來源仍是 2 rank，看來源會讓
+    # 128 節點的 run 拿 2-GPU trace 去算 α 與誤差，寫出一列看似合理實則無意義的指標。
+    if not args.no_autocalib and actual_world != 2:
+        print(f"[INFO] 模擬規模為 {actual_world}，auto calibration 只在 2 GPU 時有意義，略過。")
+    if not args.no_autocalib and actual_world == 2:
         if trace_dir.exists():
             real_t_step_ms, per_rank_stats, used_epoch = \
                 extract_real_metrics_from_traces(trace_dir, args.model_tag)
@@ -1531,7 +1580,7 @@ def main():
 
     # ---------- A-保護：Comm==Wall 與 ET 是否有 Compute ----------
     flags: list[str] = list(calib["flags"])
-    has_compute_nodes = detect_compute_nodes_in_et(workload_dir2, args.model_tag)
+    # has_compute_nodes 已在 cleanup 之前算好（見上方），此處不可重算。
     comm_equals_wall = (sim_cycles_step is not None and sim_cycles_comm is not None and sim_cycles_comm == sim_cycles_step)
 
     if comm_equals_wall:
@@ -1550,8 +1599,10 @@ def main():
 
     # 匯出 metrics
     row = {
-        # 只有 2-GPU 且有實測值才算校準
-        "mode": "calibrate" if (count_world_size(workload_dir, args.model_tag) == 2 and real_t_step_ms is not None) else "simulate",
+        # 只有 2-GPU 且有實測值才算校準。這裡必須看實際模擬規模 actual_world，
+        # 不是來源 workload：虛擬擴張後來源仍是 2 rank，看來源會把 128 節點的 run
+        # 標成 calibrate 並寫進權威校準 DB。
+        "mode": "calibrate" if (actual_world == 2 and real_t_step_ms is not None) else "simulate",
         "tag": args.model_tag if args.model_tag else "",
         "calib_id": used_epoch if used_epoch is not None else "",
         "world": actual_world,
@@ -1600,7 +1651,8 @@ def main():
         print("-" * 72)
         if real_t_step_ms is not None and alpha_us is not None:
             print(f"  Wall-clock:  real = {real_t_step_ms:.2f} ms | α_step = {alpha_us:.6f} μs/cycle")
-        if ns3_comm_ms_aligned is not None and real_t_net_comm_ms is not None:
+        if (ns3_comm_ms_aligned is not None and real_t_net_comm_ms is not None
+                and ns3_signed_err_comm is not None):
             direction = "overestimate" if ns3_signed_err_comm > 0 else "underestimate"
             print(f"  視窗:        rank{selected_rank} kernels={trace_kernel_count} | "
                   f"ET collectives={et_collective_count} | ratio={window_ratio}")

@@ -54,7 +54,9 @@ def main():
         et_n = R.count_et_collectives(Path(args.workload), tag)
         calib = R.align_and_compare(per_rank, et_n, step_c, comm_c, real_step, iters)
 
-        print(f"  sim_cycles_comm={comm_c:,}  et_collectives={et_n}  "
+        print(f"  sim_cycles_comm={comm_c:,} " if comm_c is not None else "  sim_cycles_comm=(缺) ",
+              end="")
+        print(f" et_collectives={et_n}  "
               f"selected_rank={calib['selected_rank']}  window_ratio={calib['window_ratio']}")
         if calib["ns3_signed_err_comm"] is not None:
             print(f"  ns3_aligned={calib['ns3_comm_ms_aligned']:.6f} ms  "

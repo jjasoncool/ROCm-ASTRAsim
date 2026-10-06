@@ -391,7 +391,10 @@ def fig_5_3():
     fig, ax1 = plt.subplots(figsize=(4.5, 3.2))
 
     # X-axis: comm_size labels (not linear scale — use categorical)
-    comm_sizes = ['AllReduce\n(~90 MiB)', '100 MB\nAll-to-All', '512 MB\nAll-to-All', '1 GB\nAll-to-All']
+    # scienceplots 的 'science' 樣式會開 usetex，而 LaTeX 把裸的 ~ 當成不斷行空格，
+    # 標籤會被渲染成 '( 90 MiB)'。用 \textasciitilde 才會真的印出波浪號。
+    _approx = r'\textasciitilde' if plt.rcParams.get('text.usetex', False) else '~'
+    comm_sizes = [f'AllReduce\n({_approx}90 MiB)', '100 MB\nAll-to-All', '512 MB\nAll-to-All', '1 GB\nAll-to-All']
     x = np.arange(len(comm_sizes))
 
     topos = ['Fat-Tree', 'Std. Torus', 'Twisted Torus']

@@ -335,24 +335,18 @@ python scripts/run_ns3.py \
 
 ### 步驟 3：檢查輸出結果
 
-從 `out/metrics.csv`、`stdout.log` 與輸出目錄中的其他統計檔案檢查模擬結果，例如：
+從 `out/metrics.csv`、`stdout.log` 與輸出目錄中的其他統計檔案檢查模擬結果。128 節點必須加 `--no-autocalib`，該次 run 沒有自己的 α，因此 `sim_t_step_ms` 等 `*_ms` 欄位都是空的。請改用一定有值的 cycle 數比較拓撲：
 
-- `sim_t_step_ms`
-- communication / wall time
-- 各 rank 統計資訊
-
-建議重點觀察下列參數與其對應關係：
-
-- **`sim_t_step_ms`**：整體步驟時間，用來比較不同拓撲下的最終執行時間差異。
-- **communication / wall time ratio**：觀察通訊時間在總時間中的占比；比例越高，代表 workload 越偏向 communication-bound。
-- **per-rank statistics**：檢查是否有特定 rank 明顯較慢，協助辨識負載不均或局部壅塞。
+- **`sim_cycles_step`**：以模擬器 cycle 表示的整體步驟時間，用來比較不同拓撲的最終執行時間。拓撲之間的比值不需換算，因為 α 會對消；若要毫秒，乘上你 2-GPU 校準列的 `alpha_us` 再除以 1000。
+- **`sim_cycles_comm / sim_cycles_step`**：通訊在總時間中的占比；比例越高，代表 workload 越偏向 communication-bound。
+- **`stdout.log` 中各 rank 的輸出**：檢查是否有特定 rank 明顯較慢，協助辨識負載不均或局部壅塞。
 - **`fct.txt` / 其他輸出統計檔**：可用來確認模擬仍持續進行，並觀察流量完成情況。
 
 在拓撲比較上，可將這些指標對照來看：
 
-- 若不同拓撲的 **`sim_t_step_ms` 幾乎相同**，通常表示通訊仍被計算遮蔽，拓撲差異尚未顯現。
-- 若 **communication / wall time ratio 上升** 且 `sim_t_step_ms` 開始分化，通常表示已進入拓撲敏感區間。
-- 若某一拓撲在 **相近 communication ratio 下仍有較低的 `sim_t_step_ms`**，可解讀為該拓撲在此工作負載下具有較佳的通訊效率或負載平衡效果。
+- 若不同拓撲的 **`sim_cycles_step` 幾乎相同**，通常表示通訊仍被計算遮蔽，拓撲差異尚未顯現。
+- 若 **通訊占比上升** 且 `sim_cycles_step` 開始分化，通常表示已進入拓撲敏感區間。
+- 若某一拓撲在 **相近通訊占比下仍有較低的 `sim_cycles_step`**，可解讀為該拓撲在此工作負載下具有較佳的通訊效率或負載平衡效果。
 
 ---
 
@@ -363,14 +357,54 @@ python scripts/run_ns3.py \
 | 腳本 | 量測內容 | 輸出 |
 |---|---|---|
 | `bucket_micro_allreduce.py` | 以 ET 解出的 DDP bucket 尺寸執行 `torch.distributed.all_reduce`，GPU 上沒有其他工作——無競爭下限。刻意走 PyTorch 路徑（而非 rccl-tests），因為那才是 trace 紀錄的路徑；每次 `all_reduce` 各自用一對 CUDA event 包起來，對應 Kineto 回報單一 kernel 的方式 | `q2_micro.csv` |
-| `q4_overlap_off.py` | 同樣的 bucket，放在真實訓練迴圈內，但等 backward 完全結束後才發出——有框架成本、無競爭。第一階段以 DDP comm hook 記錄並印出每步的 bucket 尺寸，而非臆測 `bucket_cap_mb`。要確認兩邊量的是同一批 collective，請將該輸出與 ET 中記錄的尺寸清單比對——用 `python src/tests/validate_et.py --prefix <tag>` 取得（需在容器內執行，它會 import `chakra`） | `q4_overlap_off.csv` |
+| `q4_overlap_off.py` | 同一批 bucket，取自一次真實的 Qwen 0.5B 訓練步。DDP 的 comm hook 對每個真實的 bucket buffer 執行集合操作，但事先以 `torch.cuda.synchronize()` 清空 GPU，因此 backward 暫停、傳輸不與任何運算重疊。兩個 CUDA event 之間只有 `dist.all_reduce` 這一個呼叫——DDP 自己的分桶、梯度複製與平均都在其外，所以本欄**不**量測 DDP 框架開銷。它相對於 `q2_micro` 多出的，是每個集合操作都單獨發到閒置的 GPU 上，因此每次呼叫的啟動延遲、以及等待對端 rank 的時間，都落在計時區間內。兩個階段共用一個 hook（DDP 每個實例只能註冊一次）。第一階段以記錄模式執行該 hook，每個 warmup step 前清空累積器，因此印出的正好是一步的 bucket，而非從 `bucket_cap_mb` 推測。要確認兩邊量的是同一批 collective，請將該輸出與 `python src/tests/validate_et.py --prefix et.qwen05b` 的結果比對（需在容器內執行，它會 import `chakra`） | `q4_overlap_off.csv` |
 | `fit_envelope.py` | 對 rccl-tests 掃描與 ns-3 逐 collective 的 COMM interval 各自擬合 `T(M) = α + M/B`，再逐 bucket 相減。模型對參數為線性，普通最小平方即為精確解，不需要 scipy | `step1_rccl_sweep.csv`、`ns3_collective_times.csv`、`envelope_fit_table.md` |
-| `gen_envelope_figures.py` | 畫出實測 RCCL 路徑與 ns-3 的 `T(M)` 與 `BW(M)` | `fig_envelope_T.png`、`fig_envelope_BW.png` |
+| `gen_envelope_figures.py` | 畫出實測 RCCL 路徑與 ns-3 的 `T(M)` 與 `BW(M)`。`step1_rccl_sweep.csv` 與 `q2_micro.csv` 是即時讀取，但 ns-3 那一組資料點與兩條擬合線是**硬編碼**的（`SIM_POINTS`、`A_REAL/B_REAL/A_SIM/B_SIM`），抄自 `ns3_collective_times.csv` 與 `envelope_fit_table.md`——重跑擬合不會更新它們 | `fig_envelope_T.png`、`fig_envelope_BW.png` |
 | `gen_figures_science.py` | 論文圖表（IEEE 樣式） | `thesis_figures/` |
 
-三個欄位合起來是：無競爭（`q2_micro`）、有框架成本但無競爭（`q4_overlap_off`）、以及與 backward 競爭的實地執行（Kineto trace）。相減即可分離出實測 RCCL kernel 時間中有多少是 ns-3 有建模的資料傳輸，有多少是它沒建模的同步等待。
+三個欄位以逐步減少的隔離程度，計時同一批集合操作。`q2_micro` 在 barrier 之後對獨立 tensor 連續排入，啟動延遲被遮蔽、各 rank 保持同步。`q4_overlap_off` 從真實訓練步內部，把每一個集合操作單獨發到閒置的 GPU 上，因此每次呼叫的啟動延遲與等待對端 rank 的時間都落在計時區間內，運算則不在。Kineto trace 記錄的是 RCCL kernel 在實地執行時自身的時間跨度，旁邊有 backward 同時在跑。三者都不包含 DDP 的分桶、梯度複製或平均，而且相鄰兩欄的差異不只一個因素——請把欄位間的落差讀成啟動、rank 偏移與運算競爭效應的上下界，而非乾淨的歸因，更不是 DDP 框架開銷。
 
 `fit_envelope.py` 的 ns-3 側輸入來自 `rocm/patches/statistics_comm_intervals.py` 加進 ASTRA-sim statistics pass 的 `COMM interval` 行，因此容器必須以 `ASTRA_PATCHES=all`（預設值）建置，這些輸入才會存在。
+
+### 這些工具需要的輸入
+
+以下指令會用到兩個輸入，但**`scripts/` 裡沒有任何腳本會產生它們**，必須先自行備妥。
+
+`runs/calibration/bucket_sizes.json` 是從各 ET 解出的 `ALL_REDUCE` `comm_size` 相異值集合。在容器內重新產生：
+
+```bash
+python3 - <<'PY'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, "scripts")
+from chakra.schema.protobuf.et_def_pb2 import ALL_REDUCE
+from run_ns3 import _read_all_nodes
+
+out = {}
+for tag in ("resnet50", "cifar10", "qwen05b"):
+    _, nodes = _read_all_nodes(Path(f"data/chakra/workload_et/et.{tag}.0.et"))
+    out[tag] = sorted({a.int64_val for n in nodes for a in n.attr
+                       if a.name == "comm_size"
+                       and any(x.name == "comm_type" and x.int64_val == ALL_REDUCE
+                               for x in n.attr)})
+import os; os.makedirs("runs/calibration", exist_ok=True)   # runs/ 被 gitignore
+json.dump(out, open("runs/calibration/bucket_sizes.json", "w"), indent=2)
+PY
+```
+
+`runs/calibration/step1_rccl_sweep_raw.log` 是 `fit_envelope.py` 用來擬合實測側的 rccl-tests 原始掃描結果——五次獨立重複、FP32、8 B 至 512 MB：
+
+```bash
+mkdir -p runs/calibration   # runs/ 被 gitignore
+docker exec -w /workspace/rccl-tests/build rocm-horovod bash -lc \
+  'for r in 1 2 3 4 5; do echo "===== RUN $r ====="; \
+   ./all_reduce_perf -b 8 -e 512M -f 2 -d float -g 2 -w 20 -n 100 2>&1; done' \
+  > runs/calibration/step1_rccl_sweep_raw.log 2>&1
+```
+
+此外 `q4_overlap_off.py` 會從 `--model-dir`（預設 `/workspace/data/models`）的 HuggingFace 快取載入 FP32 的 Qwen2.5-0.5B，執行前該快取必須已備妥。
+
+### 執行方式
 
 ```bash
 # 在 rocm-horovod 容器內執行；/workspace/runs 為 bind mount

@@ -342,24 +342,18 @@ python scripts/run_ns3.py \
 
 ### Step 3: Inspect output metrics
 
-Inspect `out/metrics.csv`, `stdout.log`, and related output files to review results such as:
+Inspect `out/metrics.csv`, `stdout.log`, and related output files. With `--no-autocalib` (required at 128 nodes) the run has no α of its own, so `sim_t_step_ms` and the other `*_ms` columns are blank. Compare topologies on the cycle counts, which are always populated:
 
-- `sim_t_step_ms`
-- communication / wall time
-- per-rank statistics
-
-The following metrics are especially useful and should be interpreted together:
-
-- **`sim_t_step_ms`**: end-to-end step time, used to compare final execution time across topologies.
-- **communication / wall time ratio**: indicates how communication-dominated the workload is; a higher ratio suggests a more communication-bound regime.
-- **per-rank statistics**: useful for checking whether a subset of ranks is lagging behind, which may indicate imbalance or localized congestion.
+- **`sim_cycles_step`**: end-to-end step time in simulator cycles, used to compare final execution time across topologies. Ratios between topologies need no conversion, because α cancels; for milliseconds, multiply by the `alpha_us` from your 2-GPU calibration row and divide by 1000.
+- **`sim_cycles_comm / sim_cycles_step`**: how communication-dominated the workload is; a higher ratio suggests a more communication-bound regime.
+- **per-rank lines in `stdout.log`**: useful for checking whether a subset of ranks is lagging behind, which may indicate imbalance or localized congestion.
 - **`fct.txt` and related output statistics**: useful for confirming that the simulation is still making progress and for inspecting flow-completion behavior.
 
 For topology comparison, these metrics can be read together as follows:
 
-- If different topologies have nearly identical **`sim_t_step_ms`**, communication is likely still hidden by computation and topology effects are not yet exposed.
-- If the **communication / wall time ratio increases** and `sim_t_step_ms` begins to diverge across topologies, the workload is entering a topology-sensitive regime.
-- If one topology achieves a lower **`sim_t_step_ms`** under a similar communication ratio, it suggests better communication efficiency or load balancing for that workload.
+- If different topologies have nearly identical **`sim_cycles_step`**, communication is likely still hidden by computation and topology effects are not yet exposed.
+- If the **communication / step ratio increases** and `sim_cycles_step` begins to diverge across topologies, the workload is entering a topology-sensitive regime.
+- If one topology achieves a lower **`sim_cycles_step`** under a similar communication ratio, it suggests better communication efficiency or load balancing for that workload.
 
 ---
 
@@ -370,14 +364,54 @@ These scripts decompose the *measured* side of the AllReduce cost, so the ns-3 g
 | Script | What it measures | Output |
 |---|---|---|
 | `bucket_micro_allreduce.py` | `torch.distributed.all_reduce` at the exact DDP bucket sizes decoded from the ET, with nothing else on the GPU — the contention-free floor. Uses the PyTorch path (not rccl-tests) because that is the path the traces recorded, and brackets each individual `all_reduce` with its own CUDA event pair, mirroring how Kineto reports a kernel | `q2_micro.csv` |
-| `q4_overlap_off.py` | The same buckets inside the real training loop, but issued only after backward has fully completed — framework cost present, contention absent. Phase 1 registers a DDP comm hook that records and prints the per-step bucket sizes rather than guessing at `bucket_cap_mb`. To confirm both sides time the same collectives, compare that printout against the ET's own list, which `python src/tests/validate_et.py --prefix <tag>` prints (run it in the container — it imports `chakra`) | `q4_overlap_off.csv` |
+| `q4_overlap_off.py` | The same buckets, taken from a real Qwen 0.5B training step. DDP's comm hook runs the collective on each real bucket buffer, but first drains the GPU with `torch.cuda.synchronize()`, so backward is paused and nothing overlaps the transfer. Only the `dist.all_reduce` call sits between the two CUDA events — DDP's own bucketing, gradient copy and averaging run outside them, so this column does **not** measure DDP framework overhead. What it adds over `q2_micro` is that each collective is launched alone onto an idle GPU, which puts per-call launch latency and any wait for the peer rank inside the window. One hook serves both phases (DDP allows only one per instance). Phase 1 runs it in record mode, clearing its accumulator before every warmup step, so the printout is exactly one step's buckets rather than a guess from `bucket_cap_mb`. To confirm both sides time the same collectives, compare that printout against `python src/tests/validate_et.py --prefix et.qwen05b` (run it in the container — it imports `chakra`) | `q4_overlap_off.csv` |
 | `fit_envelope.py` | Fits `T(M) = α + M/B` independently to the rccl-tests sweep and to ns-3's per-collective COMM intervals, then differences them per bucket. Ordinary least squares — the model is linear in its parameters, so no scipy | `step1_rccl_sweep.csv`, `ns3_collective_times.csv`, `envelope_fit_table.md` |
-| `gen_envelope_figures.py` | Plots `T(M)` and `BW(M)` for the measured RCCL path against ns-3 | `fig_envelope_T.png`, `fig_envelope_BW.png` |
+| `gen_envelope_figures.py` | Plots `T(M)` and `BW(M)` for the measured RCCL path against ns-3. Reads `step1_rccl_sweep.csv` and `q2_micro.csv` live, but the ns-3 series and both fit lines are **hardcoded** (`SIM_POINTS`, `A_REAL/B_REAL/A_SIM/B_SIM`), transcribed from `ns3_collective_times.csv` and `envelope_fit_table.md` — re-running the fits does not update them | `fig_envelope_T.png`, `fig_envelope_BW.png` |
 | `gen_figures_science.py` | Thesis figures (IEEE style) | `thesis_figures/` |
 
-The three columns together are: contention-free (`q2_micro`), framework-present but contention-free (`q4_overlap_off`), and in-situ racing a backward pass (the Kineto trace). Differencing them isolates how much of the measured RCCL kernel time is transfer — which ns-3 models — and how much is synchronization wait, which it does not.
+The three columns time the same collectives with progressively less isolation. `q2_micro` enqueues them back to back on a standalone tensor after a barrier, so launch latency is hidden and the ranks stay in lockstep. `q4_overlap_off` runs each one alone on an idle GPU from inside a real training step, so per-call launch latency and any wait for the peer rank fall inside its window, while compute does not. The Kineto trace records the RCCL kernel's own span in situ, with backward running alongside. None of the three brackets DDP's bucketing, gradient copy or averaging, and adjacent columns differ in more than one factor — read the gaps as bounds on launch, skew and contention effects, not as a clean attribution and not as DDP framework overhead.
 
 `fit_envelope.py` reads ns-3's per-collective timings from the `COMM interval` lines that `rocm/patches/statistics_comm_intervals.py` adds to ASTRA-sim's statistics pass, so the container must be built with `ASTRA_PATCHES=all` (the default) for those inputs to exist.
+
+### Inputs these tools expect
+
+Two inputs are consumed by the commands below but produced by **nothing in `scripts/`**. Both have to exist first.
+
+`runs/calibration/bucket_sizes.json` is the distinct `ALL_REDUCE` `comm_size` set decoded from the ETs. Regenerate it inside the container:
+
+```bash
+python3 - <<'PY'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, "scripts")
+from chakra.schema.protobuf.et_def_pb2 import ALL_REDUCE
+from run_ns3 import _read_all_nodes
+
+out = {}
+for tag in ("resnet50", "cifar10", "qwen05b"):
+    _, nodes = _read_all_nodes(Path(f"data/chakra/workload_et/et.{tag}.0.et"))
+    out[tag] = sorted({a.int64_val for n in nodes for a in n.attr
+                       if a.name == "comm_size"
+                       and any(x.name == "comm_type" and x.int64_val == ALL_REDUCE
+                               for x in n.attr)})
+import os; os.makedirs("runs/calibration", exist_ok=True)   # runs/ is gitignored
+json.dump(out, open("runs/calibration/bucket_sizes.json", "w"), indent=2)
+PY
+```
+
+`runs/calibration/step1_rccl_sweep_raw.log` is the raw rccl-tests envelope sweep that `fit_envelope.py` fits the measured side to — five independent repeats, FP32, 8 B to 512 MB:
+
+```bash
+mkdir -p runs/calibration   # runs/ is gitignored
+docker exec -w /workspace/rccl-tests/build rocm-horovod bash -lc \
+  'for r in 1 2 3 4 5; do echo "===== RUN $r ====="; \
+   ./all_reduce_perf -b 8 -e 512M -f 2 -d float -g 2 -w 20 -n 100 2>&1; done' \
+  > runs/calibration/step1_rccl_sweep_raw.log 2>&1
+```
+
+`q4_overlap_off.py` additionally loads Qwen2.5-0.5B in FP32 from the HuggingFace cache at `--model-dir` (default `/workspace/data/models`), so that cache must be populated before it runs.
+
+### Running them
 
 ```bash
 # inside the rocm-horovod container; /workspace/runs is bind-mounted

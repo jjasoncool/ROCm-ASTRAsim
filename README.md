@@ -36,7 +36,7 @@ The configs here let you reproduce that comparison; the full analysis is in the 
 │   ├── run_ns3.py                 # Stage 3 — ASTRA-sim ns-3 orchestration + calibration
 │   ├── calibrate_from_runs.py     # Re-derive calibration from finished run dirs (no re-simulation)
 │   ├── bucket_micro_allreduce.py  # Contention-free AllReduce timing at the ET's DDP bucket sizes
-│   ├── q4_overlap_off.py          # Same buckets, in the training loop, gradient overlap disabled
+│   ├── q4_overlap_off.py          # Same buckets from a real step, each timed alone, no overlap
 │   ├── fit_envelope.py            # Fit T(M) = α + M/B for the RCCL path and for ns-3, then compare
 │   ├── gen_envelope_figures.py    # T(M) / BW(M) envelope figures
 │   ├── gen_figures_science.py     # Thesis figures (IEEE style)
@@ -304,7 +304,7 @@ Three scripts decompose the measured side of the AllReduce cost, so the ns-3 gap
 | Script | What it measures |
 |---|---|
 | `scripts/bucket_micro_allreduce.py` | `torch.distributed.all_reduce` at the exact DDP bucket sizes decoded from the ET, with nothing else on the GPU — the contention-free floor |
-| `scripts/q4_overlap_off.py` | The same buckets inside the real training loop but issued only after backward completes — framework cost present, contention absent |
+| `scripts/q4_overlap_off.py` | The same buckets from a real training step, each collective run alone on an idle GPU from inside DDP's comm hook — no overlap with backward. Only the `all_reduce` is timed; DDP's own bucketing and copies are not |
 | `scripts/fit_envelope.py` | Fits `T(M) = α + M/B` independently to the rccl-tests sweep and to ns-3's per-collective COMM intervals, then differences them per bucket |
 
 The Kineto trace supplies the third column: the same collectives racing a backward pass. `scripts/gen_envelope_figures.py` plots `T(M)` and `BW(M)` for both sides.

@@ -37,7 +37,7 @@
 │   ├── run_ns3.py                 # 階段 3 — ASTRA-sim ns-3 執行與校準
 │   ├── calibrate_from_runs.py     # 由既有 run 目錄重算校準,不需重跑模擬
 │   ├── bucket_micro_allreduce.py  # 以 ET 內的 DDP bucket 尺寸量測無競爭 AllReduce
-│   ├── q4_overlap_off.py          # 同樣的 bucket,在訓練迴圈內但關閉梯度重疊
+│   ├── q4_overlap_off.py          # 同一批 bucket,取自真實訓練步,逐一單獨計時,無重疊
 │   ├── fit_envelope.py            # 對 RCCL 路徑與 ns-3 各自擬合 T(M) = α + M/B 後逐 bucket 比對
 │   ├── gen_envelope_figures.py    # T(M) / BW(M) envelope 圖
 │   ├── gen_figures_science.py     # 論文圖表(IEEE 樣式)
@@ -304,7 +304,7 @@ python scripts/run_ns3.py \
 | 腳本 | 量測內容 |
 |---|---|
 | `scripts/bucket_micro_allreduce.py` | 以 ET 解出的 DDP bucket 尺寸執行 `torch.distributed.all_reduce`,GPU 上沒有其他工作——無競爭下限 |
-| `scripts/q4_overlap_off.py` | 同樣的 bucket,放在真實訓練迴圈內,但等 backward 完全結束後才發出——有框架成本、無競爭 |
+| `scripts/q4_overlap_off.py` | 同一批 bucket,取自真實訓練步,每個集合操作都從 DDP 的 comm hook 內單獨發到閒置 GPU 上——不與 backward 重疊。只計時 `all_reduce` 本身,不含 DDP 自己的分桶與複製 |
 | `scripts/fit_envelope.py` | 對 rccl-tests 掃描與 ns-3 逐 collective 的 COMM interval 各自擬合 `T(M) = α + M/B`,再逐 bucket 相減 |
 
 第三個欄位由 Kineto trace 提供:同一批 collective 與 backward 競爭時的時間。`scripts/gen_envelope_figures.py` 會畫出兩側的 `T(M)` 與 `BW(M)`。

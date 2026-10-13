@@ -471,7 +471,7 @@ The standard 3D Torus and Fat-Tree do not require this workaround because their 
 
 **Mechanism.** Under `localBWAware`, a 3D AllReduce decomposes into five phases (RS on X, RS on Y, AllReduce on Z, AG on Y, AG on X), and the RS/AG phases of the *same* dimension share one queue — phases 0 and 4 share queue 0, phases 1 and 3 share queue 1. At `active-chunks-per-dimension=1` only one chunk may hold a queue, so once the twist desynchronizes phase progress across nodes, a fast node's next-bucket Reduce-Scatter and a slow node's current-bucket All-Gather contend for the same queue and deadlock. The layer was confirmed by instrumenting `send_flow` and `qp_finish` in the ns-3 frontend's `entry.h`: both counters stopped at exactly 5,337, proving ns-3 completed every flow it received and ASTRA-sim had stopped issuing new ones. The risk is acknowledged in ASTRA-sim's own `Sys.cc` (lines 837–852) and partly discussed in Issue #137, but the default config remains vulnerable. That instrumentation ships as `rocm/patches/entry_flow_diagnostics.py`.
 
-**Reproducing it.** [`deadlock-reproduction/`](deadlock-reproduction/) is a self-contained bundle — the Twisted Torus topology, the deadlocking and fixed system configs, the Qwen 0.5B ET, and the captured `stdout` evidence for `chunks=1` (FIFO and LIFO) and `chunks=2`.
+**Reproducing it.** [`deadlock-reproduction/`](deadlock-reproduction/) is a self-contained bundle — the Twisted Torus topology, the deadlocking and fixed system configs, the Qwen 0.5B ET, and the captured `stdout` evidence for `chunks=1` (two LIFO runs) and `chunks=2`.
 
 ---
 

@@ -459,7 +459,7 @@ python3 src/topology_generator.py \
 
 **機制。** 在 `localBWAware` 下,3D AllReduce 被拆成五個階段(X 的 RS、Y 的 RS、Z 的 AllReduce、Y 的 AG、X 的 AG),而**同一維度**的 RS 與 AG 共用一個 queue——階段 0 與 4 共用 queue 0,階段 1 與 3 共用 queue 1。當 `active-chunks-per-dimension=1` 時一個 queue 同時只容得下一個 chunk,因此只要扭轉使各節點階段進度不同步,快節點的下一個 bucket 的 Reduce-Scatter 就會與慢節點當前 bucket 的 All-Gather 爭用同一個 queue 而死鎖。死鎖發生在哪一層是靠 instrumentation 確認的:在 ns-3 前端 `entry.h` 插入 `send_flow` 與 `qp_finish` 計數器後,兩者都停在 5,337,證明 ns-3 完成了所有收到的 flow,是 ASTRA-sim 停止發出新 flow。這個風險在 ASTRA-sim 自己的 `Sys.cc`(第 837–852 行)中已被承認,Issue #137 亦有部分討論,但預設組態仍未防範。該 instrumentation 以 `rocm/patches/entry_flow_diagnostics.py` 形式收錄。
 
-**重現方式。** [`deadlock-reproduction/`](deadlock-reproduction/) 是一個自足的重現包——Twisted Torus 拓撲檔、會死鎖與已修正的 system 設定、Qwen 0.5B 的 ET,以及 `chunks=1`(FIFO 與 LIFO)和 `chunks=2` 的 stdout 證據。
+**重現方式。** [`deadlock-reproduction/`](deadlock-reproduction/) 是一個自足的重現包——Twisted Torus 拓撲檔、會死鎖與已修正的 system 設定、Qwen 0.5B 的 ET,以及 `chunks=1`(兩次 LIFO run)和 `chunks=2` 的 stdout 證據。
 
 ---
 

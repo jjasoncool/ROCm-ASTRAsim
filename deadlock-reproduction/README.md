@@ -36,10 +36,10 @@ workload/
   et.qwen05b.1.et                           Chakra ET trace (odd nodes)
 
 evidence/
-  stdout_chunks1_lifo.log     Trimmed log: chunks=1, LIFO (5,337 flows → hang)
-  stdout_chunks1_fifo.log     Trimmed log: chunks=1, FIFO (5,337 flows → hang, identical)
-  stdout_chunks2.log          Trimmed log: chunks=2 (7,384 flows → hang)
-  per_bucket_analysis.md      Phase-by-phase breakdown of completed flows
+  stdout_chunks1_lifo.log         Trimmed log: chunks=1, LIFO (5,337 flows → hang)
+  stdout_chunks1_lifo_repeat.log  Trimmed log: chunks=1, LIFO, independent repeat (5,337 flows → hang, identical; no FIFO run exists)
+  stdout_chunks2.log              Trimmed log: chunks=2 (7,384 flows → hang)
+  per_bucket_analysis.md          Phase-by-phase breakdown of completed flows
 ```
 
 ## Trigger Conditions
